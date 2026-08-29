@@ -1669,6 +1669,80 @@ impl Workspace {
         self.unfloat_window(hwnd)
     }
 
+    /// Minimize an owned window without changing which container owns it.
+    ///
+    /// Returns whether the window's visibility actually changed, so a repeated Win32 event
+    /// cannot cause a repeated retile. Container focus moves off the minimized window because a
+    /// minimized window is not a focus target, but the window keeps its place in the stack and
+    /// stays in the container's window count.
+    pub fn minimize_window(&mut self, hwnd: isize) -> eyre::Result<bool> {
+        let container_idx = self
+            .container_idx_for_window(hwnd)
+            .ok_or_eyre("this workspace does not own that window")?;
+
+        let container = self
+            .containers_mut()
+            .get_mut(container_idx)
+            .ok_or_eyre("there is no container")?;
+
+        let window_idx = container
+            .idx_for_window(hwnd)
+            .ok_or_eyre("that container does not own that window")?;
+
+        let changed = container.windows_mut()[window_idx].set_minimized();
+
+        if changed && container.focused_window_idx() == window_idx {
+            let successor = container.first_focusable_window().map(|window| window.hwnd);
+
+            if let Some(successor) = successor {
+                container.focus_window_by_hwnd(successor);
+            }
+        }
+
+        self.record_minimized_window(hwnd);
+
+        Ok(changed)
+    }
+
+    /// Mark an owned window as no longer minimized.
+    ///
+    /// This is the reconciliation half of [`Workspace::minimize_window`]: it is what a window
+    /// restored from the taskbar goes through, so it neither focuses nor moves anything.
+    pub fn unminimize_window(&mut self, hwnd: isize) -> eyre::Result<bool> {
+        let container_idx = self
+            .container_idx_for_window(hwnd)
+            .ok_or_eyre("this workspace does not own that window")?;
+
+        let container = self
+            .containers_mut()
+            .get_mut(container_idx)
+            .ok_or_eyre("there is no container")?;
+
+        let window_idx = container
+            .idx_for_window(hwnd)
+            .ok_or_eyre("that container does not own that window")?;
+
+        let changed = container.windows_mut()[window_idx].set_visible();
+
+        self.forget_minimized_window(hwnd);
+
+        Ok(changed)
+    }
+
+    /// Restore the most recently minimized window this workspace still owns, and focus it.
+    ///
+    /// The window returns with the placement and presentation it had, so a floating window comes
+    /// back floating and a maximized window comes back maximized. Both histories are updated
+    /// through the ordinary focus path.
+    pub fn restore_last_minimized_window(&mut self) -> Option<isize> {
+        let hwnd = self.take_last_minimized_window()?;
+
+        self.unminimize_window(hwnd).ok()?;
+        self.focus_container_by_window(hwnd).ok()?;
+
+        Some(hwnd)
+    }
+
     /// Record the rectangle a floating window actually occupies.
     pub fn set_floating_rect(&mut self, hwnd: isize, rect: Rect) -> bool {
         for window in self.floating_managed_windows_mut() {
@@ -2545,6 +2619,7 @@ mod tests {
     use crate::Window;
     use crate::container::Container;
     use crate::geometry::SlotOrder;
+    use crate::managed_window::Presentation;
     use std::collections::HashMap;
 
     #[test]
@@ -2818,6 +2893,151 @@ mod tests {
             workspace.containers()[0].visible_stored_windows().count(),
             0
         );
+    }
+
+    #[test]
+    fn minimizing_a_window_keeps_it_in_its_container() {
+        let mut workspace = workspace_with_containers(&[3]);
+        let container_id = workspace.containers()[0].id.clone();
+
+        assert!(workspace.minimize_window(1).unwrap());
+
+        let container = &workspace.containers()[0];
+        assert_eq!(container.id, container_id);
+        assert_eq!(container.windows().len(), 3);
+        assert_eq!(
+            container
+                .windows()
+                .iter()
+                .map(|window| window.hwnd)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(container.windows()[1].visibility, Visibility::Minimized);
+        assert!(container.is_active());
+        assert!(workspace.minimize_history.contains(&1));
+    }
+
+    #[test]
+    fn minimizing_the_last_visible_stored_window_hides_its_container() {
+        let mut workspace = workspace_with_containers(&[1, 1]);
+        let area = work_area(1920, 1080);
+        let minimized_id = workspace.containers()[0].id.clone();
+
+        workspace.minimize_window(0).unwrap();
+        workspace.record_logical_slots(area);
+
+        assert!(workspace.containers()[0].is_hidden());
+        assert!(!workspace.logical_slots.contains(&minimized_id));
+        // The container is not destroyed and keeps the window it owns.
+        assert_eq!(workspace.containers().len(), 2);
+        assert_eq!(workspace.containers()[0].windows().len(), 1);
+    }
+
+    #[test]
+    fn minimizing_the_focused_window_moves_container_focus_off_it() {
+        let mut workspace = workspace_with_containers(&[3]);
+        workspace.containers_mut()[0].focus_window(1);
+
+        workspace.minimize_window(1).unwrap();
+
+        let container = &workspace.containers()[0];
+        assert_ne!(container.focused_window_idx(), 1);
+        assert!(
+            container
+                .focused_managed_window()
+                .is_some_and(ManagedWindow::is_visible_stored)
+        );
+    }
+
+    #[test]
+    fn a_repeated_minimize_changes_nothing() {
+        let mut workspace = workspace_with_containers(&[2]);
+
+        assert!(workspace.minimize_window(0).unwrap());
+        let after_first = workspace.clone();
+
+        assert!(!workspace.minimize_window(0).unwrap());
+        assert_eq!(workspace.containers(), after_first.containers());
+        assert_eq!(workspace.minimize_history, after_first.minimize_history);
+    }
+
+    #[test]
+    fn restoring_the_last_minimized_window_reactivates_and_focuses_it() {
+        let mut workspace = workspace_with_containers(&[1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.focus_container(1);
+        workspace.minimize_window(0).unwrap();
+        workspace.record_logical_slots(area);
+
+        assert_eq!(workspace.restore_last_minimized_window(), Some(0));
+        workspace.record_logical_slots(area);
+
+        assert!(workspace.containers()[0].is_active());
+        assert!(
+            workspace
+                .logical_slots
+                .contains(&workspace.containers()[0].id)
+        );
+        assert_eq!(workspace.focused_container_idx(), 0);
+        assert!(!workspace.minimize_history.contains(&0));
+        // Both levels of history recorded the restored selection.
+        assert_eq!(
+            workspace.container_focus_history.iter().next(),
+            Some(&workspace.containers()[0].id)
+        );
+    }
+
+    #[test]
+    fn a_restored_window_keeps_the_placement_it_was_minimized_with() {
+        let mut workspace = workspace_with_containers(&[2]);
+        workspace.float_window(0, floating_rect(3)).unwrap();
+        workspace.containers_mut()[0].windows_mut()[0].presentation = Presentation::Maximized;
+        workspace.minimize_window(0).unwrap();
+
+        assert_eq!(workspace.restore_last_minimized_window(), Some(0));
+
+        let window = &workspace.containers()[0].windows()[0];
+        assert_eq!(window.visibility, Visibility::Visible);
+        assert_eq!(window.placement, ManagedPlacement::Floating);
+        assert_eq!(window.presentation, Presentation::Maximized);
+        assert_eq!(window.floating_rect, Some(floating_rect(3)));
+    }
+
+    #[test]
+    fn restoring_without_a_minimized_window_changes_nothing() {
+        let mut workspace = workspace_with_containers(&[2]);
+        let before = workspace.clone();
+
+        assert_eq!(workspace.restore_last_minimized_window(), None);
+        assert_eq!(workspace.containers(), before.containers());
+
+        // A history entry for a window which is no longer minimized is discarded, not restored.
+        workspace.record_minimized_window(0);
+        assert_eq!(workspace.restore_last_minimized_window(), None);
+        assert!(workspace.minimize_history.is_empty());
+    }
+
+    #[test]
+    fn a_repeated_unminimize_changes_nothing() {
+        let mut workspace = workspace_with_containers(&[2]);
+        workspace.minimize_window(0).unwrap();
+
+        assert!(workspace.unminimize_window(0).unwrap());
+        let after_first = workspace.clone();
+
+        assert!(!workspace.unminimize_window(0).unwrap());
+        assert_eq!(workspace.containers(), after_first.containers());
+    }
+
+    #[test]
+    fn minimizing_a_window_this_workspace_does_not_own_fails_without_changing_anything() {
+        let mut workspace = workspace_with_containers(&[1]);
+        let before = workspace.clone();
+
+        assert!(workspace.minimize_window(404).is_err());
+        assert_eq!(workspace.containers(), before.containers());
+        assert!(workspace.minimize_history.is_empty());
     }
 
     fn hide_container(workspace: &mut Workspace, idx: usize) {

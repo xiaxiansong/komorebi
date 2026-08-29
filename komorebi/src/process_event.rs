@@ -382,6 +382,22 @@ impl WindowManager {
             _ => {}
         }
 
+        // A window restored from the taskbar arrives as an ordinary show/focus event. It is
+        // still owned by its container, so it must not be re-managed as a new window; the model
+        // only has to agree with Win32 again about its visibility. This is idempotent, which is
+        // what makes a duplicated or out-of-order restore harmless.
+        if matches!(
+            event,
+            WindowManagerEvent::FocusChange(..)
+                | WindowManagerEvent::Show(..)
+                | WindowManagerEvent::Uncloak(..)
+                | WindowManagerEvent::Manage(_)
+                | WindowManagerEvent::MoveResizeEnd(..)
+        ) && !event.window().is_miminized()
+        {
+            self.unminimize_managed_window(event.window().hwnd)?;
+        }
+
         self.enforce_workspace_rules()?;
 
         if matches!(event, WindowManagerEvent::MouseCapture(..)) {
@@ -443,18 +459,21 @@ impl WindowManager {
                         window.hwnd
                     );
                 } else {
-                    let mut hide = false;
+                    let mut user_minimized = false;
 
                     {
                         let programmatically_hidden_hwnds = HIDDEN_HWNDS.lock();
                         if !programmatically_hidden_hwnds.contains(&window.hwnd) {
-                            hide = true;
+                            user_minimized = true;
                         }
                     }
 
-                    if hide {
-                        self.focused_workspace_mut()?.remove_window(window.hwnd)?;
-                        self.update_focused_workspace(false, false)?;
+                    if user_minimized {
+                        // Minimizing is a visibility change, not a removal: the window keeps its
+                        // container, its stack position and its histories, and the container it
+                        // belongs to stops occupying a slot once it has no visible stored window
+                        // left.
+                        self.minimize_managed_window(window.hwnd)?;
                     }
                 }
             }

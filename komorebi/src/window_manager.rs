@@ -828,6 +828,77 @@ impl WindowManager {
         None
     }
 
+    /// Record that a managed window was minimized, wherever it is owned.
+    ///
+    /// Minimizing keeps the window in its container: the container keeps its ID, its stack and
+    /// its histories, and only stops occupying a logical slot once it has no visible stored
+    /// window left. Returns whether anything changed, so a repeated Win32 minimize event does
+    /// not cause a repeated retile.
+    pub fn minimize_managed_window(&mut self, hwnd: isize) -> eyre::Result<bool> {
+        self.set_managed_window_minimized(hwnd, true)
+    }
+
+    /// Record that a managed window is no longer minimized, wherever it is owned.
+    pub fn unminimize_managed_window(&mut self, hwnd: isize) -> eyre::Result<bool> {
+        self.set_managed_window_minimized(hwnd, false)
+    }
+
+    fn set_managed_window_minimized(&mut self, hwnd: isize, minimized: bool) -> eyre::Result<bool> {
+        let Some((monitor_idx, workspace_idx)) = self.managed_window_location(hwnd) else {
+            return Ok(false);
+        };
+
+        let workspace = self
+            .monitors_mut()
+            .get_mut(monitor_idx)
+            .and_then(|monitor| monitor.workspaces_mut().get_mut(workspace_idx))
+            .ok_or_eyre("there is no workspace")?;
+
+        let changed = if minimized {
+            workspace.minimize_window(hwnd)?
+        } else {
+            workspace.unminimize_window(hwnd)?
+        };
+
+        if !changed {
+            return Ok(false);
+        }
+
+        if self
+            .monitors()
+            .get(monitor_idx)
+            .is_some_and(|monitor| monitor.focused_workspace_idx() == workspace_idx)
+        {
+            self.update_focused_workspace_by_monitor_idx(monitor_idx)?;
+        }
+
+        Ok(true)
+    }
+
+    /// Restore the window most recently minimized on the focused workspace.
+    ///
+    /// The window comes back with the placement and presentation it was minimized with, and both
+    /// levels of focus history follow it. A workspace with no minimized window it still owns is
+    /// left completely unchanged.
+    pub fn restore_last_minimized_window(&mut self) -> eyre::Result<Option<isize>> {
+        let monitor_idx = self.focused_monitor_idx();
+
+        let Some(hwnd) = self
+            .focused_workspace_mut()?
+            .restore_last_minimized_window()
+        else {
+            return Ok(None);
+        };
+
+        let window = Window::from(hwnd);
+        window.restore();
+
+        self.update_focused_workspace_by_monitor_idx(monitor_idx)?;
+        window.focus(self.mouse_follows_focus)?;
+
+        Ok(Some(hwnd))
+    }
+
     /// Remove a managed window from every ownership/index path and add it to the runtime
     /// suppression set. The workspace snapshot makes the in-memory mutation atomic if detaching or
     /// retiling fails.
@@ -4044,6 +4115,7 @@ impl WindowManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::managed_window::Visibility;
     use crate::monitor;
     use crossbeam_channel::Sender;
     use crossbeam_channel::bounded;
@@ -4119,6 +4191,102 @@ mod tests {
 
         assert!(!wm.suspend_managed_window(42).unwrap());
         assert!(wm.temporarily_unmanaged_hwnds.contains(&42));
+    }
+
+    fn window_manager_with_container(hwnds: &[isize]) -> (WindowManager, TestContext) {
+        let (mut wm, context) = setup_window_manager();
+        let mut monitor = monitor::new(
+            0,
+            Rect::default(),
+            Rect::default(),
+            "TestMonitor".to_string(),
+            "TestDevice".to_string(),
+            "TestDeviceID".to_string(),
+            Some("TestMonitorID".to_string()),
+        );
+
+        let mut container = Container::default();
+        for hwnd in hwnds {
+            container.windows_mut().push_back(Window::from(*hwnd));
+        }
+
+        monitor
+            .focused_workspace_mut()
+            .unwrap()
+            .add_container_to_back(container);
+        wm.monitors_mut().push_back(monitor);
+
+        for hwnd in hwnds {
+            wm.known_hwnds.insert(*hwnd, (0, 0));
+        }
+
+        (wm, context)
+    }
+
+    #[test]
+    fn minimizing_a_managed_window_keeps_its_container_ownership() {
+        let (mut wm, _test_context) = window_manager_with_container(&[42, 43]);
+
+        assert!(wm.minimize_managed_window(42).unwrap());
+
+        // Unlike suspending, minimizing leaves ownership and the container completely intact.
+        assert_eq!(wm.managed_window_location(42), Some((0, 0)));
+        assert!(!wm.temporarily_unmanaged_hwnds.contains(&42));
+        let workspace = wm.focused_workspace().unwrap();
+        assert_eq!(workspace.containers().len(), 1);
+        assert_eq!(workspace.containers()[0].windows().len(), 2);
+        assert!(workspace.minimize_history.contains(&42));
+
+        // Repeated Win32 minimize events converge instead of retiling again.
+        assert!(!wm.minimize_managed_window(42).unwrap());
+
+        assert!(wm.unminimize_managed_window(42).unwrap());
+        assert!(!wm.unminimize_managed_window(42).unwrap());
+        assert!(
+            !wm.focused_workspace()
+                .unwrap()
+                .minimize_history
+                .contains(&42)
+        );
+    }
+
+    #[test]
+    fn minimizing_the_last_visible_stored_window_hides_its_container() {
+        let (mut wm, _test_context) = window_manager_with_container(&[42]);
+
+        assert!(wm.minimize_managed_window(42).unwrap());
+
+        let workspace = wm.focused_workspace().unwrap();
+        assert_eq!(workspace.containers().len(), 1);
+        assert!(workspace.containers()[0].is_hidden());
+        assert_eq!(workspace.active_container_count(), 0);
+    }
+
+    #[test]
+    fn minimizing_an_unmanaged_window_is_a_noop() {
+        let (mut wm, _test_context) = setup_window_manager();
+
+        assert!(!wm.minimize_managed_window(42).unwrap());
+        assert!(!wm.unminimize_managed_window(42).unwrap());
+    }
+
+    #[test]
+    fn restoring_the_last_minimized_window_brings_back_the_most_recent_one() {
+        let (mut wm, _test_context) = window_manager_with_container(&[42, 43]);
+        wm.minimize_managed_window(42).unwrap();
+        wm.minimize_managed_window(43).unwrap();
+
+        // The Win32 focus call cannot succeed for a synthetic handle; the model transition is
+        // committed before it, which is what this asserts.
+        wm.restore_last_minimized_window().ok();
+
+        let workspace = wm.focused_workspace().unwrap();
+        let container = &workspace.containers()[0];
+        assert_eq!(container.windows()[1].visibility, Visibility::Visible);
+        assert_eq!(container.windows()[0].visibility, Visibility::Minimized);
+        assert!(workspace.minimize_history.contains(&42));
+        assert!(!workspace.minimize_history.contains(&43));
+        assert!(container.is_active());
     }
 
     #[test]
