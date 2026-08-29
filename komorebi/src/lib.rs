@@ -9,6 +9,7 @@ pub mod container;
 pub mod core;
 pub mod focus_manager;
 pub mod lockable_sequence;
+pub mod managed_window;
 pub mod monitor;
 pub mod monitor_reconciliator;
 pub mod process_command;
@@ -50,6 +51,7 @@ use std::sync::atomic::Ordering;
 
 pub use core::*;
 pub use komorebi_themes::colour::*;
+pub use managed_window::*;
 pub use process_command::*;
 pub use process_event::*;
 pub use static_config::*;

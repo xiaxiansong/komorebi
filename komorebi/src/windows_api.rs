@@ -1079,6 +1079,25 @@ impl WindowsApi {
         unsafe { IsZoomed(HWND(as_ptr!(hwnd))) }.into()
     }
 
+    /// Conservatively identify borderless fullscreen independently from Win32 maximization.
+    /// Maximized windows are always classified by `IsZoomed`, even if their painted bounds happen
+    /// to cover the monitor.
+    pub fn is_fullscreen(hwnd: isize) -> bool {
+        if Self::is_zoomed(hwnd) {
+            return false;
+        }
+
+        let Ok(window_rect) = Self::window_rect(hwnd) else {
+            return false;
+        };
+        let hmonitor = HMONITOR(as_ptr!(Self::monitor_from_window(hwnd)));
+        let Ok(monitor_info) = Self::monitor_info_w(hmonitor) else {
+            return false;
+        };
+
+        window_rect == Rect::from(monitor_info.monitorInfo.rcMonitor)
+    }
+
     pub fn monitor_info_w(hmonitor: HMONITOR) -> eyre::Result<MONITORINFOEXW> {
         let mut ex_info = MONITORINFOEXW::default();
         ex_info.monitorInfo.cbSize = u32::try_from(std::mem::size_of::<MONITORINFOEXW>())?;

@@ -128,18 +128,47 @@ check and test passed; layouts remained 128/128 and bar remained 3/3. Existing l
 the `net2` future-incompatibility warning are unchanged. Format/Clippy remain unavailable for the
 baseline toolchain reasons above.
 
-### Phase 2 - Managed window multidimensional state
+### Phase 2A - Managed window state types and transitions
 
-- [ ] Add `ManagedWindow`, `ManagedPlacement`, `Visibility`, and `Presentation` with serde defaults.
+- [x] Add `ManagedWindow`, `ManagedPlacement`, `Visibility`, and `Presentation` with serde defaults.
+- [x] Derive initial visibility and presentation from Win32 queries while keeping maximized and
+  fullscreen classification distinct.
+- [x] Keep maximize, fullscreen, minimize, and placement independent in pure transition methods.
+- [x] Accept both the new managed-window JSON shape and legacy serialized `Window` objects.
+- [x] Add serialization/backward-compatibility and transition tests.
+- [x] Commit as `feat: add managed window state transitions`.
+
+Expected handwritten change: 250-400 lines. Likely files: new `managed_window.rs`, `window.rs`,
+`windows_api.rs`, `lib.rs`.
+
+Actual files: new `managed_window.rs`, `windows_api.rs`, and `lib.rs`. Actual Rust change: 397
+added lines. Nine focused state/serde tests passed and `cargo check --workspace` passed. A normal
+`cargo test --workspace` ran all new tests successfully but two pre-existing monitor movement tests
+failed because this desktop session's `GetForegroundWindow()` returned null (`ERROR_INVALID_PARAMETER
+(87)` at `WindowsApi::foreground_window`); both fail identically when run alone and serially. The
+pre-change full-suite run in the same turn passed before the desktop lost its foreground window.
+Running the workspace suite with exactly those two environment-dependent tests skipped passed:
+komorebi 113 passed/1 ignored/2 filtered, layouts 128 passed, bar 3 passed, all other targets and
+doc-tests passed. No production workaround was mixed into this phase; the foreground dependency is
+recorded for the workspace migration/event reconciliation phases. Format/Clippy remain unavailable
+for the baseline toolchain reasons above. Two normal and one PTY-backed signed commit attempts
+failed in `op-ssh-sign` with `1Password: failed to fill whole buffer`; the phase commit was therefore
+created unsigned with a one-command `commit.gpgsign=false` override, without changing repository or
+global Git configuration. It can be replaced by a signed amend after 1Password signing recovers.
+
+### Phase 2B - Container managed-window storage migration
+
 - [ ] Convert container storage from `Window` to `ManagedWindow` while preserving convenient Win32
-  accessors.
-- [ ] Derive initial visibility and presentation from Win32 queries.
-- [ ] Keep maximize, fullscreen, minimize, and placement independent in transition methods.
-- [ ] Add serialization/backward-compatibility and transition tests.
-- [ ] Commit as `feat: add multidimensional managed window state`.
+  accessors and legacy container deserialization.
+- [ ] Assign and update the owning container ID on every add, move, stack, and removal path.
+- [ ] Capture initial state when a new or resumed HWND first enters a container.
+- [ ] Route existing minimize/maximize/float paths through the multidimensional transition methods
+  without yet removing the legacy workspace-owned alternate presentation paths (Phase 5).
+- [ ] Add container ownership, legacy state, new-window, and resume-state tests.
+- [ ] Commit as `feat: store managed window state in containers`.
 
-Expected handwritten change: 300-500 lines. Likely files: new `managed_window.rs`, `container.rs`,
-`window.rs`, `windows_api.rs`, `lib.rs`, `core/mod.rs`, `state.rs`.
+Expected handwritten change: 300-500 lines. Likely files: `container.rs`, `workspace.rs`,
+`window_manager.rs`, `process_event.rs`, `windows_callbacks.rs`, `state.rs`.
 
 ### Phase 3 - Stable workspace identity and MRU histories
 
@@ -343,6 +372,10 @@ This list is updated from actual diffs, not treated as permission to change ever
   target applications with existing Win32 helpers; application-specific exceptions may be needed.
 - Open: `ApplyState` must be made transactionally aware of the runtime suspension set when state
   migration is implemented; ordinary Win32 reconciliation is already suppressed in Phase 1.
+- Open: `Monitor::move_container_to_workspace` currently requires a non-null foreground HWND even
+  when moving an empty test container. Its two unit tests fail with Win32 error 87 whenever the
+  desktop session has no foreground window; remove that incidental dependency in the workspace
+  migration phase rather than hiding the production behavior in a state-model commit.
 
 ## Progress log
 
@@ -353,3 +386,14 @@ This list is updated from actual diffs, not treated as permission to change ever
   destroy cleanup, ignore-respecting resume, rollback of failed in-memory detach/retile, and focused
   lifecycle tests. Full workspace check and tests passed. Next phase: managed window
   multidimensional state.
+- 2026-08-29: Phase 2 was split before coding because converting every `Ring<Window>` container
+  caller together with the new state model would exceed the per-phase review limit. Phase 2A owns
+  the types, Win32 observation, serde compatibility, and pure transitions; Phase 2B owns the
+  container/call-site migration. Pre-2A workspace check and tests passed (komorebi 106 passed/1
+  ignored; layouts 128; bar 3). Toolchain limitations for rustup, rustfmt, and Clippy are unchanged.
+- 2026-08-29: Phase 2A implemented independent placement, visibility, and presentation state,
+  legacy/new serde representations, atomic pure transitions, and conservative Win32 fullscreen
+  observation distinct from `IsZoomed`. Focused tests and workspace compile passed. All tests except
+  two existing foreground-dependent monitor tests passed; exact failure and filtered verification
+  are recorded above. Next phase: migrate container storage and all ownership-changing call sites to
+  `ManagedWindow`.
