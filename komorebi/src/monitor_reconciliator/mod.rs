@@ -894,10 +894,8 @@ where
                                         }
                                     }
 
-                                    workspace.floating_windows_mut().retain(|window| {
-                                        window.exe().is_ok()
-                                            && !known_hwnds.contains_key(&window.hwnd)
-                                    });
+                                    // Floating windows live in containers, so the container
+                                    // sweep above has already dropped the dead ones.
 
                                     if is_focused_workspace {
                                         for window in workspace.floating_windows() {

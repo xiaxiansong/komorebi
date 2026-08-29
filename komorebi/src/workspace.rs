@@ -40,6 +40,7 @@ use crate::geometry::LogicalRect;
 use crate::geometry::LogicalSlots;
 use crate::geometry::RenderInsets;
 use crate::lockable_sequence::LockableSequence;
+use crate::managed_window::ManagedPlacement;
 use crate::managed_window::ManagedWindow;
 use crate::managed_window::Visibility;
 use crate::model::ContainerId;
@@ -87,7 +88,6 @@ pub struct Workspace {
     pub maximized_window: Option<Window>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub maximized_window_restore_idx: Option<usize>,
-    pub floating_windows: Ring<Window>,
     pub layout: Layout,
     pub layout_options: Option<LayoutOptions>,
     pub layout_rules: Vec<(usize, Layout)>,
@@ -159,7 +159,6 @@ impl Display for WorkspaceLayer {
 }
 
 impl_ring_elements!(Workspace, Container);
-impl_ring_elements!(Workspace, Window, "floating_window");
 
 impl Default for Workspace {
     fn default() -> Self {
@@ -173,7 +172,6 @@ impl Default for Workspace {
             maximized_window: None,
             maximized_window_restore_idx: None,
             monocle_container_restore_idx: None,
-            floating_windows: Ring::default(),
             layout: Layout::Default(DefaultLayout::BSP),
             layout_options: None,
             layout_rules: vec![],
@@ -210,7 +208,7 @@ pub enum WorkspaceWindowLocation {
     Monocle(usize), // window_idx
     Maximized,
     Container(usize, usize), // container_idx, window_idx
-    Floating(usize),         // idx in floating_windows
+    Floating(usize),         // idx in the derived floating window order
 }
 
 #[derive(Debug, Default, Copy, Clone, Serialize, Deserialize, PartialEq)]
@@ -429,21 +427,8 @@ impl Workspace {
     }
 
     pub fn hide(&mut self, omit: Option<isize>) {
-        for window in self.floating_windows_mut().iter_mut().rev() {
-            let mut should_hide = omit.is_none();
-
-            if !should_hide
-                && let Some(omit) = omit
-                && omit != window.hwnd
-            {
-                should_hide = true
-            }
-
-            if should_hide {
-                window.hide();
-            }
-        }
-
+        // Floating windows are hidden by the container which owns them, in the same pass as the
+        // stored windows, so leaving a workspace cannot leave one of them on screen.
         for container in self.containers_mut() {
             container.hide(omit)
         }
@@ -606,10 +591,6 @@ impl Workspace {
 
         if let Some(container) = self.focused_container_mut() {
             container.focus_window(container.focused_window_idx());
-        }
-
-        for window in self.floating_windows() {
-            window.restore();
         }
 
         // Do this here to make sure that an error doesn't stop the restoration of other windows
@@ -799,7 +780,10 @@ impl Workspace {
 
                 for (i, container) in containers.iter_mut().enumerate() {
                     if let Some(layout) = rendered.get(&i) {
-                        for window in container.windows() {
+                        // A container positions the windows it controls. A floating window keeps
+                        // its own rectangle and a minimized window has none, so neither is moved
+                        // into the container's slot.
+                        for window in container.visible_stored_windows() {
                             if container
                                 .focused_window()
                                 .is_some_and(|w| w.hwnd == window.hwnd)
@@ -886,6 +870,117 @@ impl Workspace {
             container.load_focused_window();
         }
 
+        self.focus_container(container_idx);
+
+        Ok(())
+    }
+
+    /// Every floating window this workspace owns, in container order and then stack order.
+    ///
+    /// A floating window is a fully managed window which its container does not position. It is
+    /// derived from container membership rather than stored in a workspace-level list, so it
+    /// cannot exist without a container and cannot be lost when its container changes.
+    pub fn floating_managed_windows(&self) -> impl Iterator<Item = &ManagedWindow> {
+        self.containers()
+            .iter()
+            .flat_map(|container| container.floating_windows())
+    }
+
+    pub fn floating_managed_windows_mut(&mut self) -> impl Iterator<Item = &mut ManagedWindow> {
+        self.containers_mut()
+            .iter_mut()
+            .flat_map(Container::floating_windows_mut)
+    }
+
+    /// The floating windows in the order the floating layer cycles through them.
+    #[must_use]
+    pub fn floating_windows(&self) -> Vec<Window> {
+        self.floating_managed_windows()
+            .map(|window| window.window)
+            .collect()
+    }
+
+    #[must_use]
+    pub fn is_floating_window(&self, hwnd: isize) -> bool {
+        self.floating_managed_windows()
+            .any(|window| window.hwnd == hwnd)
+    }
+
+    /// The position of `hwnd` in [`Workspace::floating_windows`].
+    #[must_use]
+    pub fn floating_window_idx(&self, hwnd: isize) -> Option<usize> {
+        self.floating_managed_windows()
+            .position(|window| window.hwnd == hwnd)
+    }
+
+    /// The floating window the floating layer currently acts on.
+    ///
+    /// The focused container's focused window wins when it floats, because that is the window
+    /// the user last selected. Otherwise the first floating window in cycle order is used, which
+    /// is what makes the floating layer usable right after it is entered.
+    #[must_use]
+    pub fn focused_floating_window(&self) -> Option<Window> {
+        if let Some(window) = self
+            .focused_container()
+            .and_then(Container::focused_managed_window)
+            && window.placement == ManagedPlacement::Floating
+        {
+            return Some(window.window);
+        }
+
+        self.floating_managed_windows()
+            .next()
+            .map(|window| window.window)
+    }
+
+    #[must_use]
+    pub fn focused_floating_window_idx(&self) -> usize {
+        self.focused_floating_window()
+            .and_then(|window| self.floating_window_idx(window.hwnd))
+            .unwrap_or_default()
+    }
+
+    /// Make an owned window float without changing which container owns it.
+    ///
+    /// The window keeps its place in the container's stack, its focus history entry and its
+    /// minimize history entry; only the placement changes, and the rectangle it currently has
+    /// becomes its floating rectangle.
+    pub fn float_window(&mut self, hwnd: isize, current_rect: Rect) -> eyre::Result<()> {
+        let container_idx = self
+            .container_idx_for_window(hwnd)
+            .ok_or_eyre("this workspace does not own that window")?;
+
+        let container = self
+            .containers_mut()
+            .get_mut(container_idx)
+            .ok_or_eyre("there is no container")?;
+
+        let window_idx = container
+            .idx_for_window(hwnd)
+            .ok_or_eyre("that container does not own that window")?;
+
+        container.windows_mut()[window_idx].set_floating(current_rect);
+
+        Ok(())
+    }
+
+    /// Return an owned floating window to its container's control.
+    pub fn unfloat_window(&mut self, hwnd: isize) -> eyre::Result<()> {
+        let container_idx = self
+            .container_idx_for_window(hwnd)
+            .ok_or_eyre("this workspace does not own that window")?;
+
+        let container = self
+            .containers_mut()
+            .get_mut(container_idx)
+            .ok_or_eyre("there is no container")?;
+
+        let window_idx = container
+            .idx_for_window(hwnd)
+            .ok_or_eyre("that container does not own that window")?;
+
+        container.windows_mut()[window_idx].set_stored();
+        container.focus_window(window_idx);
         self.focus_container(container_idx);
 
         Ok(())
@@ -1093,14 +1188,6 @@ impl Workspace {
             return Option::from(hwnd);
         }
 
-        for window in self.floating_windows() {
-            if let Ok(window_exe) = window.exe()
-                && exe == window_exe
-            {
-                return Option::from(window.hwnd);
-            }
-        }
-
         None
     }
 
@@ -1127,7 +1214,7 @@ impl Workspace {
             return Some(WorkspaceWindowLocation::Monocle(window_idx));
         }
 
-        for (window_idx, window) in self.floating_windows().iter().enumerate() {
+        for (window_idx, window) in self.floating_managed_windows().enumerate() {
             if let Ok(window_exe) = window.exe()
                 && exe == window_exe
             {
@@ -1181,7 +1268,6 @@ impl Workspace {
         self.containers().is_empty()
             && self.maximized_window.is_none()
             && self.monocle_container.is_none()
-            && self.floating_windows().is_empty()
     }
 
     pub fn contains_window(&self, hwnd: isize) -> bool {
@@ -1201,12 +1287,6 @@ impl Workspace {
             && container.contains_window(hwnd)
         {
             return true;
-        }
-
-        for window in self.floating_windows() {
-            if hwnd == window.hwnd {
-                return true;
-            }
         }
 
         false
@@ -1308,11 +1388,6 @@ impl Workspace {
         border_manager::delete_border(hwnd);
         self.minimize_history.remove(&hwnd);
 
-        if self.floating_windows().iter().any(|w| w.hwnd == hwnd) {
-            self.floating_windows_mut().retain(|w| w.hwnd != hwnd);
-            return Ok(());
-        }
-
         if let Some(container) = &mut self.monocle_container
             && let Some(window_idx) = container
                 .windows()
@@ -1383,22 +1458,22 @@ impl Workspace {
     /// Windows currently has it. Surviving stack members may still be shown because they remain
     /// managed by this workspace.
     pub fn detach_window(&mut self, hwnd: isize) -> eyre::Result<()> {
+        self.take_window(hwnd).map(|_| ())
+    }
+
+    /// Remove `hwnd` from this workspace and hand back its complete managed state.
+    ///
+    /// The placement, visibility, presentation and floating rectangle travel with the window, so
+    /// a move to another workspace or monitor does not silently reset a floating window to a
+    /// stored one.
+    pub fn take_window(&mut self, hwnd: isize) -> eyre::Result<ManagedWindow> {
         border_manager::delete_border(hwnd);
         self.minimize_history.remove(&hwnd);
-
-        if let Some(window_idx) = self
-            .floating_windows()
-            .iter()
-            .position(|window| window.hwnd == hwnd)
-        {
-            self.floating_windows_mut().remove(window_idx);
-            return Ok(());
-        }
 
         if let Some(container) = &mut self.monocle_container
             && let Some(window_idx) = container.idx_for_window(hwnd)
         {
-            container
+            let window = container
                 .remove_window_by_idx(window_idx)
                 .ok_or_eyre("there is no window")?;
 
@@ -1409,16 +1484,19 @@ impl Workspace {
                 container.load_focused_window();
             }
 
-            return Ok(());
+            return Ok(window);
         }
 
-        if self
-            .maximized_window
-            .is_some_and(|window| window.hwnd == hwnd)
-        {
+        if let Some(window) = self.maximized_window.filter(|window| window.hwnd == hwnd) {
             self.maximized_window = None;
             self.maximized_window_restore_idx = None;
-            return Ok(());
+            return Ok(ManagedWindow::from_observed(
+                window,
+                ContainerId::default(),
+                false,
+                true,
+                false,
+            ));
         }
 
         let container_idx = self
@@ -1432,7 +1510,7 @@ impl Workspace {
             .idx_for_window(hwnd)
             .ok_or_eyre("there is no window")?;
 
-        container
+        let window = container
             .remove_window_by_idx(window_idx)
             .ok_or_eyre("there is no window")?;
 
@@ -1443,7 +1521,30 @@ impl Workspace {
             container.load_focused_window();
         }
 
-        Ok(())
+        Ok(window)
+    }
+
+    /// Take on a brand-new window as a floating window of a container of its own.
+    ///
+    /// The container is Hidden the moment it is created, because its only window is floating, so
+    /// this adds no logical slot and does not disturb the tiled arrangement.
+    pub fn add_floating_window(&mut self, window: Window) {
+        let current_rect = WindowsApi::window_rect(window.hwnd).unwrap_or_default();
+        let mut managed = ManagedWindow::capture(window, ContainerId::default());
+        managed.set_floating(current_rect);
+
+        self.adopt_managed_window(managed);
+    }
+
+    /// Adopt a window which already carries its managed state into a container of its own.
+    ///
+    /// This is the receiving half of [`Workspace::take_window`]: the new container gets a new
+    /// stable ID and stamps its ownership on the window, and nothing else about the window's
+    /// state is touched.
+    pub fn adopt_managed_window(&mut self, window: ManagedWindow) {
+        let mut container = Container::default();
+        container.add_managed_window(window);
+        self.add_container_to_back(container);
     }
 
     pub fn remove_focused_container(&mut self) -> Option<Container> {
@@ -1554,18 +1655,38 @@ impl Workspace {
         Ok(())
     }
 
+    /// Return the foreground floating window to the control of its own container.
+    ///
+    /// The window stays in the container which already owns it, so unfloating no longer creates
+    /// a container and no longer moves the window between owners.
     pub fn new_container_for_floating_window(&mut self) -> eyre::Result<()> {
-        let focused_idx = self.focused_container_idx();
-        let window = self
-            .remove_focused_floating_window()
+        let hwnd = WindowsApi::foreground_window()
+            .ok()
+            .filter(|hwnd| self.is_floating_window(*hwnd))
+            .or_else(|| self.focused_floating_window().map(|window| window.hwnd))
             .ok_or_eyre("there is no floating window")?;
 
-        let mut container = Container::default();
-        container.add_window(window);
+        self.unfloat_window(hwnd)
+    }
 
-        self.insert_container_at_idx(focused_idx, container);
+    /// Record the rectangle a floating window actually occupies.
+    pub fn set_floating_rect(&mut self, hwnd: isize, rect: Rect) -> bool {
+        for window in self.floating_managed_windows_mut() {
+            if window.hwnd == hwnd {
+                window.floating_rect = Some(rect);
+                return true;
+            }
+        }
 
-        Ok(())
+        false
+    }
+
+    /// Focus the floating window at `idx` in [`Workspace::floating_windows`] order.
+    pub fn focus_floating_window(&mut self, idx: usize) -> Option<Window> {
+        let hwnd = self.floating_windows().get(idx).map(|window| window.hwnd)?;
+
+        self.focus_container_by_window(hwnd).ok()?;
+        self.floating_windows().get(idx).copied()
     }
 
     pub fn new_container_for_window(&mut self, window: Window) {
@@ -1715,52 +1836,38 @@ impl Workspace {
         }
     }
 
+    /// Float the focused window, keeping it in the container which owns it.
+    ///
+    /// A window held by the transitional maximized or monocle path is not owned by a container,
+    /// so it is reintegrated first; floating it then leaves ownership where the model requires
+    /// it. Nothing is removed from a container here, which is why an emptied container can no
+    /// longer appear as a side effect of floating a window.
     pub fn new_floating_window(&mut self) -> eyre::Result<()> {
-        let window = if let Some(maximized_window) = self.maximized_window {
-            let window = maximized_window;
-            self.maximized_window = None;
-            self.maximized_window_restore_idx = None;
-            window
-        } else if let Some(monocle_container) = &mut self.monocle_container {
-            let window = monocle_container
-                .remove_focused_window()
-                .ok_or_eyre("there is no window")?;
+        if self.maximized_window.is_some() {
+            self.reintegrate_maximized_window()?;
+        } else if self.monocle_container.is_some() {
+            self.reintegrate_monocle_container()?;
+        }
 
-            if monocle_container.windows().is_empty() {
-                self.monocle_container = None;
-                self.monocle_container_restore_idx = None;
-            } else {
-                monocle_container.load_focused_window();
-            }
+        let hwnd = self
+            .focused_container()
+            .and_then(Container::focused_window)
+            .ok_or_eyre("there is no window")?
+            .hwnd;
 
-            window.window
-        } else {
-            let focused_idx = self.focused_container_idx();
+        let current_rect = WindowsApi::window_rect(hwnd).unwrap_or_default();
 
-            let container = self
-                .focused_container_mut()
-                .ok_or_eyre("there is no container")?;
+        self.float_window(hwnd, current_rect)
+    }
 
-            let window = container
-                .remove_focused_window()
-                .ok_or_eyre("there is no window")?;
+    /// Return the focused floating window to its container's control.
+    pub fn unfloat_focused_window(&mut self) -> eyre::Result<()> {
+        let hwnd = self
+            .focused_floating_window()
+            .ok_or_eyre("there is no floating window")?
+            .hwnd;
 
-            if container.windows().is_empty() {
-                self.remove_container_by_idx(focused_idx);
-
-                if focused_idx == self.containers().len() {
-                    self.focus_container(focused_idx.saturating_sub(1));
-                }
-            } else {
-                container.load_focused_window();
-            }
-
-            window.window
-        };
-
-        self.floating_windows_mut().push_back(window);
-
-        Ok(())
+        self.unfloat_window(hwnd)
     }
 
     fn enforce_resize_constraints(&mut self) {
@@ -2123,14 +2230,13 @@ impl Workspace {
     pub fn new_maximized_window(&mut self) -> eyre::Result<()> {
         let focused_idx = self.focused_container_idx();
 
-        if matches!(self.layer, WorkspaceLayer::Floating) {
-            let floating_window_idx = self.focused_floating_window_idx();
-            let floating_window = self.floating_windows_mut().remove(floating_window_idx);
-            self.maximized_window = floating_window;
+        if matches!(self.layer, WorkspaceLayer::Floating)
+            && let Some(floating_window) = self.focused_floating_window()
+        {
+            self.detach_window(floating_window.hwnd)?;
+            self.maximized_window = Option::from(floating_window);
             self.maximized_window_restore_idx = Option::from(focused_idx);
-            if let Some(window) = self.maximized_window {
-                window.maximize();
-            }
+            floating_window.maximize();
 
             return Ok(());
         }
@@ -2352,26 +2458,18 @@ impl Workspace {
         self.focus_container(j);
     }
 
+    /// Detach the foreground window from this workspace if it is one of its floating windows.
     pub fn remove_focused_floating_window(&mut self) -> Option<Window> {
         let hwnd = WindowsApi::foreground_window().ok()?;
 
-        let mut idx = None;
-        for (i, window) in self.floating_windows().iter().enumerate() {
-            if hwnd == window.hwnd {
-                idx = Option::from(i);
-            }
-        }
+        let window = self
+            .floating_managed_windows()
+            .find(|window| window.hwnd == hwnd)
+            .map(|window| window.window)?;
 
-        match idx {
-            None => None,
-            Some(idx) => {
-                if self.floating_windows().get(idx).is_some() {
-                    self.floating_windows_mut().remove(idx)
-                } else {
-                    None
-                }
-            }
-        }
+        self.detach_window(hwnd).ok()?;
+
+        Some(window)
     }
 
     pub fn visible_windows(&self) -> Vec<Option<&Window>> {
@@ -2384,11 +2482,11 @@ impl Workspace {
         }
 
         for container in self.containers() {
-            vec.push(container.focused_window());
-        }
+            vec.push(container.focused_visible_stored_window());
 
-        for window in self.floating_windows() {
-            vec.push(Some(window));
+            for window in container.visible_floating_windows() {
+                vec.push(Some(&window.window));
+            }
         }
 
         vec
@@ -2418,8 +2516,8 @@ impl Workspace {
             }
         }
 
-        for window in self.floating_windows() {
-            if let Ok(details) = (*window).try_into() {
+        for window in self.floating_managed_windows() {
+            if let Ok(details) = window.window.try_into() {
                 vec.push(details);
             }
         }
@@ -2580,6 +2678,146 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn floating_rect(left: i32) -> Rect {
+        Rect {
+            left,
+            top: 10,
+            right: 400,
+            bottom: 300,
+        }
+    }
+
+    #[test]
+    fn a_floating_window_keeps_the_container_which_owns_it() {
+        let mut workspace = workspace_with_containers(&[3]);
+        let container_id = workspace.containers()[0].id.clone();
+
+        workspace.float_window(1, floating_rect(0)).unwrap();
+
+        let container = &workspace.containers()[0];
+        assert_eq!(container.id, container_id);
+        assert_eq!(container.windows().len(), 3);
+        // Stack order is untouched: floating is a placement, not a move.
+        assert_eq!(
+            container
+                .windows()
+                .iter()
+                .map(|window| window.hwnd)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(workspace.container_idx_for_window(1), Some(0));
+        assert_eq!(container.windows()[1].container_id, container_id);
+        assert_eq!(container.windows()[1].floating_rect, Some(floating_rect(0)));
+    }
+
+    #[test]
+    fn floating_the_last_visible_stored_window_hides_its_container() {
+        let mut workspace = workspace_with_containers(&[1, 1]);
+        let area = work_area(1920, 1080);
+        let floated_id = workspace.containers()[0].id.clone();
+
+        workspace.float_window(0, floating_rect(0)).unwrap();
+        workspace.record_logical_slots(area);
+
+        assert!(workspace.containers()[0].is_hidden());
+        assert!(!workspace.logical_slots.contains(&floated_id));
+        assert_eq!(workspace.active_container_count(), 1);
+        // The container is still there with its window; only its slot went away.
+        assert_eq!(workspace.containers().len(), 2);
+    }
+
+    #[test]
+    fn unfloating_returns_the_container_to_the_arrangement() {
+        let mut workspace = workspace_with_containers(&[1, 1]);
+        let area = work_area(1920, 1080);
+        let floated_id = workspace.containers()[0].id.clone();
+
+        workspace.float_window(0, floating_rect(0)).unwrap();
+        workspace.record_logical_slots(area);
+        workspace.unfloat_window(0).unwrap();
+        workspace.record_logical_slots(area);
+
+        assert!(workspace.containers()[0].is_active());
+        assert!(workspace.logical_slots.contains(&floated_id));
+        assert_eq!(workspace.active_container_count(), 2);
+        // Unfloating focuses the window it restored, at both levels.
+        assert_eq!(workspace.focused_container_idx(), 0);
+        assert_eq!(
+            workspace.focused_container().unwrap().focused_window_idx(),
+            0
+        );
+    }
+
+    #[test]
+    fn floating_windows_are_listed_in_container_then_stack_order() {
+        let mut workspace = workspace_with_containers(&[2, 2]);
+
+        // Float them out of order to prove the listing is derived, not an insertion log.
+        workspace.float_window(3, floating_rect(0)).unwrap();
+        workspace.float_window(0, floating_rect(1)).unwrap();
+        workspace.float_window(2, floating_rect(2)).unwrap();
+
+        assert_eq!(
+            workspace.floating_windows(),
+            vec![Window::from(0), Window::from(2), Window::from(3)]
+        );
+        assert_eq!(workspace.floating_window_idx(3), Some(2));
+        assert!(workspace.is_floating_window(2));
+        assert!(!workspace.is_floating_window(1));
+    }
+
+    #[test]
+    fn a_floating_window_carries_its_state_to_another_workspace() {
+        let mut source = workspace_with_containers(&[2]);
+        let mut target = workspace_with_containers(&[1]);
+        source.float_window(1, floating_rect(7)).unwrap();
+
+        let window = source.take_window(1).unwrap();
+        target.adopt_managed_window(window);
+
+        // The source container kept its other window, so it survives the move.
+        assert_eq!(source.containers().len(), 1);
+        assert!(source.floating_windows().is_empty());
+
+        assert_eq!(target.containers().len(), 2);
+        assert!(target.is_floating_window(1));
+        let adopted = &target.containers()[1];
+        assert_eq!(adopted.windows()[0].floating_rect, Some(floating_rect(7)));
+        // The receiving container stamped its own ownership on the window.
+        assert_eq!(adopted.windows()[0].container_id, adopted.id);
+    }
+
+    #[test]
+    fn floating_a_window_this_workspace_does_not_own_fails_without_changing_anything() {
+        let mut workspace = workspace_with_containers(&[1]);
+        let before = workspace.clone();
+
+        assert!(workspace.float_window(404, floating_rect(0)).is_err());
+        assert_eq!(workspace.containers(), before.containers());
+        assert!(workspace.floating_windows().is_empty());
+    }
+
+    #[test]
+    fn a_hidden_container_of_floating_windows_is_not_positioned_by_the_arrangement() {
+        let mut workspace = workspace_with_containers(&[1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.float_window(0, floating_rect(0)).unwrap();
+        workspace.record_logical_slots(area);
+
+        // The remaining active container covers the whole area, and the floating window's
+        // container is absent from the slot map entirely.
+        assert_eq!(workspace.logical_slots.len(), 1);
+        assert_eq!(
+            workspace.logical_slots.get(&workspace.containers()[1].id),
+            Some(LogicalRect::from(area))
+        );
+        assert_eq!(
+            workspace.containers()[0].visible_stored_windows().count(),
+            0
+        );
     }
 
     fn hide_container(workspace: &mut Workspace, idx: usize) {
@@ -3083,19 +3321,18 @@ mod tests {
         // float index 0
         ws.new_floating_window().unwrap();
 
-        assert_eq!(ws.containers()[0].focused_window().unwrap().hwnd, 2);
-        // index 1 should still be the same
-        assert_eq!(ws.containers()[1].focused_window().unwrap().hwnd, 1);
-        assert_eq!(ws.containers()[2].focused_window().unwrap().hwnd, 3);
+        // Floating keeps the window in the container which owns it, so no container is created,
+        // destroyed or reordered and no locked index can be disturbed by it.
+        assert_eq!(ws.containers().len(), 4);
+        assert_eq!(ws.floating_windows(), vec![Window::from(0)]);
+        assert!(ws.containers()[0].is_hidden());
 
-        // unfloat - have to do this semi-manually becuase of calls to WindowsApi in
-        // new_container_for_floating_window which usually handles unfloating
-        let window = ws.floating_windows_mut().pop_back().unwrap();
-        let mut container = Container::default();
-        container.add_window(window);
-        ws.insert_container_at_idx(ws.focused_container_idx(), container);
+        ws.unfloat_window(0).unwrap();
 
-        // all indexes should be at their original position
+        assert!(ws.floating_windows().is_empty());
+        assert!(ws.containers()[0].is_active());
+
+        // all indexes are still at their original position
         for i in 0..4 {
             assert_eq!(
                 ws.containers()[i].focused_window().unwrap().hwnd,
@@ -3661,14 +3898,20 @@ mod tests {
     }
 
     #[test]
-    fn detach_removes_alternate_legacy_ownership_paths() {
-        let mut floating_workspace = Workspace::default();
-        floating_workspace
-            .floating_windows_mut()
-            .push_back(Window::from(42));
-        floating_workspace.detach_window(42).unwrap();
-        assert!(floating_workspace.floating_windows().is_empty());
+    fn detach_removes_a_floating_window_through_its_container() {
+        let mut workspace = workspace_with_containers(&[1]);
+        workspace.float_window(0, Rect::default()).unwrap();
 
+        workspace.detach_window(0).unwrap();
+
+        // A floating window is the last window of its container here, so detaching it destroys
+        // the container exactly as detaching a stored window would.
+        assert!(workspace.floating_windows().is_empty());
+        assert!(workspace.containers().is_empty());
+    }
+
+    #[test]
+    fn detach_removes_alternate_legacy_ownership_paths() {
         let mut maximized_workspace = Workspace {
             maximized_window: Some(Window::from(43)),
             maximized_window_restore_idx: Some(0),
@@ -3798,19 +4041,20 @@ mod tests {
             workspace.add_container_to_back(container);
         }
 
-        // Add window to floating_windows
-        workspace.new_floating_window().ok();
+        // Float the focused window of the focused container
+        workspace.new_floating_window().unwrap();
 
         // Should have 1 floating window
         assert_eq!(workspace.floating_windows().len(), 1);
 
-        // Should have only 2 windows now
-        let container = workspace.focused_container_mut().unwrap();
-        assert_eq!(container.windows().len(), 2);
+        // The container still owns all three: floating changes placement, not ownership
+        let container = workspace.focused_container().unwrap();
+        assert_eq!(container.windows().len(), 3);
+        assert!(container.is_active());
 
         // Should contain hwnd 0 since this is the first window in the container
-        let floating_windows = workspace.floating_windows_mut();
-        assert!(floating_windows.contains(&Window { hwnd: 0 }));
+        assert!(workspace.floating_windows().contains(&Window { hwnd: 0 }));
+        assert!(workspace.is_floating_window(0));
     }
 
     #[test]

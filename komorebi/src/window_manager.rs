@@ -733,9 +733,7 @@ impl WindowManager {
                 .ok_or_eyre("there is no workspace with that index")?;
 
             if op.floating {
-                target_workspace
-                    .floating_windows_mut()
-                    .push_back(Window::from(op.hwnd));
+                target_workspace.add_floating_window(Window::from(op.hwnd));
             } else {
                 //TODO(alex-ds13): should this take into account the target workspace
                 //`window_container_behaviour`?
@@ -1007,16 +1005,12 @@ impl WindowManager {
                     target_container_idx,
                 ),
             )?;
-        } else if let Some(idx) = origin_workspace
-            .floating_windows()
-            .iter()
-            .position(|w| w.hwnd == w_hwnd)
-        {
+        } else if origin_workspace.is_floating_window(w_hwnd) {
             // Moving floating window
             // There is no need to physically move the floating window between areas with
             // `move_to_area` because the user already did that, so we only need to transfer the
-            // window to the target `floating_windows`
-            if let Some(floating_window) = origin_workspace.floating_windows_mut().remove(idx) {
+            // window, with its floating state, to a container of the target workspace
+            if let Ok(floating_window) = origin_workspace.take_window(w_hwnd) {
                 let target_workspace = self
                     .monitors_mut()
                     .get_mut(target_monitor_idx)
@@ -1024,9 +1018,7 @@ impl WindowManager {
                     .focused_workspace_mut()
                     .ok_or_eyre("there is no focused workspace for this monitor")?;
 
-                target_workspace
-                    .floating_windows_mut()
-                    .push_back(floating_window);
+                target_workspace.adopt_managed_window(floating_window);
             }
         } else if origin_workspace
             .monocle_container
@@ -1747,14 +1739,12 @@ impl WindowManager {
         }
 
         let foreground_hwnd = WindowsApi::foreground_window()?;
-        let floating_window_index = workspace
-            .floating_windows()
-            .iter()
-            .position(|w| w.hwnd == foreground_hwnd);
+        let floating_hwnd = workspace
+            .is_floating_window(foreground_hwnd)
+            .then_some(foreground_hwnd);
 
-        let floating_window =
-            floating_window_index.and_then(|idx| workspace.floating_windows_mut().remove(idx));
-        let container = if floating_window_index.is_none() {
+        let floating_window = floating_hwnd.and_then(|hwnd| workspace.take_window(hwnd).ok());
+        let container = if floating_window.is_none() {
             Some(
                 workspace
                     .remove_focused_container()
@@ -1786,18 +1776,14 @@ impl WindowManager {
                 container.restore();
             }
 
-            for window in target_workspace.floating_windows_mut() {
-                window.restore();
-            }
-
             target_workspace.reintegrate_monocle_container()?;
         }
 
         if let Some(window) = floating_window {
-            target_workspace.floating_windows_mut().push_back(window);
+            let hwnd = window.hwnd;
+            target_workspace.adopt_managed_window(window);
             target_workspace.layer = WorkspaceLayer::Floating;
-            Window::from(window.hwnd)
-                .move_to_area(&current_area, &target_monitor.work_area_size)?;
+            Window::from(hwnd).move_to_area(&current_area, &target_monitor.work_area_size)?;
         } else if let Some(container) = container {
             let container_hwnds = container
                 .windows()
@@ -2018,8 +2004,7 @@ impl WindowManager {
         }
 
         if let Some(idx) = target_idx {
-            focused_workspace.floating_windows.focus(idx);
-            if let Some(window) = focused_workspace.floating_windows().get(idx) {
+            if let Some(window) = focused_workspace.focus_floating_window(idx) {
                 window.focus(mouse_follows_focus)?;
             }
             return Ok(());
@@ -3176,14 +3161,20 @@ impl WindowManager {
         let workspace = self.focused_workspace_mut()?;
         workspace.new_floating_window()?;
 
-        let window = workspace
-            .floating_windows_mut()
-            .back_mut()
+        let mut window = workspace
+            .focused_floating_window()
             .ok_or_eyre("there is no floating window")?;
 
         if toggle_float_placement.should_center() {
             window.center(&work_area, toggle_float_placement.should_resize())?;
+
+            // Centring moved the window after it was floated, so the rectangle the model holds
+            // for it has to be the one it actually ended up with.
+            if let Ok(centred) = WindowsApi::window_rect(window.hwnd) {
+                workspace.set_floating_rect(window.hwnd, centred);
+            }
         }
+
         window.focus(self.mouse_follows_focus)?;
 
         Ok(())
@@ -3219,12 +3210,9 @@ impl WindowManager {
         let workspace = self.focused_workspace_mut()?;
         workspace.new_monocle_container()?;
 
+        // A container hides every window it owns, floating ones included.
         for container in workspace.containers_mut() {
             container.hide(None);
-        }
-
-        for window in workspace.floating_windows_mut() {
-            window.hide();
         }
 
         Ok(())
@@ -3238,10 +3226,6 @@ impl WindowManager {
 
         for container in workspace.containers_mut() {
             container.restore();
-        }
-
-        for window in workspace.floating_windows_mut() {
-            window.restore();
         }
 
         workspace.reintegrate_monocle_container()
@@ -5551,7 +5535,7 @@ mod tests {
             wm.monitors_mut().push_back(m);
         }
 
-        // Add focused window to floating window list
+        // Float the focused window
         wm.float_window().ok();
 
         {
@@ -5559,20 +5543,22 @@ mod tests {
             let floating_windows = workspace.floating_windows();
             let container = workspace.focused_container().unwrap();
 
-            // Hwnd 0 should be added to floating_windows
-            assert_eq!(floating_windows[0].hwnd, 0);
+            // Hwnd 0 is the workspace's only floating window
+            assert_eq!(floating_windows, vec![Window::from(0)]);
 
-            // Should have a length of 1
-            assert_eq!(floating_windows.len(), 1);
+            // Floating changes placement, not ownership: the container still owns all three
+            assert_eq!(container.windows().len(), 3);
 
-            // Should have 2 windows in the container
-            assert_eq!(container.windows().len(), 2);
-
-            // Should be focused on window 1
-            assert_eq!(container.focused_window(), Some(&Window { hwnd: 1 }));
+            // Two stored windows are left, so the container still occupies a slot
+            assert!(container.is_active());
+            assert_eq!(container.visible_stored_windows().count(), 2);
         }
 
-        // Add focused window to floating window list
+        // Float the next window of the same container
+        wm.focused_workspace_mut()
+            .unwrap()
+            .focus_container_by_window(1)
+            .unwrap();
         wm.float_window().ok();
 
         {
@@ -5580,17 +5566,44 @@ mod tests {
             let floating_windows = workspace.floating_windows();
             let container = workspace.focused_container().unwrap();
 
-            // Hwnd 1 should be added to floating_windows
-            assert_eq!(floating_windows[1].hwnd, 1);
+            // Both floating windows are reported in stack order
+            assert_eq!(floating_windows, vec![Window::from(0), Window::from(1)]);
 
-            // Should have a length of 2
-            assert_eq!(floating_windows.len(), 2);
+            assert_eq!(container.windows().len(), 3);
+            assert!(container.is_active());
+        }
 
-            // Should have 1 window in the container
-            assert_eq!(container.windows().len(), 1);
+        // Float the last stored window of the container
+        wm.focused_workspace_mut()
+            .unwrap()
+            .focus_container_by_window(2)
+            .unwrap();
+        wm.float_window().ok();
 
-            // Should be focused on window 2
-            assert_eq!(container.focused_window(), Some(&Window { hwnd: 2 }));
+        {
+            let workspace = wm.focused_workspace().unwrap();
+            let container = workspace.focused_container().unwrap();
+
+            assert_eq!(workspace.floating_windows().len(), 3);
+
+            // With no visible stored window left the container is hidden, but it keeps every
+            // window it owns and it is not destroyed
+            assert_eq!(container.windows().len(), 3);
+            assert!(container.is_hidden());
+            assert_eq!(workspace.containers().len(), 1);
+            assert_eq!(workspace.active_container_count(), 0);
+        }
+
+        // Unfloat brings the window back under the control of the same container
+        wm.focused_workspace_mut()
+            .unwrap()
+            .unfloat_window(2)
+            .unwrap();
+
+        {
+            let workspace = wm.focused_workspace().unwrap();
+            assert_eq!(workspace.floating_windows().len(), 2);
+            assert!(workspace.containers()[0].is_active());
         }
     }
 

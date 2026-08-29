@@ -258,7 +258,6 @@ impl From<&WindowManager> for State {
                             monocle_container_restore_idx: workspace.monocle_container_restore_idx,
                             maximized_window: workspace.maximized_window,
                             maximized_window_restore_idx: workspace.maximized_window_restore_idx,
-                            floating_windows: workspace.floating_windows.clone(),
                             layout: workspace.layout.clone(),
                             layout_options: workspace.layout_options,
                             layout_rules: workspace.layout_rules.clone(),

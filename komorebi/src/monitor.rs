@@ -403,13 +403,14 @@ impl Monitor {
                 .ok()
                 .and_then(|foreground_hwnd| {
                     workspace
-                        .floating_windows()
-                        .iter()
-                        .position(|w| w.hwnd == foreground_hwnd)
+                        .is_floating_window(foreground_hwnd)
+                        .then_some(foreground_hwnd)
                 });
 
-        if let Some(idx) = floating_window_index {
-            if let Some(window) = workspace.floating_windows_mut().remove(idx) {
+        if let Some(hwnd) = floating_window_index {
+            // The window keeps its floating placement and rectangle across the move; only the
+            // container which owns it changes.
+            if let Ok(window) = workspace.take_window(hwnd) {
                 let workspaces = self.workspaces_mut();
                 #[allow(clippy::option_if_let_else)]
                 let target_workspace = match workspaces.get_mut(target_workspace_idx) {
@@ -420,7 +421,7 @@ impl Monitor {
                     Some(workspace) => workspace,
                 };
 
-                target_workspace.floating_windows_mut().push_back(window);
+                target_workspace.adopt_managed_window(window);
                 target_workspace.layer = WorkspaceLayer::Floating;
             }
         } else {
@@ -442,10 +443,6 @@ impl Monitor {
             if target_workspace.monocle_container.is_some() {
                 for container in target_workspace.containers_mut() {
                     container.restore();
-                }
-
-                for window in target_workspace.floating_windows_mut() {
-                    window.restore();
                 }
 
                 target_workspace.reintegrate_monocle_container()?;

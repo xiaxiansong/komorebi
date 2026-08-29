@@ -274,12 +274,15 @@ impl WindowManager {
                             self.focus_container_window(window_idx)?;
                         }
                         WorkspaceWindowLocation::Floating(window_idx) => {
+                            let mouse_follows_focus = self.mouse_follows_focus;
+
                             if let Some(window) = self
-                                .focused_workspace_mut()?
-                                .floating_windows_mut()
-                                .get_mut(window_idx)
+                                .focused_workspace()?
+                                .floating_windows()
+                                .get(window_idx)
+                                .copied()
                             {
-                                window.focus(self.mouse_follows_focus)?;
+                                window.focus(mouse_follows_focus)?;
                             }
                         }
                     }
@@ -1284,12 +1287,9 @@ impl WindowManager {
                         workspace.layer = WorkspaceLayer::Floating;
 
                         let focused_idx = workspace.focused_floating_window_idx();
-                        let mut window_idx_pairs = workspace
-                            .floating_windows_mut()
-                            .make_contiguous()
-                            .iter()
-                            .enumerate()
-                            .collect::<Vec<_>>();
+                        let floating_windows = workspace.floating_windows();
+                        let mut window_idx_pairs =
+                            floating_windows.iter().enumerate().collect::<Vec<_>>();
 
                         // Sort by window area
                         window_idx_pairs.sort_by_key(|(_, w)| {
@@ -1349,11 +1349,8 @@ impl WindowManager {
                                 }
                             }
 
-                            let mut window_idx_pairs = workspace
-                                .floating_windows_mut()
-                                .make_contiguous()
-                                .iter()
-                                .collect::<Vec<_>>();
+                            let floating_windows = workspace.floating_windows();
+                            let mut window_idx_pairs = floating_windows.iter().collect::<Vec<_>>();
 
                             // Sort by window area
                             window_idx_pairs.sort_by_key(|w| {

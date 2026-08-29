@@ -686,7 +686,7 @@ impl WindowManager {
                                 // on a floating workspace
                                 let center_spawned_floats =
                                     placement.should_center() && workspace.tile;
-                                workspace.floating_windows_mut().push_back(window);
+                                workspace.add_floating_window(window);
                                 workspace.layer = WorkspaceLayer::Floating;
                                 if center_spawned_floats {
                                     let mut floating_window = window;
@@ -919,7 +919,7 @@ impl WindowManager {
                                 window.focus(self.mouse_follows_focus)?;
                             }
                         } else if window_management_behaviour.float_override {
-                            workspace.floating_windows_mut().push_back(window);
+                            workspace.add_floating_window(window);
                             self.update_focused_workspace(false, false)?;
                         } else {
                             match window_management_behaviour.current_behaviour {
@@ -1135,9 +1135,6 @@ impl WindowManager {
                         tracing::info!("disabling monocle");
                         for container in workspace.containers_mut() {
                             container.restore();
-                        }
-                        for window in workspace.floating_windows_mut() {
-                            window.restore();
                         }
                         workspace.reintegrate_monocle_container()?;
                     }

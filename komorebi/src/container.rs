@@ -286,25 +286,79 @@ impl Container {
         }
     }
 
+    /// Show what this container should be showing.
+    ///
+    /// Only one stored window of a stack is on screen at a time, but a floating window is not
+    /// part of that stack for display purposes: it keeps its own rectangle and stays visible
+    /// next to whichever stored window is on top. A minimized window is never restored here,
+    /// because being minimized is a window state this container does not own.
     pub fn restore(&self) {
-        if let Some(window) = self.focused_window() {
+        if let Some(window) = self.focused_visible_stored_window() {
+            window.restore();
+        }
+
+        for window in self.visible_floating_windows() {
             window.restore();
         }
     }
 
-    /// Hides the unfocused windows of the container and restores the focused one. This function
-    /// is used to make sure we update the window that should be shown on a stack. If the container
-    /// isn't a stack this function won't change anything.
+    /// Hides the unfocused stored windows of the container and restores the focused one. This
+    /// function is used to make sure we update the window that should be shown on a stack. If the
+    /// container isn't a stack this function won't change anything.
+    ///
+    /// Floating windows are left alone unless they are minimized: their visibility does not
+    /// depend on where they sit in the stack.
     pub fn load_focused_window(&mut self) {
         let focused_idx = self.focused_window_idx();
 
         for (i, window) in self.windows_mut().iter_mut().enumerate() {
-            if i == focused_idx {
-                window.restore_with_border(false);
-            } else {
-                window.hide_with_border(false);
+            match (window.placement, window.visibility) {
+                (_, Visibility::Minimized) => {}
+                (ManagedPlacement::Floating, _) => window.restore_with_border(false),
+                (ManagedPlacement::Stored, _) => {
+                    if i == focused_idx {
+                        window.restore_with_border(false);
+                    } else {
+                        window.hide_with_border(false);
+                    }
+                }
             }
         }
+    }
+
+    /// The stored window this container is currently showing, if it is showing one.
+    ///
+    /// The ring focus can be on a floating or a minimized window, which is exactly when this
+    /// falls back to the first stored window the container could show instead.
+    pub fn focused_visible_stored_window(&self) -> Option<&Window> {
+        self.focused_managed_window()
+            .filter(|window| window.is_visible_stored())
+            .or_else(|| self.visible_stored_windows().next())
+            .map(|window| &window.window)
+    }
+
+    pub fn visible_floating_windows(&self) -> impl Iterator<Item = &ManagedWindow> {
+        self.windows().iter().filter(|window| {
+            window.placement == ManagedPlacement::Floating
+                && window.visibility == Visibility::Visible
+        })
+    }
+
+    pub fn floating_windows(&self) -> impl Iterator<Item = &ManagedWindow> {
+        self.windows()
+            .iter()
+            .filter(|window| window.placement == ManagedPlacement::Floating)
+    }
+
+    /// Mutable access to this container's floating windows.
+    ///
+    /// This goes past [`ManagedWindowsMut`] deliberately: that guard exists to stamp ownership on
+    /// insertion, and iteration inserts nothing.
+    pub fn floating_windows_mut(&mut self) -> impl Iterator<Item = &mut ManagedWindow> {
+        self.windows
+            .elements_mut()
+            .iter_mut()
+            .filter(|window| window.placement == ManagedPlacement::Floating)
     }
 
     pub fn hwnd_from_exe(&self, exe: &str) -> Option<isize> {

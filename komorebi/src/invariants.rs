@@ -210,14 +210,12 @@ impl ValidateInvariants for Workspace {
             ));
         }
 
-        // Alternate ownership through the workspace-level floating list, the maximized window,
-        // and the monocle container is transitional: those windows are removed from the model
-        // while they are held there. Holding the same window in both places is still a defect.
-        let mut alternate = self
-            .floating_windows()
-            .iter()
-            .map(|window| window.hwnd)
-            .collect::<Vec<_>>();
+        // Alternate ownership through the maximized window and the monocle container is
+        // transitional: those windows are removed from the model while they are held there.
+        // Holding the same window in both places is still a defect. Floating windows are not
+        // listed here any more, because they are owned by a container like every other managed
+        // window.
+        let mut alternate = Vec::new();
 
         if let Some(window) = self.maximized_window {
             alternate.push(window.hwnd);
@@ -400,6 +398,7 @@ impl ValidateInvariants for WindowManager {
 mod tests {
     use super::*;
     use crate::Window;
+    use crate::core::Rect;
     use crate::managed_window::ManagedWindow;
 
     fn container_with(hwnds: &[isize]) -> Container {
@@ -480,12 +479,22 @@ mod tests {
     #[test]
     fn a_window_held_by_a_container_and_by_the_workspace_is_reported() {
         let mut workspace = workspace_with(vec![container_with(&[1])]);
-        workspace.floating_windows_mut().push_back(Window::from(1));
+        // The maximized window is the remaining transitional ownership path.
+        workspace.maximized_window = Some(Window::from(1));
 
         assert_eq!(
             invariants(&workspace.validate_invariants()),
             vec![Invariant::WindowOwnership]
         );
+    }
+
+    #[test]
+    fn a_floating_window_in_its_own_container_is_not_a_violation() {
+        let mut workspace = workspace_with(vec![container_with(&[1])]);
+        workspace.float_window(1, Rect::default()).unwrap();
+
+        assert!(workspace.is_floating_window(1));
+        assert!(workspace.validate_invariants().is_empty());
     }
 
     #[test]

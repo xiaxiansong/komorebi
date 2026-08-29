@@ -958,7 +958,8 @@ impl ContainerInfo {
         });
 
         // All floating windows
-        let floats = ws.floating_windows().iter().map(Self::from_window);
+        let floating_windows = ws.floating_windows();
+        let floats = floating_windows.iter().map(Self::from_window);
         // All windows
         monocle.into_iter().chain(tiled).chain(floats).collect()
     }
@@ -970,7 +971,11 @@ impl ContainerInfo {
     /// 2. Monocle container
     /// 3. Focused tiled container
     pub fn from_focused_container(ws: &Workspace) -> Option<Self> {
-        if let Some(window) = ws.floating_windows().iter().find(|w| w.is_focused()) {
+        if let Some(window) = ws
+            .floating_windows()
+            .iter()
+            .find(|window| window.is_focused())
+        {
             return Some(Self::from_window(window));
         }
         if let Some(container) = &ws.monocle_container {
