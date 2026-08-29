@@ -154,7 +154,7 @@ pub fn handle_notifications(wm: Arc<Mutex<WindowManager>>) -> color_eyre::Result
                 let container_ids = ws
                     .containers()
                     .iter()
-                    .map(|c| c.id.clone())
+                    .map(|c| c.id.to_string())
                     .collect::<Vec<_>>();
 
                 let mut to_remove = vec![];
@@ -183,17 +183,17 @@ pub fn handle_notifications(wm: Arc<Mutex<WindowManager>>) -> color_eyre::Result
                     };
 
                     if !should_add_stackbar {
-                        if let Some(stackbar) = stackbars.get(&container.id) {
+                        if let Some(stackbar) = stackbars.get(container.id.as_str()) {
                             stackbar.destroy()?
                         }
 
-                        stackbars.remove(&container.id);
-                        stackbars_monitors.remove(&container.id);
+                        stackbars.remove(container.id.as_str());
+                        stackbars_monitors.remove(container.id.as_str());
                         continue 'containers;
                     }
 
                     // Get the stackbar entry for this container from the map or create one
-                    let stackbar = match stackbars.entry(container.id.clone()) {
+                    let stackbar = match stackbars.entry(container.id.to_string()) {
                         Entry::Occupied(entry) => entry.into_mut(),
                         Entry::Vacant(entry) => {
                             if let Ok(stackbar) = Stackbar::create(&container.id) {
@@ -204,7 +204,7 @@ pub fn handle_notifications(wm: Arc<Mutex<WindowManager>>) -> color_eyre::Result
                         }
                     };
 
-                    stackbars_monitors.insert(container.id.clone(), monitor_idx);
+                    stackbars_monitors.insert(container.id.to_string(), monitor_idx);
 
                     let rect = WindowsApi::window_rect(
                         container.focused_window().copied().unwrap_or_default().hwnd,

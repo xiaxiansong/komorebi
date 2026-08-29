@@ -412,7 +412,7 @@ pub fn handle_notifications(wm: Arc<Mutex<WindowManager>>) -> color_eyre::Result
                             let mut new_border = false;
                             let focused_window_hwnd =
                                 monocle.focused_window().map(|w| w.hwnd).unwrap_or_default();
-                            let id = monocle.id.clone();
+                            let id = monocle.id.to_string();
                             let border = match borders.entry(id.clone()) {
                                 Entry::Occupied(entry) => entry.into_mut(),
                                 Entry::Vacant(entry) => {
@@ -536,7 +536,7 @@ pub fn handle_notifications(wm: Arc<Mutex<WindowManager>>) -> color_eyre::Result
                         let mut container_and_floating_window_ids = ws
                             .containers()
                             .iter()
-                            .map(|c| c.id.clone())
+                            .map(|c| c.id.to_string())
                             .collect::<Vec<_>>();
 
                         for w in ws.floating_windows() {
@@ -554,7 +554,7 @@ pub fn handle_notifications(wm: Arc<Mutex<WindowManager>>) -> color_eyre::Result
                         'containers: for (idx, c) in ws.containers().iter().enumerate() {
                             let focused_window_hwnd =
                                 c.focused_window().map(|w| w.hwnd).unwrap_or_default();
-                            let id = c.id.clone();
+                            let id = c.id.to_string();
 
                             // Get the border entry for this container from the map or create one
                             let mut new_border = false;

@@ -1128,17 +1128,17 @@ mod tests {
             "Test Monitor".to_string(),
             "Test Device".to_string(),
             "Test Device ID".to_string(),
-            Some("TestMonitorID".to_string()),
+            Some("TestSingleMonitorID".to_string()),
         );
 
         // Insert the monitor into the cache
-        insert_in_monitor_cache("TestMonitorID", m.clone());
+        insert_in_monitor_cache("TestSingleMonitorID", m.clone());
 
         // Retrieve the monitor from the cache
         let cache = MONITOR_CACHE
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock();
-        let retrieved_monitor = cache.get("TestMonitorID");
+        let retrieved_monitor = cache.get("TestSingleMonitorID");
 
         // Check that the monitor was inserted correctly and matches the expected value
         assert_eq!(retrieved_monitor, Some(&m));
@@ -1153,7 +1153,7 @@ mod tests {
             "Test Monitor".to_string(),
             "Test Device".to_string(),
             "Test Device ID".to_string(),
-            Some("TestMonitorID".to_string()),
+            Some("TestFirstMonitorID".to_string()),
         );
 
         let m2 = monitor::new(
@@ -1163,14 +1163,14 @@ mod tests {
             "Test Monitor 2".to_string(),
             "Test Device 2".to_string(),
             "Test Device ID 2".to_string(),
-            Some("TestMonitorID2".to_string()),
+            Some("TestSecondMonitorID".to_string()),
         );
 
         // Insert the first monitor into the cache
-        insert_in_monitor_cache("TestMonitorID", m1.clone());
+        insert_in_monitor_cache("TestFirstMonitorID", m1.clone());
 
         // Insert the second monitor into the cache
-        insert_in_monitor_cache("TestMonitorID2", m2.clone());
+        insert_in_monitor_cache("TestSecondMonitorID", m2.clone());
 
         // Retrieve the cache to check if the first and second monitors are present
         let cache = MONITOR_CACHE
@@ -1179,14 +1179,14 @@ mod tests {
 
         // Check if Monitor 1 was found in the cache
         assert_eq!(
-            cache.get("TestMonitorID"),
+            cache.get("TestFirstMonitorID"),
             Some(&m1),
             "Monitor cache should contain monitor 1"
         );
 
         // Check if Monitor 2 was found in the cache
         assert_eq!(
-            cache.get("TestMonitorID2"),
+            cache.get("TestSecondMonitorID"),
             Some(&m2),
             "Monitor cache should contain monitor 2"
         );

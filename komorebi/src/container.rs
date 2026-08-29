@@ -2,20 +2,20 @@ use std::collections::VecDeque;
 use std::ops::Deref;
 use std::ops::DerefMut;
 
-use nanoid::nanoid;
 use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
 
 use crate::Lockable;
 use crate::managed_window::ManagedWindow;
+use crate::model::ContainerId;
 use crate::ring::Ring;
 use crate::window::Window;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct Container {
-    pub id: String,
+    pub id: ContainerId,
     #[serde(default)]
     pub locked: bool,
     windows: Ring<ManagedWindow>,
@@ -23,32 +23,32 @@ pub struct Container {
 
 #[derive(Deserialize)]
 struct ContainerRepr {
-    id: String,
+    id: ContainerId,
     #[serde(default)]
     locked: bool,
     windows: Ring<ManagedWindow>,
 }
 
 pub trait IntoManagedWindow {
-    fn into_managed_window(self, container_id: &str) -> ManagedWindow;
+    fn into_managed_window(self, container_id: &ContainerId) -> ManagedWindow;
 }
 
 impl IntoManagedWindow for Window {
-    fn into_managed_window(self, container_id: &str) -> ManagedWindow {
-        ManagedWindow::capture(self, container_id.to_string())
+    fn into_managed_window(self, container_id: &ContainerId) -> ManagedWindow {
+        ManagedWindow::capture(self, container_id.clone())
     }
 }
 
 impl IntoManagedWindow for ManagedWindow {
-    fn into_managed_window(mut self, container_id: &str) -> ManagedWindow {
-        self.container_id = container_id.to_string();
+    fn into_managed_window(mut self, container_id: &ContainerId) -> ManagedWindow {
+        self.container_id.clone_from(container_id);
         self
     }
 }
 
 /// Mutable access to a container's window ring which keeps ownership correct on insertion.
 pub struct ManagedWindowsMut<'a> {
-    container_id: &'a str,
+    container_id: &'a ContainerId,
     windows: &'a mut VecDeque<ManagedWindow>,
 }
 
@@ -108,7 +108,7 @@ impl<'de> Deserialize<'de> for Container {
 impl Default for Container {
     fn default() -> Self {
         Self {
-            id: nanoid!(),
+            id: ContainerId::new(),
             locked: false,
             windows: Ring::default(),
         }
@@ -163,14 +163,14 @@ impl Container {
 
     pub fn preselect() -> Self {
         Self {
-            id: "PRESELECT".to_string(),
+            id: ContainerId::from("PRESELECT"),
             locked: false,
             windows: Default::default(),
         }
     }
 
     pub fn is_preselect(&self) -> bool {
-        self.id == "PRESELECT"
+        self.id.as_str() == "PRESELECT"
     }
 
     pub fn hide(&self, omit: Option<isize>) {
@@ -447,7 +447,7 @@ mod tests {
         let mut target = Container::default();
         let mut window = ManagedWindow::from_observed(
             Window::from(42),
-            "stale-owner".into(),
+            "stale-owner",
             true,
             true,
             false,

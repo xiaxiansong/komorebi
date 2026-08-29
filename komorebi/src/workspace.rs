@@ -36,6 +36,7 @@ use crate::core::Rect;
 use crate::core::WindowPlacement;
 use crate::lockable_sequence::LockableSequence;
 use crate::managed_window::ManagedWindow;
+use crate::model::WorkspaceId;
 use crate::ring::Ring;
 use crate::should_act;
 use crate::should_act_individual;
@@ -57,6 +58,8 @@ use uds_windows::UnixStream;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct Workspace {
+    #[serde(default = "WorkspaceId::new")]
+    pub id: WorkspaceId,
     pub name: Option<String>,
     pub containers: Ring<Container>,
     pub monocle_container: Option<Container>,
@@ -128,6 +131,7 @@ impl_ring_elements!(Workspace, Window, "floating_window");
 impl Default for Workspace {
     fn default() -> Self {
         Self {
+            id: WorkspaceId::new(),
             name: None,
             containers: Ring::default(),
             monocle_container: None,
@@ -2094,6 +2098,35 @@ mod tests {
     use crate::Window;
     use crate::container::Container;
     use std::collections::HashMap;
+
+    #[test]
+    fn legacy_workspace_json_gets_a_new_stable_id() {
+        let workspace = Workspace::default();
+        let mut json = serde_json::to_value(&workspace).unwrap();
+        json.as_object_mut().unwrap().remove("id");
+
+        let migrated: Workspace = serde_json::from_value(json).unwrap();
+
+        assert!(!migrated.id.is_empty());
+        assert_ne!(migrated.id, workspace.id);
+    }
+
+    #[test]
+    fn workspace_id_survives_serialization_and_order_changes() {
+        let first = Workspace::default();
+        let second = Workspace::default();
+        let first_id = first.id.clone();
+        let second_id = second.id.clone();
+        let mut workspaces = VecDeque::from([first, second]);
+
+        workspaces.swap(0, 1);
+        assert_eq!(workspaces[0].id, second_id);
+        assert_eq!(workspaces[1].id, first_id);
+
+        let roundtrip: Workspace =
+            serde_json::from_str(&serde_json::to_string(&workspaces[1]).unwrap()).unwrap();
+        assert_eq!(roundtrip.id, first_id);
+    }
 
     #[test]
     fn test_locked_containers_with_new_window() {

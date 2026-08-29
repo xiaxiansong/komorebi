@@ -183,17 +183,38 @@ rewrites every window to the new container ID instead of copying stale owners. F
 layouts 128 passed, bar 3 passed, all remaining targets/doc-tests passed). Format/Clippy remain
 unavailable for the recorded toolchain reasons.
 
-### Phase 3 - Stable workspace identity and MRU histories
+### Phase 3A - Stable workspace and container identity
 
-- [ ] Add typed stable `WorkspaceId`/`ContainerId`; migrate the existing container string ID.
+- [x] Add typed stable `WorkspaceId`/`ContainerId`; migrate the existing container string ID.
+- [x] Preserve IDs through ordering, cloning, state output, and ownership changes.
+- [x] Accept legacy workspace JSON without an ID and existing string container IDs.
+- [x] Add stable-ID serde and ordering tests.
+- [x] Commit as `feat: add stable workspace and container identities`.
+
+Expected handwritten change: 200-350 lines. Likely files: new `model.rs`, `lib.rs`,
+`managed_window.rs`, `container.rs`, `workspace.rs`, `state.rs`, and `stackbar_manager/mod.rs`.
+
+Actual files: new `model.rs`, plus `lib.rs`, `managed_window.rs`, `container.rs`, `workspace.rs`,
+`state.rs`, `border_manager/mod.rs`, `stackbar_manager/mod.rs`, and test-only cache keys in
+`monitor_reconciliator/mod.rs`. Actual source/test change before this plan update: 93 lines in the
+new ID module plus 79 added and 42 removed lines elsewhere. Transparent serde retains the existing
+JSON string shape for container IDs; legacy workspaces without an ID receive a new stable ID.
+`cargo check --workspace` and the schemars feature check passed. The serial full workspace suite
+passed: komorebi 123 passed/1 ignored, layouts 128 passed, bar 3 passed, and all other targets and
+doc-tests passed. Parallel runs exposed pre-existing shared-global test isolation in the monitor
+cache/channel tests; unique cache keys were added, while the channel tests remain reliably covered
+by the passing serial run. Format/Clippy remain unavailable for the recorded toolchain reasons.
+
+### Phase 3B - Focus histories and ownership invariants
+
 - [ ] Add workspace container MRU, container window MRU, and per-workspace minimize MRU.
 - [ ] Centralize record, selection, deduplication, and deletion cleanup.
 - [ ] Add `validate_invariants()` ownership/history checks enabled by tests and debug assertions.
-- [ ] Add focus, deletion, minimize-history, and stable-ID serde tests.
-- [ ] Commit as `feat: add stable identities and focus histories`.
+- [ ] Add focus, deletion, minimize-history, and invariant tests.
+- [ ] Commit as `feat: add focus histories and ownership invariants`.
 
-Expected handwritten change: 300-500 lines. Likely files: new `model.rs`, `ring.rs`, `container.rs`,
-`workspace.rs`, `monitor.rs`, `window_manager.rs`, `state.rs`.
+Expected handwritten change: 300-500 lines. Likely files: `container.rs`, `workspace.rs`,
+`monitor.rs`, `window_manager.rs`, `process_event.rs`, and `state.rs`.
 
 ### Phase 4 - Logical slots and render rectangles
 
@@ -419,3 +440,9 @@ This list is updated from actual diffs, not treated as permission to change ever
   float/maximize/minimize transition routing was moved to Phase 5 after inspection showed it cannot
   preserve state until those workspace-owned alternate paths are removed. Next phase: typed stable
   workspace/container identities and explicit focus/minimize histories.
+- 2026-08-29: Phase 3 was split into 3A identity and 3B histories/invariants after call-site review
+  showed that doing both together would exceed the phase review-size limit. Phase 3A added
+  transparent typed workspace/container IDs, migrated managed ownership and UI integration
+  boundaries, preserved workspace IDs in state snapshots, and maintained legacy JSON compatibility.
+  Compile, schema, focused serial tests, and the full serial workspace suite passed. Next phase:
+  explicit focus/minimize histories and ownership/history invariant validation.

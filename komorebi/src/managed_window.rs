@@ -6,6 +6,7 @@ use serde::Deserializer;
 use serde::Serialize;
 
 use crate::core::Rect;
+use crate::model::ContainerId;
 use crate::window::Window;
 use crate::windows_api::WindowsApi;
 
@@ -36,13 +37,13 @@ pub enum Presentation {
 
 /// Runtime and serialized state for a window owned by a container.
 ///
-/// `container_id` remains a string until the stable ID newtypes are introduced. Container
-/// migration fills an empty ID accepted from legacy state with the deserializing container's ID.
+/// Container migration fills an empty or stale ID accepted from legacy state with the
+/// deserializing container's stable ID.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ManagedWindow {
     pub window: Window,
-    pub container_id: String,
+    pub container_id: ContainerId,
     pub placement: ManagedPlacement,
     pub visibility: Visibility,
     pub presentation: Presentation,
@@ -56,7 +57,7 @@ enum ManagedWindowRepr {
     Current {
         window: Window,
         #[serde(default)]
-        container_id: String,
+        container_id: ContainerId,
         #[serde(default)]
         placement: ManagedPlacement,
         #[serde(default)]
@@ -96,7 +97,7 @@ impl<'de> Deserialize<'de> for ManagedWindow {
             },
             ManagedWindowRepr::Legacy(window) => Self::from_observed(
                 window,
-                String::new(),
+                ContainerId::default(),
                 false,
                 false,
                 false,
@@ -120,7 +121,7 @@ impl DerefMut for ManagedWindow {
 }
 
 impl ManagedWindow {
-    pub fn capture(window: Window, container_id: String) -> Self {
+    pub fn capture(window: Window, container_id: ContainerId) -> Self {
         Self::from_observed(
             window,
             container_id,
@@ -132,7 +133,7 @@ impl ManagedWindow {
 
     pub fn from_observed(
         window: Window,
-        container_id: String,
+        container_id: impl Into<ContainerId>,
         minimized: bool,
         maximized: bool,
         fullscreen: bool,
@@ -153,7 +154,7 @@ impl ManagedWindow {
 
         Self {
             window,
-            container_id,
+            container_id: container_id.into(),
             placement: ManagedPlacement::Stored,
             visibility,
             presentation,
@@ -254,14 +255,14 @@ mod tests {
     }
 
     fn managed() -> ManagedWindow {
-        ManagedWindow::from_observed(Window::from(42), "container-1".into(), false, false, false)
+        ManagedWindow::from_observed(Window::from(42), "container-1", false, false, false)
     }
 
     #[test]
     fn observed_state_keeps_visibility_and_presentation_independent() {
         let window = ManagedWindow::from_observed(
             Window::from(42),
-            "container-1".into(),
+            "container-1",
             true,
             true,
             false,
@@ -276,7 +277,7 @@ mod tests {
     fn fullscreen_observation_is_distinct_from_maximized() {
         let window = ManagedWindow::from_observed(
             Window::from(42),
-            "container-1".into(),
+            "container-1",
             false,
             false,
             true,
