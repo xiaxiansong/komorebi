@@ -158,17 +158,30 @@ global Git configuration. It can be replaced by a signed amend after 1Password s
 
 ### Phase 2B - Container managed-window storage migration
 
-- [ ] Convert container storage from `Window` to `ManagedWindow` while preserving convenient Win32
+- [x] Convert container storage from `Window` to `ManagedWindow` while preserving convenient Win32
   accessors and legacy container deserialization.
-- [ ] Assign and update the owning container ID on every add, move, stack, and removal path.
-- [ ] Capture initial state when a new or resumed HWND first enters a container.
-- [ ] Route existing minimize/maximize/float paths through the multidimensional transition methods
-  without yet removing the legacy workspace-owned alternate presentation paths (Phase 5).
-- [ ] Add container ownership, legacy state, new-window, and resume-state tests.
-- [ ] Commit as `feat: store managed window state in containers`.
+- [x] Assign and update the owning container ID on every add, move, stack, and removal path.
+- [x] Capture initial state when a new or resumed HWND first enters a container.
+- [x] Preserve multidimensional state across container-to-container stack/split operations. The
+  legacy workspace-owned floating/maximized paths still explicitly unwrap to `Window`; routing
+  those transitions without discarding state moves to Phase 5, where alternate ownership is
+  removed atomically rather than temporarily giving a detached window a stale container ID.
+- [x] Add container ownership, legacy/current serde, state-preserving move, and capture-path tests.
+- [x] Commit as `feat: store managed window state in containers`.
 
 Expected handwritten change: 300-500 lines. Likely files: `container.rs`, `workspace.rs`,
 `window_manager.rs`, `process_event.rs`, `windows_callbacks.rs`, `state.rs`.
+
+Actual files: `container.rs`, `workspace.rs`, `window_manager.rs`, `windows_callbacks.rs`,
+`stackbar_manager/stackbar.rs`, and `komorebi-bar/src/widgets/komorebi.rs`. Actual source/test diff
+before this plan update: 276 added, 26 removed lines. `Container` now serializes
+`Ring<ManagedWindow>`, repairs legacy or stale owner IDs on deserialize, captures observed Win32
+state for raw-window insertion, and preserves state while reassigning ownership for stack/split
+operations. Focused `Window` compatibility accessors limited unrelated churn. `stack_all` now
+rewrites every window to the new container ID instead of copying stale owners. Focused tests passed;
+`cargo check --workspace` passed; full workspace tests passed (komorebi 119 passed/1 ignored,
+layouts 128 passed, bar 3 passed, all remaining targets/doc-tests passed). Format/Clippy remain
+unavailable for the recorded toolchain reasons.
 
 ### Phase 3 - Stable workspace identity and MRU histories
 
@@ -201,6 +214,8 @@ there.
 - [ ] Make only containers with a visible stored window occupy a logical slot.
 - [ ] Migrate floating windows from the workspace list into their owning containers.
 - [ ] Remove alternate ownership through maximized/monocle storage; presentation becomes window state.
+- [ ] Route minimize/restore, maximize/fullscreen, and stored/floating operations through the
+  multidimensional transition methods once windows no longer leave their owning container.
 - [ ] Make state transitions idempotent and extend invariant validation.
 - [ ] Add all basic Hidden classification and ownership tests.
 - [ ] Commit as `feat: derive active and hidden container state`.
@@ -397,3 +412,10 @@ This list is updated from actual diffs, not treated as permission to change ever
   two existing foreground-dependent monitor tests passed; exact failure and filtered verification
   are recorded above. Next phase: migrate container storage and all ownership-changing call sites to
   `ManagedWindow`.
+- 2026-08-29: Phase 2B migrated container rings and insertion/removal APIs to `ManagedWindow`,
+  repaired ownership during deserialization and every current stack/split insertion, captured
+  observed state for new/resumed raw HWNDs, preserved state across container moves, and adapted the
+  bar/stackbar readers. The full workspace check and test suite passed. The planned legacy
+  float/maximize/minimize transition routing was moved to Phase 5 after inspection showed it cannot
+  preserve state until those workspace-owned alternate paths are removed. Next phase: typed stable
+  workspace/container identities and explicit focus/minimize histories.

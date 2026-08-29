@@ -1,23 +1,109 @@
 use std::collections::VecDeque;
+use std::ops::Deref;
+use std::ops::DerefMut;
 
 use nanoid::nanoid;
 use serde::Deserialize;
+use serde::Deserializer;
 use serde::Serialize;
 
 use crate::Lockable;
+use crate::managed_window::ManagedWindow;
 use crate::ring::Ring;
 use crate::window::Window;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct Container {
     pub id: String,
     #[serde(default)]
     pub locked: bool,
-    windows: Ring<Window>,
+    windows: Ring<ManagedWindow>,
 }
 
-impl_ring_elements!(Container, Window);
+#[derive(Deserialize)]
+struct ContainerRepr {
+    id: String,
+    #[serde(default)]
+    locked: bool,
+    windows: Ring<ManagedWindow>,
+}
+
+pub trait IntoManagedWindow {
+    fn into_managed_window(self, container_id: &str) -> ManagedWindow;
+}
+
+impl IntoManagedWindow for Window {
+    fn into_managed_window(self, container_id: &str) -> ManagedWindow {
+        ManagedWindow::capture(self, container_id.to_string())
+    }
+}
+
+impl IntoManagedWindow for ManagedWindow {
+    fn into_managed_window(mut self, container_id: &str) -> ManagedWindow {
+        self.container_id = container_id.to_string();
+        self
+    }
+}
+
+/// Mutable access to a container's window ring which keeps ownership correct on insertion.
+pub struct ManagedWindowsMut<'a> {
+    container_id: &'a str,
+    windows: &'a mut VecDeque<ManagedWindow>,
+}
+
+impl ManagedWindowsMut<'_> {
+    pub fn push_back(&mut self, window: impl IntoManagedWindow) {
+        self.windows
+            .push_back(window.into_managed_window(self.container_id));
+    }
+}
+
+impl Deref for ManagedWindowsMut<'_> {
+    type Target = VecDeque<ManagedWindow>;
+
+    fn deref(&self) -> &Self::Target {
+        self.windows
+    }
+}
+
+impl DerefMut for ManagedWindowsMut<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.windows
+    }
+}
+
+impl<'a> IntoIterator for ManagedWindowsMut<'a> {
+    type Item = &'a mut ManagedWindow;
+    type IntoIter = std::collections::vec_deque::IterMut<'a, ManagedWindow>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.windows.iter_mut()
+    }
+}
+
+impl<'de> Deserialize<'de> for Container {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let repr = ContainerRepr::deserialize(deserializer)?;
+        let mut container = Self {
+            id: repr.id,
+            locked: repr.locked,
+            windows: repr.windows,
+        };
+
+        // The container is the authority for ownership. This both migrates legacy serialized
+        // windows (whose owner defaults to an empty ID) and repairs stale owner IDs.
+        let container_id = container.id.clone();
+        for window in container.windows_mut() {
+            window.container_id.clone_from(&container_id);
+        }
+
+        Ok(container)
+    }
+}
 
 impl Default for Container {
     fn default() -> Self {
@@ -41,6 +127,40 @@ impl Lockable for Container {
 }
 
 impl Container {
+    pub const fn windows(&self) -> &VecDeque<ManagedWindow> {
+        self.windows.elements()
+    }
+
+    pub fn windows_mut(&mut self) -> ManagedWindowsMut<'_> {
+        ManagedWindowsMut {
+            container_id: &self.id,
+            windows: self.windows.elements_mut(),
+        }
+    }
+
+    /// Compatibility accessor for callers that only need the Win32 handle wrapper.
+    pub fn focused_window(&self) -> Option<&Window> {
+        self.windows.focused().map(|window| &window.window)
+    }
+
+    pub fn focused_window_mut(&mut self) -> Option<&mut Window> {
+        self.windows
+            .focused_mut()
+            .map(|window| &mut window.window)
+    }
+
+    pub fn focused_managed_window(&self) -> Option<&ManagedWindow> {
+        self.windows.focused()
+    }
+
+    pub fn focused_managed_window_mut(&mut self) -> Option<&mut ManagedWindow> {
+        self.windows.focused_mut()
+    }
+
+    pub const fn focused_window_idx(&self) -> usize {
+        self.windows.focused_idx()
+    }
+
     pub fn preselect() -> Self {
         Self {
             id: "PRESELECT".to_string(),
@@ -135,18 +255,25 @@ impl Container {
         None
     }
 
-    pub fn remove_window_by_idx(&mut self, idx: usize) -> Option<Window> {
+    pub fn remove_window_by_idx(&mut self, idx: usize) -> Option<ManagedWindow> {
         let window = self.windows_mut().remove(idx);
         self.focus_window(idx.saturating_sub(1));
         window
     }
 
-    pub fn remove_focused_window(&mut self) -> Option<Window> {
+    pub fn remove_focused_window(&mut self) -> Option<ManagedWindow> {
         let focused_idx = self.focused_window_idx();
         self.remove_window_by_idx(focused_idx)
     }
 
     pub fn add_window(&mut self, window: Window) {
+        self.add_managed_window(ManagedWindow::capture(window, self.id.clone()));
+    }
+
+    /// Add a previously managed window while preserving its independent state dimensions.
+    /// Ownership always changes to this container, regardless of the source container ID.
+    pub fn add_managed_window(&mut self, mut window: ManagedWindow) {
+        window.container_id.clone_from(&self.id);
         self.windows_mut().push_back(window);
         self.focus_window(self.windows().len().saturating_sub(1));
         let focused_window_idx = self.focused_window_idx();
@@ -235,6 +362,16 @@ mod tests {
         assert_eq!(container.windows().len(), 1);
         assert_eq!(container.focused_window_idx(), 0);
         assert!(container.contains_window(1));
+        assert_eq!(container.windows()[0].container_id, container.id);
+    }
+
+    #[test]
+    fn mutable_window_ring_insertion_assigns_ownership() {
+        let mut container = Container::default();
+
+        container.windows_mut().push_back(Window::from(42));
+
+        assert_eq!(container.windows()[0].container_id, container.id);
     }
 
     #[test]
@@ -295,20 +432,82 @@ mod tests {
         let container: Container = serde_json::from_str(json).unwrap();
         assert_eq!(container.id, "test-2");
         assert!(!container.locked);
-        assert_eq!(container.windows(), &[Window::from(5), Window::from(9)]);
+        assert_eq!(container.windows()[0].window, Window::from(5));
+        assert_eq!(container.windows()[1].window, Window::from(9));
+        assert!(container
+            .windows()
+            .iter()
+            .all(|window| window.container_id == container.id));
         assert_eq!(container.focused_window_idx(), 1);
+    }
+
+    #[test]
+    fn add_and_move_managed_window_maintain_ownership() {
+        let mut source = Container::default();
+        let mut target = Container::default();
+        let mut window = ManagedWindow::from_observed(
+            Window::from(42),
+            "stale-owner".into(),
+            true,
+            true,
+            false,
+        );
+        window.set_floating(Default::default());
+
+        source.add_managed_window(window);
+        assert_eq!(source.windows()[0].container_id, source.id);
+
+        let window = source.remove_focused_window().unwrap();
+        target.add_managed_window(window);
+
+        let moved = &target.windows()[0];
+        assert_eq!(moved.container_id, target.id);
+        assert_eq!(moved.placement, crate::ManagedPlacement::Floating);
+        assert_eq!(moved.visibility, crate::Visibility::Minimized);
+        assert_eq!(moved.presentation, crate::Presentation::Maximized);
+    }
+
+    #[test]
+    fn deserialization_repairs_stale_current_owner() {
+        let json = r#"{
+            "id": "container-1",
+            "windows": {
+                "elements": [{
+                    "window": {"hwnd": 42},
+                    "container_id": "container-elsewhere",
+                    "placement": "Floating"
+                }],
+                "focused": 0
+            }
+        }"#;
+        let container: Container = serde_json::from_str(json).unwrap();
+
+        assert_eq!(container.windows()[0].container_id, "container-1");
+        assert_eq!(
+            container.windows()[0].placement,
+            crate::ManagedPlacement::Floating
+        );
     }
 
     #[test]
     fn serializes_and_deserializes() {
         let mut container = Container::default();
         container.set_locked(true);
+        let mut window = ManagedWindow::from_observed(
+            Window::from(42),
+            container.id.clone(),
+            true,
+            false,
+            true,
+        );
+        window.set_floating(Default::default());
+        container.add_managed_window(window);
 
         let serialized = serde_json::to_string(&container).expect("Should serialize");
         let deserialized: Container =
             serde_json::from_str(&serialized).expect("Should deserialize");
 
         assert!(deserialized.locked);
-        assert_eq!(deserialized.id, container.id);
+        assert_eq!(deserialized, container);
     }
 }

@@ -363,7 +363,7 @@ impl Stackbar {
                                 {
                                     tracing::error!(
                                         "stackbar WM_LBUTTONDOWN repositioning error: hwnd {} ({})",
-                                        *window,
+                                        window.hwnd,
                                         err
                                     );
                                 }
@@ -373,7 +373,7 @@ impl Stackbar {
                                 if let Err(err) = window.focus(false) {
                                     tracing::error!(
                                         "stackbar WMLBUTTONDOWN focus error: hwnd {} ({})",
-                                        *window,
+                                        window.hwnd,
                                         err
                                     );
                                 }

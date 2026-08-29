@@ -984,7 +984,11 @@ impl ContainerInfo {
     /// Creates a `ContainerInfo` from a given container.
     pub fn from_container(container: &Container, is_focused: bool) -> Self {
         Self {
-            windows: container.windows().iter().map(WindowInfo::from).collect(),
+            windows: container
+                .windows()
+                .iter()
+                .map(|window| WindowInfo::from(&window.window))
+                .collect(),
             focused_window_idx: container.focused_window_idx(),
             is_focused,
             is_locked: container.locked,

@@ -35,6 +35,7 @@ use crate::core::PlacementTarget;
 use crate::core::Rect;
 use crate::core::WindowPlacement;
 use crate::lockable_sequence::LockableSequence;
+use crate::managed_window::ManagedWindow;
 use crate::ring::Ring;
 use crate::should_act;
 use crate::should_act_individual;
@@ -1288,7 +1289,7 @@ impl Workspace {
             .get_mut(adjusted_target_container_index)
             .ok_or_eyre("there is no container")?;
 
-        target_container.add_window(window);
+        target_container.add_managed_window(window);
 
         self.focus_container(adjusted_target_container_index);
         self.focused_container_mut()
@@ -1315,10 +1316,7 @@ impl Workspace {
             container.load_focused_window();
         }
 
-        self.new_container_for_window(window);
-
-        let mut container = Container::default();
-        container.add_window(window);
+        self.new_container_for_managed_window(window);
         Ok(())
     }
 
@@ -1351,6 +1349,23 @@ impl Workspace {
         let mut container = Container::default();
         container.add_window(window);
 
+        self.insert_container_at_idx(next_idx, container);
+    }
+
+    fn new_container_for_managed_window(&mut self, window: ManagedWindow) {
+        let next_idx = if let Some(idx) = self.preselected_container_idx {
+            let next = idx;
+            self.preselected_container_idx = None;
+            self.remove_container_by_idx(next);
+            next
+        } else if self.containers().is_empty() {
+            0
+        } else {
+            self.resolve_placement_index(&window.window)
+        };
+
+        let mut container = Container::default();
+        container.add_managed_window(window);
         self.insert_container_at_idx(next_idx, container);
     }
 
@@ -1484,7 +1499,7 @@ impl Workspace {
                 monocle_container.load_focused_window();
             }
 
-            window
+            window.window
         } else {
             let focused_idx = self.focused_container_idx();
 
@@ -1506,7 +1521,7 @@ impl Workspace {
                 container.load_focused_window();
             }
 
-            window
+            window.window
         };
 
         self.floating_windows_mut().push_back(window);
@@ -1895,7 +1910,7 @@ impl Workspace {
                 monocle_container.load_focused_window();
             }
 
-            self.maximized_window = Option::from(window);
+            self.maximized_window = Option::from(window.window);
             self.maximized_window_restore_idx = monocle_restore_idx;
             if let Some(window) = self.maximized_window {
                 window.maximize();
@@ -1924,7 +1939,7 @@ impl Workspace {
             container.load_focused_window();
         }
 
-        self.maximized_window = Option::from(window);
+        self.maximized_window = Option::from(window.window);
         self.maximized_window_restore_idx = Option::from(focused_idx);
 
         if let Some(window) = self.maximized_window {
@@ -1954,7 +1969,7 @@ impl Workspace {
         }
 
         let mut container = Container::default();
-        container.windows_mut().push_back(window);
+        container.add_window(window);
 
         // we shouldn't use insert_container_at_index here because it doesn't make sense for
         // monocle and maximized toggles which take over the whole screen before being reinserted
@@ -2628,6 +2643,7 @@ mod tests {
         // Container 0 should have 1 window
         let container = workspace.focused_container_mut().unwrap();
         assert_eq!(container.windows().len(), 1);
+        assert_eq!(container.windows()[0].container_id, container.id);
 
         // Should return true that window 2 exists
         assert!(workspace.contains_window(2));
@@ -2661,6 +2677,35 @@ mod tests {
         // Container 0 should have 1 window
         let container = workspace.focused_container_mut().unwrap();
         assert_eq!(container.windows().len(), 1);
+    }
+
+    #[test]
+    fn moving_window_to_container_preserves_state_and_reassigns_owner() {
+        let mut workspace = Workspace::default();
+        let target = Container::default();
+        let target_id = target.id.clone();
+        workspace.add_container_to_back(target);
+
+        let mut source = Container::default();
+        let mut window = ManagedWindow::from_observed(
+            Window::from(42),
+            source.id.clone(),
+            true,
+            true,
+            false,
+        );
+        window.set_floating(Default::default());
+        source.add_managed_window(window);
+        workspace.add_container_to_back(source);
+        workspace.focus_container(1);
+
+        workspace.move_window_to_container(0).unwrap();
+
+        let moved = &workspace.containers()[0].windows()[0];
+        assert_eq!(moved.container_id, target_id);
+        assert_eq!(moved.placement, crate::ManagedPlacement::Floating);
+        assert_eq!(moved.visibility, crate::Visibility::Minimized);
+        assert_eq!(moved.presentation, crate::Presentation::Maximized);
     }
 
     #[test]

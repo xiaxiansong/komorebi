@@ -2891,17 +2891,19 @@ impl WindowManager {
             focused_hwnd = Some(window.hwnd);
         }
 
-        let workspace_hwnds =
+        let managed_windows =
             workspace
                 .containers()
                 .iter()
-                .fold(VecDeque::new(), |mut hwnds, c| {
-                    hwnds.extend(c.windows().clone());
-                    hwnds
+                .fold(VecDeque::new(), |mut windows, container| {
+                    windows.extend(container.windows().clone());
+                    windows
                 });
 
         let mut container = Container::default();
-        *container.windows_mut() = workspace_hwnds;
+        for window in managed_windows {
+            container.add_managed_window(window);
+        }
         *workspace.containers_mut() = VecDeque::from([container]);
         workspace.focus_container(0);
 

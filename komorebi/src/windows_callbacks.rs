@@ -41,7 +41,7 @@ pub extern "system" fn enum_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
             }
 
             let mut container = Container::default();
-            container.windows_mut().push_back(window);
+            container.add_window(window);
             containers.push_back(container);
         }
     }
