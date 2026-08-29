@@ -95,13 +95,9 @@ impl<'de> Deserialize<'de> for ManagedWindow {
                 floating_rect,
                 restore_rect,
             },
-            ManagedWindowRepr::Legacy(window) => Self::from_observed(
-                window,
-                ContainerId::default(),
-                false,
-                false,
-                false,
-            ),
+            ManagedWindowRepr::Legacy(window) => {
+                Self::from_observed(window, ContainerId::default(), false, false, false)
+            }
         })
     }
 }
@@ -260,13 +256,8 @@ mod tests {
 
     #[test]
     fn observed_state_keeps_visibility_and_presentation_independent() {
-        let window = ManagedWindow::from_observed(
-            Window::from(42),
-            "container-1",
-            true,
-            true,
-            false,
-        );
+        let window =
+            ManagedWindow::from_observed(Window::from(42), "container-1", true, true, false);
 
         assert_eq!(window.placement, ManagedPlacement::Stored);
         assert_eq!(window.visibility, Visibility::Minimized);
@@ -275,13 +266,8 @@ mod tests {
 
     #[test]
     fn fullscreen_observation_is_distinct_from_maximized() {
-        let window = ManagedWindow::from_observed(
-            Window::from(42),
-            "container-1",
-            false,
-            false,
-            true,
-        );
+        let window =
+            ManagedWindow::from_observed(Window::from(42), "container-1", false, false, true);
 
         assert_eq!(window.presentation, Presentation::Fullscreen);
     }
@@ -351,10 +337,8 @@ mod tests {
 
     #[test]
     fn missing_current_state_fields_get_compatible_defaults() {
-        let window: ManagedWindow = serde_json::from_str(
-            r#"{"window":{"hwnd":42},"container_id":"container-1"}"#,
-        )
-        .unwrap();
+        let window: ManagedWindow =
+            serde_json::from_str(r#"{"window":{"hwnd":42},"container_id":"container-1"}"#).unwrap();
 
         assert_eq!(window.container_id, "container-1");
         assert_eq!(window.placement, ManagedPlacement::Stored);

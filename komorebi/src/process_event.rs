@@ -211,10 +211,8 @@ impl WindowManager {
             return Ok(());
         }
 
-        if should_suppress_temporarily_unmanaged_event(
-            &mut self.temporarily_unmanaged_hwnds,
-            event,
-        ) {
+        if should_suppress_temporarily_unmanaged_event(&mut self.temporarily_unmanaged_hwnds, event)
+        {
             tracing::trace!(
                 "ignoring event for temporarily unmanaged hwnd: {}",
                 event.hwnd()
@@ -231,16 +229,11 @@ impl WindowManager {
                 | WindowManagerEvent::Unmanage(_)
         ) && self.managed_window_location(event.hwnd()).is_some();
 
-        let should_manage = removes_managed_window
-            || event
-                .window()
-                .should_manage(Some(event), &mut rule_debug)?;
+        let should_manage =
+            removes_managed_window || event.window().should_manage(Some(event), &mut rule_debug)?;
 
         if matches!(event, WindowManagerEvent::Resume(_)) && rule_debug.is_explicitly_ignored() {
-            tracing::info!(
-                "refusing to resume ignored hwnd: {}",
-                event.hwnd()
-            );
+            tracing::info!("refusing to resume ignored hwnd: {}", event.hwnd());
             return Ok(());
         }
 

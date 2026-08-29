@@ -144,9 +144,7 @@ impl Container {
     }
 
     pub fn focused_window_mut(&mut self) -> Option<&mut Window> {
-        self.windows
-            .focused_mut()
-            .map(|window| &mut window.window)
+        self.windows.focused_mut().map(|window| &mut window.window)
     }
 
     pub fn focused_managed_window(&self) -> Option<&ManagedWindow> {
@@ -434,10 +432,12 @@ mod tests {
         assert!(!container.locked);
         assert_eq!(container.windows()[0].window, Window::from(5));
         assert_eq!(container.windows()[1].window, Window::from(9));
-        assert!(container
-            .windows()
-            .iter()
-            .all(|window| window.container_id == container.id));
+        assert!(
+            container
+                .windows()
+                .iter()
+                .all(|window| window.container_id == container.id)
+        );
         assert_eq!(container.focused_window_idx(), 1);
     }
 
@@ -445,13 +445,8 @@ mod tests {
     fn add_and_move_managed_window_maintain_ownership() {
         let mut source = Container::default();
         let mut target = Container::default();
-        let mut window = ManagedWindow::from_observed(
-            Window::from(42),
-            "stale-owner",
-            true,
-            true,
-            false,
-        );
+        let mut window =
+            ManagedWindow::from_observed(Window::from(42), "stale-owner", true, true, false);
         window.set_floating(Default::default());
 
         source.add_managed_window(window);
@@ -493,13 +488,8 @@ mod tests {
     fn serializes_and_deserializes() {
         let mut container = Container::default();
         container.set_locked(true);
-        let mut window = ManagedWindow::from_observed(
-            Window::from(42),
-            container.id.clone(),
-            true,
-            false,
-            true,
-        );
+        let mut window =
+            ManagedWindow::from_observed(Window::from(42), container.id.clone(), true, false, true);
         window.set_floating(Default::default());
         container.add_managed_window(window);
 

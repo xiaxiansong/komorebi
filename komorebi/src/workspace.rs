@@ -2720,13 +2720,8 @@ mod tests {
         workspace.add_container_to_back(target);
 
         let mut source = Container::default();
-        let mut window = ManagedWindow::from_observed(
-            Window::from(42),
-            source.id.clone(),
-            true,
-            true,
-            false,
-        );
+        let mut window =
+            ManagedWindow::from_observed(Window::from(42), source.id.clone(), true, true, false);
         window.set_floating(Default::default());
         source.add_managed_window(window);
         workspace.add_container_to_back(source);
@@ -2816,9 +2811,7 @@ mod tests {
         assert!(maximized_workspace.maximized_window_restore_idx.is_none());
 
         let mut monocle_container = Container::default();
-        monocle_container
-            .windows_mut()
-            .push_back(Window::from(44));
+        monocle_container.windows_mut().push_back(Window::from(44));
         let mut monocle_workspace = Workspace {
             monocle_container: Some(monocle_container),
             monocle_container_restore_idx: Some(0),
