@@ -1069,21 +1069,31 @@ mod tests {
 
     #[test]
     fn test_send_notification() {
-        // Create a monitor notification
+        // The notification channel is global, and `test_listen_for_notifications` starts a
+        // listener thread which lives for the rest of the test binary and consumes from that
+        // same channel. A single send can therefore be taken by the listener before this test
+        // observes it, which is why this sends until one of its own notifications comes back
+        // instead of asserting on one try_recv. The property under test is unchanged: what
+        // send_notification puts on the channel is what a reader takes off it.
         let notification = MonitorNotification::ResolutionScalingChanged;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let receiver = event_rx();
 
-        // Use the send_notification function to send the notification
-        send_notification(notification);
+        loop {
+            send_notification(notification);
 
-        // Receive the notification from the channel
-        let received = event_rx().try_recv();
-
-        // Check if we received the notification and if it matches what we sent
-        match received {
-            Ok(notification) => {
-                assert_eq!(notification, MonitorNotification::ResolutionScalingChanged);
+            while let Ok(received) = receiver.try_recv() {
+                if received == notification {
+                    return;
+                }
             }
-            Err(e) => panic!("Failed to receive MonitorNotification: {e}"),
+
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no {notification:?} was received from the notification channel"
+            );
+
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 
