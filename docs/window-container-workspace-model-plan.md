@@ -1,0 +1,339 @@
+# Window / Container / Workspace Model Implementation Plan
+
+This document is the source of truth for the multi-turn implementation of the managed-window,
+container-slot, per-monitor workspace, and AutoHotkey workflow described in the project task. Read
+and update it at the beginning and end of every implementation turn. A phase is not complete until
+its focused tests and the workspace compile check pass and the phase has its own commit.
+
+## Scope and non-negotiable constraints
+
+- Core ownership, lifecycle, geometry, merge, focus-history, minimize-history, and floating state
+  live in the Rust window manager. AutoHotkey is only a `komorebic` command launcher.
+- Ignored, temporarily unmanaged, and managed-floating windows are distinct states and code paths.
+- A managed window belongs to exactly one container. There will be no workspace-owned floating
+  window list in the completed model.
+- Stable IDs, not list indices, are persistent identity. Indices remain transient UI/order inputs.
+- Slot algorithms operate on gap-free logical rectangles. Padding and gaps are applied only when
+  producing render rectangles.
+- Mutating compound operations validate their complete input and geometry before committing state.
+- Existing user changes are preserved. Each phase should normally change about 150-450 handwritten
+  lines; generated schema changes are counted separately. If a phase would exceed that range, split
+  it before coding.
+- Do not add polling for window state and do not create a whkd configuration.
+
+## Repository baseline
+
+Recorded on 2026-08-29 (Asia/Shanghai), before task changes:
+
+| Item | Baseline |
+| --- | --- |
+| Branch | `master` |
+| Commit | `3348a95b38e1f7055cc9636688b57d7a9751684a` |
+| Describe | `nightly-1-g3348a95b` |
+| Commit subject | `删除readme` |
+| komorebi / komorebic version | `0.1.42` |
+| Worktree | clean |
+| Repository instructions | no `AGENTS.md`; root README is absent at this commit |
+| Rust | `rustc 1.98.0 (88d9e12ae 2026-08-18)` |
+| Cargo | `cargo 1.98.0 (797e8a9bc 2026-08-05)` |
+| rustup | unavailable (`rustup` is not installed/on PATH) |
+| Clippy | unavailable (`cargo clippy`: no such command) |
+| Format check | unavailable: installed rustfmt is a deprecated pre-2018 version; it rejects `crate::` and raw identifiers and does not support `--check` |
+| `cargo check --workspace` | passed; existing future-incompatibility warning for `net2 v0.2.39` |
+| `cargo test --workspace --no-run` | passed; existing MSVC linker informational warnings |
+| `cargo test --workspace` | passed: komorebi 98 passed/1 ignored; layouts 128 passed; bar 3 passed; remaining targets/doc-tests passed with zero tests |
+
+The Clippy limitation is an installed-toolchain mismatch, not a claim that Windows cannot run
+Clippy. If a rustup-managed toolchain is later installed, run `rustup component add clippy` for the
+repository's stable toolchain and then `cargo clippy --workspace --all-targets`.
+
+## Current architecture findings
+
+- `Container` already has a generated stable string ID, but owns `Ring<Window>` directly and has no
+  independent state, slot, or window MRU.
+- `Workspace` is ordered inside each `Monitor`, but has no stable ID. It currently owns separate
+  tiled containers, `floating_windows`, `maximized_window`, and `monocle_container`; these alternate
+  ownership paths are the main migration hazard.
+- Container geometry is currently positional (`latest_layout` and parallel `resize_dimensions`),
+  keyed by container index. It must move to an ID-keyed logical slot map.
+- Ring focus indices currently stand in for focus history. Explicit MRU lists are required.
+- `UnmanageFocusedWindow` currently emits the same removal event path used by ordinary lifecycle
+  removal and has no suppression set, so a later Show event can re-manage the HWND.
+- `ManageFocusedWindow` currently sends a force-manage event. Resume-after-temporary-unmanage must
+  become a distinct command and must still respect ignore rules.
+- `SocketMessage` is shared through `komorebi-client`; command handling is in `process_command.rs`,
+  CLI parsing is in `komorebic/src/main.rs`, and events are coordinated in `process_event.rs`.
+- Runtime state output is assembled in `state.rs`; static configuration conversion and defaults are
+  concentrated in `static_config.rs` and `core/mod.rs`.
+- Win32 create/show/hide/minimize/destroy/focus coordination is event-driven through
+  `winevent_listener`, `WindowManagerEvent`, and `process_event`; this infrastructure will be reused.
+
+## Planned model
+
+New core types will be introduced without reusing the existing floating-window placement enum:
+
+- `WorkspaceId` and `ContainerId`: serde-transparent stable newtypes.
+- `ManagedWindow`: `Window`, owning `ContainerId`, `ManagedPlacement`, `Visibility`, `Presentation`,
+  optional floating rectangle, and optional restore rectangle.
+- `ContainerState`: derived `Active` or `Hidden`.
+- `LogicalRect`: gap-free slot geometry, distinct by type/field from final `Rect` rendering.
+- `HiddenSlotRestore`: old rectangle, absorption direction and participants, their prior rectangles,
+  generation, validity, and a center anchor for fallback placement.
+- Workspace-owned `HashMap<ContainerId, LogicalRect>`, container/window MRUs, minimize MRU, and a
+  monotonically increasing geometry generation.
+
+The existing user-facing floating placement policy (`None`, `Center`, `CenterAndResize`) will be
+renamed or kept as a separately named policy type so it cannot be confused with managed window
+placement (`Stored`, `Floating`).
+
+## Phase plan and commit boundaries
+
+Every checkbox is updated only after the named verification succeeds. Commit hashes are appended to
+the phase when complete.
+
+### Phase 0 - Baseline and plan
+
+- [x] Inspect contribution guidance, docs, manifests, core types, event path, command path, tests.
+- [x] Record commit, branch, version, worktree, toolchain, Clippy, format, build, and test baseline.
+- [x] Commit this plan as `docs: plan managed window model migration`.
+
+Expected files: this document only.
+
+### Phase 1 - Temporary-unmanage classification and event suppression
+
+- [ ] Add runtime-only `temporarily_unmanaged_hwnds` ownership to `WindowManager`.
+- [ ] Separate temporary suspend/resume operations from force-manage semantics at the core method
+  and event boundary.
+- [ ] On suspend, remove the HWND from every current ownership path and normal indexes; destroy an
+  emptied container through the existing local lifecycle and retile path.
+- [ ] Ignore ordinary show/uncloak/name/focus/move events for suspended HWNDs.
+- [ ] Clear the suppression entry on destroy and handle HWND reuse safely.
+- [ ] Resume by removing suppression first, rejecting ignored windows, reading real Win32 state,
+  and processing the HWND through the new-window path without restoring former ownership.
+- [ ] Add classification and idempotency unit tests.
+- [ ] Run focused tests, `cargo check --workspace`, and `cargo test --workspace`.
+- [ ] Commit as `feat: separate temporary window suspension`.
+
+Expected handwritten change: 250-450 lines. Likely files: `window_manager.rs`, `process_event.rs`,
+`window_manager_event.rs`, `workspace.rs`, plus focused tests. The public socket/CLI spellings may be
+added here if needed for end-to-end testability; otherwise they are finalized in Phase 12.
+
+### Phase 2 - Managed window multidimensional state
+
+- [ ] Add `ManagedWindow`, `ManagedPlacement`, `Visibility`, and `Presentation` with serde defaults.
+- [ ] Convert container storage from `Window` to `ManagedWindow` while preserving convenient Win32
+  accessors.
+- [ ] Derive initial visibility and presentation from Win32 queries.
+- [ ] Keep maximize, fullscreen, minimize, and placement independent in transition methods.
+- [ ] Add serialization/backward-compatibility and transition tests.
+- [ ] Commit as `feat: add multidimensional managed window state`.
+
+Expected handwritten change: 300-500 lines. Likely files: new `managed_window.rs`, `container.rs`,
+`window.rs`, `windows_api.rs`, `lib.rs`, `core/mod.rs`, `state.rs`.
+
+### Phase 3 - Stable workspace identity and MRU histories
+
+- [ ] Add typed stable `WorkspaceId`/`ContainerId`; migrate the existing container string ID.
+- [ ] Add workspace container MRU, container window MRU, and per-workspace minimize MRU.
+- [ ] Centralize record, selection, deduplication, and deletion cleanup.
+- [ ] Add `validate_invariants()` ownership/history checks enabled by tests and debug assertions.
+- [ ] Add focus, deletion, minimize-history, and stable-ID serde tests.
+- [ ] Commit as `feat: add stable identities and focus histories`.
+
+Expected handwritten change: 300-500 lines. Likely files: new `model.rs`, `ring.rs`, `container.rs`,
+`workspace.rs`, `monitor.rs`, `window_manager.rs`, `state.rs`.
+
+### Phase 4 - Logical slots and render rectangles
+
+- [ ] Add ID-keyed logical slots as workspace geometry authority.
+- [ ] Move adjacency, swap, resize, split, and coverage validation to logical rectangles.
+- [ ] Apply workspace padding/container gaps/borders only in render conversion.
+- [ ] Preserve integer-pixel coverage; odd 50:50 remainder belongs to the old container.
+- [ ] Add gap independence, adjacency, split, overlap, and full-coverage tests.
+- [ ] Commit as `feat: separate logical slots from window rendering`.
+
+Expected handwritten change: 350-500 lines. Likely files: new `geometry.rs`, `workspace.rs`,
+`container.rs`, `set_window_position.rs`, `komorebi-layouts` only if a generic helper truly belongs
+there.
+
+### Phase 5 - Derived Active/Hidden container state
+
+- [ ] Add derived `ContainerState` and active-container selectors.
+- [ ] Make only containers with a visible stored window occupy a logical slot.
+- [ ] Migrate floating windows from the workspace list into their owning containers.
+- [ ] Remove alternate ownership through maximized/monocle storage; presentation becomes window state.
+- [ ] Make state transitions idempotent and extend invariant validation.
+- [ ] Add all basic Hidden classification and ownership tests.
+- [ ] Commit as `feat: derive active and hidden container state`.
+
+Expected handwritten change: 350-500 lines. Likely files: `managed_window.rs`, `container.rs`,
+`workspace.rs`, `window_manager.rs`, `process_event.rs`, `state.rs`.
+
+### Phase 6 - Hidden slot absorption and restoration
+
+- [ ] Implement complete-edge neighbor group selection in left/right/up/down order.
+- [ ] Implement local absorption plus `HiddenSlotRestore` snapshots and geometry generations.
+- [ ] Implement exact reverse restoration with existence, geometry, generation, and min-size checks.
+- [ ] Invalidate restores on all named topology/geometry operations and full-relayout fallback.
+- [ ] Add single/multiple neighbor, only-active, consecutive hide/restore, exact/fallback tests.
+- [ ] Commit as `feat: restore hidden container slots safely`.
+
+Expected handwritten change: 350-500 lines. Likely files: `geometry.rs`, `container.rs`,
+`workspace.rs`, `window_manager.rs`.
+
+### Phase 7 - New-window threshold placement and manual split
+
+- [ ] Implement active-count N=0, N<=2, and N>2 allocation rules.
+- [ ] Implement deterministic neighbor selection and diagnostic fallback.
+- [ ] Add atomic auto/horizontal/vertical manual container creation from an eligible donor.
+- [ ] Route donor/recipient state changes through the Hidden transition engine.
+- [ ] Add N=0/1/2/3, long-edge split, odd-pixel, neighbor-order, and atomic-failure tests.
+- [ ] Commit as `feat: add threshold based container allocation`.
+
+Expected handwritten change: 300-500 lines. Likely files: `geometry.rs`, `workspace.rs`,
+`window_manager.rs`, `process_event.rs`.
+
+### Phase 8 - Container deletion, distribution, and multi-neighbor resize
+
+- [ ] Reuse complete-edge groups for Active deletion expansion.
+- [ ] Implement Hidden explicit deletion recipient order and atomic refusal.
+- [ ] Distribute top-to-bottom source windows round-robin to recipient bottoms.
+- [ ] Implement shared-edge resize with multi-container opposite sides and clamped delta.
+- [ ] Invalidate impacted hidden restores; select post-delete focus from expansion recipients.
+- [ ] Add deletion/distribution/focus/resize/failure-rollback tests.
+- [ ] Commit as `feat: make container deletion and resize topology safe`.
+
+Expected handwritten change: 350-500 lines. Likely files: `geometry.rs`, `workspace.rs`,
+`window_manager.rs`.
+
+### Phase 9 - Floating move and edge resize
+
+- [ ] Add DPI-aware move and independent edge-resize core operations.
+- [ ] Validate visible + floating + normal state and return typed success/no-op reasons.
+- [ ] Clamp movement to a draggable visible area and sizing to Win32/system minimums.
+- [ ] Read back the accepted Win32 rectangle after a resize and store it.
+- [ ] Add defaulted `floating_move_delta` and `floating_resize_delta` configuration.
+- [ ] Add isolated-geometry, state rejection, clamp, DPI, and Hidden-container tests.
+- [ ] Commit as `feat: add independent floating window geometry commands`.
+
+Expected handwritten change: 300-500 lines. Likely files: `core/mod.rs`, `static_config.rs`,
+`managed_window.rs`, `windows_api.rs`, `window_manager.rs`, `process_command.rs`.
+
+### Phase 10 - Workspace ordering, deletion, merge, and minimized restore
+
+- [ ] Implement stable-ID reorder/swap APIs without changing names or rules.
+- [ ] Implement delete-direction selection and atomic source-to-target merge.
+- [ ] Merge all containers and histories, preserve states, invalidate hidden exact restores, relayout
+  only Active containers, and inherit source focus.
+- [ ] Implement current-workspace last-minimized restore through state transitions and MRUs.
+- [ ] Add only-workspace refusal, first/middle/last merge, history, focus, and rollback tests.
+- [ ] Commit as `feat: merge and reorder stable workspaces`.
+
+Expected handwritten change: 350-500 lines. Likely files: `monitor.rs`, `workspace.rs`,
+`window_manager.rs`, `process_command.rs`, `state.rs`.
+
+### Phase 11 - Cross-monitor container/workspace migration
+
+- [ ] Move/swap complete containers while recomputing target slots and DPI render geometry.
+- [ ] Translate and clamp floating rectangles between monitor work areas.
+- [ ] Move workspaces without leaving a monitor empty; retain workspace ID/name.
+- [ ] Preserve Hidden state without creating active slots and implement explicit focus-follow rules.
+- [ ] Add mixed-DPI, empty/occupied target, Hidden, atomic-failure, and focus tests.
+- [ ] Commit as `feat: preserve model across monitor migrations`.
+
+Expected handwritten change: 300-500 lines. Likely files: `monitor.rs`, `workspace.rs`,
+`window_manager.rs`, `monitor_reconciliator/mod.rs`, `windows_api.rs`.
+
+### Phase 12 - Socket protocol and komorebic CLI
+
+- [ ] Finalize distinct commands for global pause, suspend/resume manage, placement, floating move and
+  resize, active resize, maximize, fullscreen, minimize/restore, container lifecycle, stable-ID
+  transfers, workspace ordering/merge, and monitor transfers.
+- [ ] Add typed command outcomes: success, no-op, non-floating, minimized, no target, ignored,
+  suspended, and invariant failure. Preserve compatibility for existing commands where practical.
+- [ ] Add CLI parsing/serialization tests and generated command docs/schema updates.
+- [ ] Commit as `feat: expose managed model commands in komorebic`.
+
+Expected handwritten change: 350-500 lines plus generated docs/schema. Likely files:
+`core/mod.rs`, `process_command.rs`, `komorebic/src/main.rs`, `komorebi-client/src/lib.rs`, `docs/cli`,
+`schema.json`, `schema.asc.json`.
+
+### Phase 13 - AutoHotkey v2 workflow
+
+- [ ] Add a directly runnable AHK v2 example using top-level executable/config/delta variables and
+  helper functions around `Run`/`RunWait`.
+- [ ] Cover every shortcut group in the task with Chinese comments; never emit whkd config.
+- [ ] Use safe stop/start restart and the version-correct static configuration replacement command.
+- [ ] Prefer existing `komorebic gui`; otherwise add a small AHK v2 shortcut panel.
+- [ ] Validate generated command lines against `komorebic --help`.
+- [ ] Commit as `docs: add complete AutoHotkey v2 workflow`.
+
+Expected handwritten change: 200-400 lines. Likely files: new `docs/common-workflows/komorebi-model.ahk`,
+`docs/common-workflows/autohotkey.md`, possibly `mkdocs.yml`.
+
+### Phase 14 - Event reconciliation, serialization, documentation, and final verification
+
+- [ ] Audit create/show/hide/destroy/minimize/restore/maximize/fullscreen, HWND reuse/crash, monitor
+  hotplug, DPI/work-area change, workspace-switch races, and suspended HWND events.
+- [ ] Make duplicate and out-of-order transitions converge idempotently.
+- [ ] Complete state output fields and migration/version policy with serde defaults.
+- [ ] Add randomized operation/property tests if current dependencies permit it without an outsized
+  dependency; otherwise add a deterministic seeded operation harness.
+- [ ] Map all 16 invariants to implementation and tests in final documentation.
+- [ ] Regenerate schemas/docs and run all available checks.
+- [ ] Commit as `feat: validate and document managed window model`.
+
+Expected handwritten change: 350-500 lines plus generated artifacts. Likely files:
+`process_event.rs`, `window_manager_event.rs`, `monitor_reconciliator/mod.rs`, `workspace.rs`,
+`window_manager.rs`, `state.rs`, `static_config.rs`, tests, and docs.
+
+## Provisional affected-file inventory
+
+This list is updated from actual diffs, not treated as permission to change every file.
+
+- Core/model: `komorebi/src/container.rs`, `workspace.rs`, `monitor.rs`, `window_manager.rs`,
+  `window.rs`, `ring.rs`, new `managed_window.rs`, new `model.rs`, new `geometry.rs`.
+- Win32/event flow: `windows_api.rs`, `window_manager_event.rs`, `winevent_listener.rs`,
+  `process_event.rs`, `monitor_reconciliator/mod.rs`, `reaper.rs`, `set_window_position.rs`.
+- Command/config/state: `core/mod.rs`, `process_command.rs`, `static_config.rs`, `state.rs`, `lib.rs`.
+- Client/CLI: `komorebi-client/src/lib.rs`, `komorebic/src/main.rs`.
+- Tests: colocated unit tests first; integration/property harness only when it reduces Win32 coupling.
+- Docs/examples/schema: `docs/cli/`, `docs/common-workflows/`, `docs/design.md`, `mkdocs.yml`,
+  `schema.json`, `schema.asc.json`.
+
+## Verification policy for every phase
+
+1. Re-read this plan and inspect the current worktree before editing.
+2. Run focused unit tests for the changed module(s).
+3. Run `cargo check --workspace`.
+4. Run `cargo test --workspace` unless the phase is documentation-only.
+5. Review `git diff --check`, `git diff --stat`, and the complete phase diff.
+6. Because the installed rustfmt is incompatible, format touched Rust using a compatible formatter if
+   one becomes available; otherwise follow existing style manually and record the limitation.
+7. Run Clippy if a compatible component becomes available; never report it as passed otherwise.
+8. Update phase status, actual files, test counts/results, decisions, and commit hash in this plan.
+9. Commit only the phase's intended files. Re-check the worktree after committing.
+
+## Decision and risk log
+
+- 2026-08-29: Keep the existing event-driven Win32 architecture. No polling fallback is planned.
+- 2026-08-29: Treat the current workspace-level floating/maximized/monocle ownership as transitional
+  debt. It cannot remain in the completed ownership model.
+- 2026-08-29: Introduce a new name for managed `Stored/Floating` placement because `core::Placement`
+  already means center/resize policy.
+- 2026-08-29: Prefer typed IDs in core APIs while retaining index-based compatibility commands until
+  the CLI migration phase.
+- 2026-08-29: The biggest merge-conflict areas with upstream will be `workspace.rs`,
+  `window_manager.rs`, `process_event.rs`, `process_command.rs`, `core/mod.rs`, and static config/state
+  serialization.
+- Open: confirm whether changing socket command replies is compatible with the existing one-way
+  client transport; if not, expose command outcomes through query/notification without breaking old
+  callers.
+- Open: determine whether fullscreen can be reliably distinguished from borderless maximize for all
+  target applications with existing Win32 helpers; application-specific exceptions may be needed.
+
+## Progress log
+
+- 2026-08-29: Phase 0 baseline captured. No source changes existed at start. Full workspace tests
+  passed; formatter and Clippy limitations recorded above. Next phase: temporary-unmanage
+  classification and event suppression.
