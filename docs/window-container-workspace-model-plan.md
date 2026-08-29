@@ -88,8 +88,8 @@ placement (`Stored`, `Floating`).
 
 ## Phase plan and commit boundaries
 
-Every checkbox is updated only after the named verification succeeds. Commit hashes are appended to
-the phase when complete.
+Every checkbox is updated only after the named verification succeeds. Because a commit cannot embed
+its own final hash, the previous phase's hash is appended when the next phase starts.
 
 ### Phase 0 - Baseline and plan
 
@@ -97,26 +97,36 @@ the phase when complete.
 - [x] Record commit, branch, version, worktree, toolchain, Clippy, format, build, and test baseline.
 - [x] Commit this plan as `docs: plan managed window model migration`.
 
+Commit: `987475d3`.
+
 Expected files: this document only.
 
 ### Phase 1 - Temporary-unmanage classification and event suppression
 
-- [ ] Add runtime-only `temporarily_unmanaged_hwnds` ownership to `WindowManager`.
-- [ ] Separate temporary suspend/resume operations from force-manage semantics at the core method
+- [x] Add runtime-only `temporarily_unmanaged_hwnds` ownership to `WindowManager`.
+- [x] Separate temporary suspend/resume operations from force-manage semantics at the core method
   and event boundary.
-- [ ] On suspend, remove the HWND from every current ownership path and normal indexes; destroy an
+- [x] On suspend, remove the HWND from every current ownership path and normal indexes; destroy an
   emptied container through the existing local lifecycle and retile path.
-- [ ] Ignore ordinary show/uncloak/name/focus/move events for suspended HWNDs.
-- [ ] Clear the suppression entry on destroy and handle HWND reuse safely.
-- [ ] Resume by removing suppression first, rejecting ignored windows, reading real Win32 state,
-  and processing the HWND through the new-window path without restoring former ownership.
-- [ ] Add classification and idempotency unit tests.
-- [ ] Run focused tests, `cargo check --workspace`, and `cargo test --workspace`.
-- [ ] Commit as `feat: separate temporary window suspension`.
+- [x] Ignore ordinary show/uncloak/name/focus/move events for suspended HWNDs.
+- [x] Clear the suppression entry on destroy so normal HWND reuse is not suppressed.
+- [x] Resume by removing suppression first, rejecting ignored windows, and processing the HWND
+  through the new-window path without restoring former ownership. Initial visibility/presentation
+  capture is intentionally completed with the multidimensional state in Phase 2.
+- [x] Add classification and idempotency unit tests.
+- [x] Run focused tests, `cargo check --workspace`, and `cargo test --workspace`.
+- [x] Commit as `feat: separate temporary window suspension`.
 
 Expected handwritten change: 250-450 lines. Likely files: `window_manager.rs`, `process_event.rs`,
 `window_manager_event.rs`, `workspace.rs`, plus focused tests. The public socket/CLI spellings may be
 added here if needed for end-to-end testability; otherwise they are finalized in Phase 12.
+
+Actual files: `process_event.rs`, `static_config.rs`, `window.rs`, `window_manager.rs`,
+`window_manager_event.rs`, and `workspace.rs`. Actual Rust diff before this plan update: 427 added,
+19 removed lines. `cargo test -p komorebi --lib`: 106 passed, 1 pre-existing ignored. Full workspace
+check and test passed; layouts remained 128/128 and bar remained 3/3. Existing linker messages and
+the `net2` future-incompatibility warning are unchanged. Format/Clippy remain unavailable for the
+baseline toolchain reasons above.
 
 ### Phase 2 - Managed window multidimensional state
 
@@ -331,9 +341,15 @@ This list is updated from actual diffs, not treated as permission to change ever
   callers.
 - Open: determine whether fullscreen can be reliably distinguished from borderless maximize for all
   target applications with existing Win32 helpers; application-specific exceptions may be needed.
+- Open: `ApplyState` must be made transactionally aware of the runtime suspension set when state
+  migration is implemented; ordinary Win32 reconciliation is already suppressed in Phase 1.
 
 ## Progress log
 
 - 2026-08-29: Phase 0 baseline captured. No source changes existed at start. Full workspace tests
   passed; formatter and Clippy limitations recorded above. Next phase: temporary-unmanage
   classification and event suppression.
+- 2026-08-29: Phase 1 implemented runtime suspension, no-side-effect detach, event suppression,
+  destroy cleanup, ignore-respecting resume, rollback of failed in-memory detach/retile, and focused
+  lifecycle tests. Full workspace check and tests passed. Next phase: managed window
+  multidimensional state.

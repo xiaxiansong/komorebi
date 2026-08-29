@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -55,6 +56,20 @@ fn should_refocus_after_destroy(foreground_hwnd: Option<isize>) -> bool {
     matches!(foreground_hwnd, None | Some(0))
 }
 
+fn should_suppress_temporarily_unmanaged_event(
+    temporarily_unmanaged_hwnds: &mut HashSet<isize>,
+    event: WindowManagerEvent,
+) -> bool {
+    match event {
+        WindowManagerEvent::Destroy(_, window) => {
+            temporarily_unmanaged_hwnds.remove(&window.hwnd);
+            false
+        }
+        WindowManagerEvent::Resume(window) => !temporarily_unmanaged_hwnds.remove(&window.hwnd),
+        _ => temporarily_unmanaged_hwnds.contains(&event.hwnd()),
+    }
+}
+
 #[cfg(test)]
 mod focus_change_tests {
     use super::should_skip_focus_change;
@@ -92,6 +107,49 @@ mod destroy_focus_tests {
     #[test]
     fn defers_when_a_successor_took_the_foreground() {
         assert!(!should_refocus_after_destroy(Some(12345)));
+    }
+}
+
+#[cfg(test)]
+mod temporarily_unmanaged_event_tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_events_are_suppressed_without_clearing_the_hwnd() {
+        let mut hwnds = HashSet::from([42]);
+        let event = WindowManagerEvent::Show(WinEvent::ObjectShow, Window::from(42));
+
+        assert!(should_suppress_temporarily_unmanaged_event(
+            &mut hwnds, event
+        ));
+        assert!(hwnds.contains(&42));
+    }
+
+    #[test]
+    fn destroy_clears_the_hwnd() {
+        let mut hwnds = HashSet::from([42]);
+        let event = WindowManagerEvent::Destroy(WinEvent::ObjectDestroy, Window::from(42));
+
+        assert!(!should_suppress_temporarily_unmanaged_event(
+            &mut hwnds, event
+        ));
+        assert!(!hwnds.contains(&42));
+    }
+
+    #[test]
+    fn only_a_suspended_hwnd_can_be_resumed() {
+        let mut hwnds = HashSet::new();
+        let event = WindowManagerEvent::Resume(Window::from(42));
+
+        assert!(should_suppress_temporarily_unmanaged_event(
+            &mut hwnds, event
+        ));
+
+        hwnds.insert(42);
+        assert!(!should_suppress_temporarily_unmanaged_event(
+            &mut hwnds, event
+        ));
+        assert!(!hwnds.contains(&42));
     }
 }
 
@@ -143,14 +201,48 @@ impl WindowManager {
     #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
     #[tracing::instrument(skip(self, event), fields(event = event.title(), winevent = event.winevent(), hwnd = event.hwnd()))]
     pub fn process_event(&mut self, event: WindowManagerEvent) -> eyre::Result<()> {
+        // Destroy cleanup is unconditional, including while global event processing is paused.
+        if let WindowManagerEvent::Destroy(_, window) = event {
+            self.temporarily_unmanaged_hwnds.remove(&window.hwnd);
+        }
+
         if self.is_paused {
             tracing::trace!("ignoring while paused");
             return Ok(());
         }
 
+        if should_suppress_temporarily_unmanaged_event(
+            &mut self.temporarily_unmanaged_hwnds,
+            event,
+        ) {
+            tracing::trace!(
+                "ignoring event for temporarily unmanaged hwnd: {}",
+                event.hwnd()
+            );
+            return Ok(());
+        }
+
         let mut rule_debug = RuleDebug::default();
 
-        let should_manage = event.window().should_manage(Some(event), &mut rule_debug)?;
+        let removes_managed_window = matches!(
+            event,
+            WindowManagerEvent::Destroy(_, _)
+                | WindowManagerEvent::Suspend(_)
+                | WindowManagerEvent::Unmanage(_)
+        ) && self.managed_window_location(event.hwnd()).is_some();
+
+        let should_manage = removes_managed_window
+            || event
+                .window()
+                .should_manage(Some(event), &mut rule_debug)?;
+
+        if matches!(event, WindowManagerEvent::Resume(_)) && rule_debug.is_explicitly_ignored() {
+            tracing::info!(
+                "refusing to resume ignored hwnd: {}",
+                event.hwnd()
+            );
+            return Ok(());
+        }
 
         // All event handlers below this point should only be processed if the event is
         // related to a window that should be managed by the WindowManager.
@@ -268,6 +360,8 @@ impl WindowManager {
         match event {
             WindowManagerEvent::FocusChange(_, window)
             | WindowManagerEvent::Show(_, window)
+            | WindowManagerEvent::Manage(window)
+            | WindowManagerEvent::Resume(window)
             | WindowManagerEvent::MoveResizeEnd(_, window) => {
                 if let Some(monitor_idx) = self.monitor_idx_from_window(window) {
                     // This is a hidden window apparently associated with COM support mechanisms (based
@@ -309,21 +403,37 @@ impl WindowManager {
                 window.focus(false)?;
                 self.has_pending_raise_op = false;
             }
-            WindowManagerEvent::Destroy(_, window) | WindowManagerEvent::Unmanage(window) => {
-                if self.focused_workspace()?.contains_window(window.hwnd) {
-                    self.focused_workspace_mut()?.remove_window(window.hwnd)?;
+            WindowManagerEvent::Destroy(_, window) => {
+                if let Some((monitor_idx, workspace_idx)) =
+                    self.managed_window_location(window.hwnd)
+                {
+                    self.monitors_mut()
+                        .get_mut(monitor_idx)
+                        .and_then(|monitor| monitor.workspaces_mut().get_mut(workspace_idx))
+                        .ok_or_eyre("there is no workspace")?
+                        .remove_window(window.hwnd)?;
 
                     // With refocus true, update_focused_workspace focuses the surviving
                     // selection (maximized/monocle/tiling); with refocus false it only
                     // re-tiles.
                     let refocus =
                         should_refocus_after_destroy(WindowsApi::foreground_window().ok());
-                    self.update_focused_workspace(refocus, refocus)?;
+                    let workspace_is_visible = self
+                        .monitors()
+                        .get(monitor_idx)
+                        .is_some_and(|monitor| monitor.focused_workspace_idx() == workspace_idx);
 
-                    let mut already_moved_window_handles = self.already_moved_window_handles.lock();
+                    if workspace_is_visible && monitor_idx == self.focused_monitor_idx() {
+                        self.update_focused_workspace(refocus, refocus)?;
+                    } else if workspace_is_visible {
+                        self.update_focused_workspace_by_monitor_idx(monitor_idx)?;
+                    }
 
-                    already_moved_window_handles.remove(&window.hwnd);
+                    self.clear_window_transients(window.hwnd);
                 }
+            }
+            WindowManagerEvent::Suspend(window) | WindowManagerEvent::Unmanage(window) => {
+                self.suspend_managed_window(window.hwnd)?;
             }
             WindowManagerEvent::Minimize(_, window) => {
                 // During transient display connection changes (e.g. monitor
@@ -460,6 +570,7 @@ impl WindowManager {
             }
             WindowManagerEvent::Show(_, window)
             | WindowManagerEvent::Manage(window)
+            | WindowManagerEvent::Resume(window)
             | WindowManagerEvent::Uncloak(_, window) => {
                 if matches!(event, WindowManagerEvent::Uncloak(_, _))
                     && self.uncloack_to_ignore >= 1
@@ -562,9 +673,11 @@ impl WindowManager {
                                 }
                             }
 
-                            if behaviour.float_override
-                                || behaviour.floating_layer_override
-                                || (should_float && !matches!(event, WindowManagerEvent::Manage(_)))
+                            if !matches!(event, WindowManagerEvent::Resume(_))
+                                && (behaviour.float_override
+                                    || behaviour.floating_layer_override
+                                    || (should_float
+                                        && !matches!(event, WindowManagerEvent::Manage(_))))
                             {
                                 let placement = if behaviour.floating_layer_override {
                                     // Floating layer override placement
@@ -621,7 +734,11 @@ impl WindowManager {
                                 // first send the `FocusChange` event and only the `Show` event after
                                 // and we will be focusing the desktop on the `FocusChange` event since
                                 // it is still empty.
-                                window.focus(self.mouse_follows_focus)?;
+                                if !(matches!(event, WindowManagerEvent::Resume(_))
+                                    && window.is_miminized())
+                                {
+                                    window.focus(self.mouse_follows_focus)?;
+                                }
                             }
                         }
 
@@ -899,11 +1016,6 @@ impl WindowManager {
             | WindowManagerEvent::Cloak(..)
             | WindowManagerEvent::TitleUpdate(..) => {}
         };
-
-        // If we unmanaged a window, it shouldn't be immediately hidden behind managed windows
-        if let WindowManagerEvent::Unmanage(mut window) = event {
-            window.center(&self.focused_monitor_work_area()?, true)?;
-        }
 
         // Update list of known_hwnds and their monitor/workspace index pair
         self.update_known_hwnds();

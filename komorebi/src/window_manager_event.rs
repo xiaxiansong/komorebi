@@ -26,6 +26,8 @@ pub enum WindowManagerEvent {
     MoveResizeEnd(WinEvent, Window),
     MouseCapture(WinEvent, Window),
     Manage(Window),
+    Resume(Window),
+    Suspend(Window),
     Unmanage(Window),
     Raise(Window),
     TitleUpdate(WinEvent, Window),
@@ -36,6 +38,12 @@ impl Display for WindowManagerEvent {
         match self {
             Self::Manage(window) => {
                 write!(f, "Manage (Window: {window})")
+            }
+            Self::Resume(window) => {
+                write!(f, "Resume (Window: {window})")
+            }
+            Self::Suspend(window) => {
+                write!(f, "Suspend (Window: {window})")
             }
             Self::Unmanage(window) => {
                 write!(f, "Unmanage (Window: {window})")
@@ -98,6 +106,8 @@ impl WindowManagerEvent {
             | Self::MouseCapture(_, window)
             | Self::Raise(window)
             | Self::Manage(window)
+            | Self::Resume(window)
+            | Self::Suspend(window)
             | Self::Unmanage(window)
             | Self::TitleUpdate(_, window) => window,
         }
@@ -120,6 +130,8 @@ impl WindowManagerEvent {
             WindowManagerEvent::MoveResizeEnd(_, _) => "MoveResizeEnd",
             WindowManagerEvent::MouseCapture(_, _) => "MouseCapture",
             WindowManagerEvent::Manage(_) => "Manage",
+            WindowManagerEvent::Resume(_) => "Resume",
+            WindowManagerEvent::Suspend(_) => "Suspend",
             WindowManagerEvent::Unmanage(_) => "Unmanage",
             WindowManagerEvent::Raise(_) => "Raise",
             WindowManagerEvent::TitleUpdate(_, _) => "TitleUpdate",
@@ -140,6 +152,8 @@ impl WindowManagerEvent {
             | WindowManagerEvent::MouseCapture(event, _)
             | WindowManagerEvent::TitleUpdate(event, _) => Some(event.to_string()),
             WindowManagerEvent::Manage(_)
+            | WindowManagerEvent::Resume(_)
+            | WindowManagerEvent::Suspend(_)
             | WindowManagerEvent::Unmanage(_)
             | WindowManagerEvent::Raise(_) => None,
         }

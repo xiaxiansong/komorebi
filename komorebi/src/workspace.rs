@@ -1142,6 +1142,75 @@ impl Workspace {
         Ok(())
     }
 
+    /// Detach a window from this workspace without changing the detached window's Win32 state.
+    ///
+    /// This is intentionally separate from [`Self::remove_window`]. Lifecycle removal may restore,
+    /// unmaximize, or focus windows while a temporarily unmanaged window must be left exactly where
+    /// Windows currently has it. Surviving stack members may still be shown because they remain
+    /// managed by this workspace.
+    pub fn detach_window(&mut self, hwnd: isize) -> eyre::Result<()> {
+        border_manager::delete_border(hwnd);
+
+        if let Some(window_idx) = self
+            .floating_windows()
+            .iter()
+            .position(|window| window.hwnd == hwnd)
+        {
+            self.floating_windows_mut().remove(window_idx);
+            return Ok(());
+        }
+
+        if let Some(container) = &mut self.monocle_container
+            && let Some(window_idx) = container.idx_for_window(hwnd)
+        {
+            container
+                .remove_window_by_idx(window_idx)
+                .ok_or_eyre("there is no window")?;
+
+            if container.windows().is_empty() {
+                self.monocle_container = None;
+                self.monocle_container_restore_idx = None;
+            } else {
+                container.load_focused_window();
+            }
+
+            return Ok(());
+        }
+
+        if self
+            .maximized_window
+            .is_some_and(|window| window.hwnd == hwnd)
+        {
+            self.maximized_window = None;
+            self.maximized_window_restore_idx = None;
+            return Ok(());
+        }
+
+        let container_idx = self
+            .container_idx_for_window(hwnd)
+            .ok_or_eyre("there is no window")?;
+        let container = self
+            .containers_mut()
+            .get_mut(container_idx)
+            .ok_or_eyre("there is no container")?;
+        let window_idx = container
+            .idx_for_window(hwnd)
+            .ok_or_eyre("there is no window")?;
+
+        container
+            .remove_window_by_idx(window_idx)
+            .ok_or_eyre("there is no window")?;
+
+        if container.windows().is_empty() {
+            self.remove_container_by_idx(container_idx);
+            self.focus_previous_container();
+        } else {
+            container.load_focused_window();
+        }
+
+        Ok(())
+    }
+
     pub fn remove_focused_container(&mut self) -> Option<Container> {
         let focused_idx = self.focused_container_idx();
         let container = self.remove_container_by_idx(focused_idx);
@@ -2635,6 +2704,51 @@ mod tests {
 
         // Check that window 1 is removed
         assert!(!workspace.contains_window(1));
+    }
+
+    #[test]
+    fn detach_last_window_removes_its_container() {
+        let mut workspace = Workspace::default();
+        let mut container = Container::default();
+        container.windows_mut().push_back(Window::from(42));
+        workspace.add_container_to_back(container);
+
+        workspace.detach_window(42).unwrap();
+
+        assert!(workspace.containers().is_empty());
+        assert!(!workspace.contains_window(42));
+    }
+
+    #[test]
+    fn detach_removes_alternate_legacy_ownership_paths() {
+        let mut floating_workspace = Workspace::default();
+        floating_workspace
+            .floating_windows_mut()
+            .push_back(Window::from(42));
+        floating_workspace.detach_window(42).unwrap();
+        assert!(floating_workspace.floating_windows().is_empty());
+
+        let mut maximized_workspace = Workspace {
+            maximized_window: Some(Window::from(43)),
+            maximized_window_restore_idx: Some(0),
+            ..Workspace::default()
+        };
+        maximized_workspace.detach_window(43).unwrap();
+        assert!(maximized_workspace.maximized_window.is_none());
+        assert!(maximized_workspace.maximized_window_restore_idx.is_none());
+
+        let mut monocle_container = Container::default();
+        monocle_container
+            .windows_mut()
+            .push_back(Window::from(44));
+        let mut monocle_workspace = Workspace {
+            monocle_container: Some(monocle_container),
+            monocle_container_restore_idx: Some(0),
+            ..Workspace::default()
+        };
+        monocle_workspace.detach_window(44).unwrap();
+        assert!(monocle_workspace.monocle_container.is_none());
+        assert!(monocle_workspace.monocle_container_restore_idx.is_none());
     }
 
     #[test]

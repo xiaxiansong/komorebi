@@ -94,6 +94,11 @@ pub struct WindowManager {
     pub uncloack_to_ignore: usize,
     /// Maps each known window hwnd to the (monitor, workspace) index pair managing it
     pub known_hwnds: HashMap<isize, (usize, usize)>,
+    /// Runtime-only suppression set for windows explicitly detached from management.
+    ///
+    /// This is deliberately not part of persisted state. A new window manager process treats any
+    /// still-existing, otherwise eligible HWND as a newly opened window.
+    pub temporarily_unmanaged_hwnds: HashSet<isize>,
 }
 
 impl AsRef<Self> for WindowManager {
@@ -171,6 +176,7 @@ impl WindowManager {
             already_moved_window_handles: Arc::new(Mutex::new(HashSet::new())),
             uncloack_to_ignore: 0,
             known_hwnds: HashMap::new(),
+            temporarily_unmanaged_hwnds: HashSet::new(),
         })
     }
 
@@ -786,15 +792,115 @@ impl WindowManager {
     #[tracing::instrument(skip(self))]
     pub fn manage_focused_window(&mut self) -> eyre::Result<()> {
         let hwnd = WindowsApi::foreground_window()?;
-        let event = WindowManagerEvent::Manage(Window::from(hwnd));
+        let event = if self.temporarily_unmanaged_hwnds.contains(&hwnd) {
+            WindowManagerEvent::Resume(Window::from(hwnd))
+        } else {
+            WindowManagerEvent::Manage(Window::from(hwnd))
+        };
+        Ok(winevent_listener::event_tx().send(event)?)
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub fn resume_window(&mut self, hwnd: isize) -> eyre::Result<()> {
+        let event = WindowManagerEvent::Resume(Window::from(hwnd));
         Ok(winevent_listener::event_tx().send(event)?)
     }
 
     #[tracing::instrument(skip(self))]
     pub fn unmanage_focused_window(&mut self) -> eyre::Result<()> {
         let hwnd = WindowsApi::foreground_window()?;
-        let event = WindowManagerEvent::Unmanage(Window::from(hwnd));
+        let event = WindowManagerEvent::Suspend(Window::from(hwnd));
         Ok(winevent_listener::event_tx().send(event)?)
+    }
+
+    pub fn managed_window_location(&self, hwnd: isize) -> Option<(usize, usize)> {
+        for (monitor_idx, monitor) in self.monitors().iter().enumerate() {
+            for (workspace_idx, workspace) in monitor.workspaces().iter().enumerate() {
+                if workspace.contains_window(hwnd) {
+                    return Some((monitor_idx, workspace_idx));
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Remove a managed window from every ownership/index path and add it to the runtime
+    /// suppression set. The workspace snapshot makes the in-memory mutation atomic if detaching or
+    /// retiling fails.
+    pub fn suspend_managed_window(&mut self, hwnd: isize) -> eyre::Result<bool> {
+        let Some((monitor_idx, workspace_idx)) = self.managed_window_location(hwnd) else {
+            return Ok(false);
+        };
+
+        let workspace_before = self
+            .monitors()
+            .get(monitor_idx)
+            .and_then(|monitor| monitor.workspaces().get(workspace_idx))
+            .cloned()
+            .ok_or_eyre("there is no workspace")?;
+
+        let detach_result = self
+            .monitors_mut()
+            .get_mut(monitor_idx)
+            .and_then(|monitor| monitor.workspaces_mut().get_mut(workspace_idx))
+            .ok_or_eyre("there is no workspace")?
+            .detach_window(hwnd);
+
+        if let Err(error) = detach_result {
+            self.restore_workspace_snapshot(monitor_idx, workspace_idx, workspace_before)?;
+            return Err(error);
+        }
+
+        let workspace_is_visible = self
+            .monitors()
+            .get(monitor_idx)
+            .is_some_and(|monitor| monitor.focused_workspace_idx() == workspace_idx);
+
+        let update_result = if workspace_is_visible {
+            self.update_focused_workspace_by_monitor_idx(monitor_idx)
+        } else {
+            Ok(())
+        };
+
+        if let Err(error) = update_result {
+            self.restore_workspace_snapshot(monitor_idx, workspace_idx, workspace_before)?;
+            return Err(error);
+        }
+
+        self.temporarily_unmanaged_hwnds.insert(hwnd);
+        self.clear_window_transients(hwnd);
+        self.known_hwnds.remove(&hwnd);
+        crate::reaper::HWNDS_CACHE.lock().remove(&hwnd);
+
+        Ok(true)
+    }
+
+    fn restore_workspace_snapshot(
+        &mut self,
+        monitor_idx: usize,
+        workspace_idx: usize,
+        snapshot: Workspace,
+    ) -> eyre::Result<()> {
+        let workspace = self
+            .monitors_mut()
+            .get_mut(monitor_idx)
+            .and_then(|monitor| monitor.workspaces_mut().get_mut(workspace_idx))
+            .ok_or_eyre("there is no workspace")?;
+        *workspace = snapshot;
+        Ok(())
+    }
+
+    pub(crate) fn clear_window_transients(&mut self, hwnd: isize) {
+        self.already_moved_window_handles.lock().remove(&hwnd);
+        crate::HIDDEN_HWNDS.lock().retain(|hidden| *hidden != hwnd);
+
+        if self
+            .pending_move_op
+            .is_some_and(|(_, _, pending_hwnd)| pending_hwnd == hwnd)
+        {
+            *Arc::make_mut(&mut self.pending_move_op) = None;
+        }
     }
 
     #[tracing::instrument(skip(self))]
@@ -3984,6 +4090,45 @@ mod tests {
     #[test]
     fn test_create_window_manager() {
         let (_wm, _test_context) = setup_window_manager();
+    }
+
+    #[test]
+    fn suspend_removes_window_ownership_and_empty_container() {
+        let (mut wm, _test_context) = setup_window_manager();
+        let mut monitor = monitor::new(
+            0,
+            Rect::default(),
+            Rect::default(),
+            "TestMonitor".to_string(),
+            "TestDevice".to_string(),
+            "TestDeviceID".to_string(),
+            Some("TestMonitorID".to_string()),
+        );
+        let mut container = Container::default();
+        container.windows_mut().push_back(Window::from(42));
+        monitor
+            .focused_workspace_mut()
+            .unwrap()
+            .add_container_to_back(container);
+        wm.monitors_mut().push_back(monitor);
+        wm.known_hwnds.insert(42, (0, 0));
+
+        assert!(wm.suspend_managed_window(42).unwrap());
+        assert!(wm.temporarily_unmanaged_hwnds.contains(&42));
+        assert!(wm.managed_window_location(42).is_none());
+        assert!(!wm.known_hwnds.contains_key(&42));
+        assert!(wm.focused_workspace().unwrap().containers().is_empty());
+
+        assert!(!wm.suspend_managed_window(42).unwrap());
+        assert!(wm.temporarily_unmanaged_hwnds.contains(&42));
+    }
+
+    #[test]
+    fn suspending_an_unmanaged_window_is_a_noop() {
+        let (mut wm, _test_context) = setup_window_manager();
+
+        assert!(!wm.suspend_managed_window(42).unwrap());
+        assert!(!wm.temporarily_unmanaged_hwnds.contains(&42));
     }
 
     #[test]

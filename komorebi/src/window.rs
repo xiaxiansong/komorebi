@@ -1094,6 +1094,28 @@ pub struct RuleDebug {
     pub matches_no_titlebar: Option<MatchingRule>,
 }
 
+impl RuleDebug {
+    /// Returns true only for permanent/static ignore classification. A manage override may make a
+    /// window otherwise eligible, but a normal resume operation must still respect these rules.
+    pub fn is_explicitly_ignored(&self) -> bool {
+        self.matches_permaignore_class.is_some() || self.matches_ignore_identifier.is_some()
+    }
+}
+
+#[cfg(test)]
+mod rule_debug_tests {
+    use super::RuleDebug;
+
+    #[test]
+    fn permanent_ignore_is_an_explicit_ignore_classification() {
+        let mut debug = RuleDebug::default();
+        assert!(!debug.is_explicitly_ignored());
+
+        debug.matches_permaignore_class = Some("IgnoredWindowClass".to_string());
+        assert!(debug.is_explicitly_ignored());
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn window_is_eligible(
     hwnd: isize,

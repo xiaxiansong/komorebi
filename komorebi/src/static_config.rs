@@ -1377,6 +1377,7 @@ impl StaticConfig {
             already_moved_window_handles: Arc::new(Mutex::new(HashSet::new())),
             uncloack_to_ignore: 0,
             known_hwnds: HashMap::new(),
+            temporarily_unmanaged_hwnds: HashSet::new(),
         };
 
         #[allow(deprecated)]
