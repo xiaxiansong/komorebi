@@ -395,11 +395,18 @@ impl Monitor {
             bail!("cannot move native maximized window to another monitor or workspace");
         }
 
-        let foreground_hwnd = WindowsApi::foreground_window()?;
-        let floating_window_index = workspace
-            .floating_windows()
-            .iter()
-            .position(|w| w.hwnd == foreground_hwnd);
+        // The foreground window is only used to decide whether a floating window is being moved.
+        // A session without a foreground window means there is no such floating window; it must
+        // not abort a container move that does not depend on the query at all.
+        let floating_window_index =
+            WindowsApi::foreground_window()
+                .ok()
+                .and_then(|foreground_hwnd| {
+                    workspace
+                        .floating_windows()
+                        .iter()
+                        .position(|w| w.hwnd == foreground_hwnd)
+                });
 
         if let Some(idx) = floating_window_index {
             if let Some(window) = workspace.floating_windows_mut().remove(idx) {
