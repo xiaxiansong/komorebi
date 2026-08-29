@@ -279,18 +279,76 @@ Verification: `cargo test --workspace -- --test-threads=1` passed with komorebi 
 ignored, layouts 128, bar 3. `cargo fmt --check` clean; `cargo clippy --workspace --all-targets`
 reported only the pre-existing upstream warning. Commit: `a40f12bc`.
 
-### Phase 4 - Logical slots and render rectangles
+### Phase 4A - Logical geometry primitives
 
-- [ ] Add ID-keyed logical slots as workspace geometry authority.
-- [ ] Move adjacency, swap, resize, split, and coverage validation to logical rectangles.
-- [ ] Apply workspace padding/container gaps/borders only in render conversion.
-- [ ] Preserve integer-pixel coverage; odd 50:50 remainder belongs to the old container.
-- [ ] Add gap independence, adjacency, split, overlap, and full-coverage tests.
-- [ ] Commit as `feat: separate logical slots from window rendering`.
+Split from the original Phase 4 before coding: the geometry primitives and the workspace wiring
+that adopts them each reach the per-phase review limit on their own, and the primitives are
+independently testable without touching any existing call site.
 
-Expected handwritten change: 350-500 lines. Likely files: new `geometry.rs`, `workspace.rs`,
-`container.rs`, `set_window_position.rs`, `komorebi-layouts` only if a generic helper truly belongs
-there.
+- [x] Add `LogicalRect` with field names distinct from `Rect` so the two cannot be interchanged.
+- [x] Add 50:50 splitting along the longer edge, new container left or bottom, odd remainder pixel
+  to the existing container.
+- [x] Add edge, projection and adjacency primitives for later absorption and deletion phases.
+- [x] Add `LogicalSlots`: the `ContainerId`-keyed slot map with a monotonic geometry generation.
+- [x] Add coverage validation for containment, pairwise non-overlap and exact total area.
+- [x] Add split, odd-pixel, adjacency, gap-independence, coverage, generation and serde tests.
+- [x] Commit as `feat: add gap-free logical slot geometry`.
+
+Expected handwritten change: 350-500 lines. Likely files: new `geometry.rs`, `lib.rs`.
+
+Actual files: new `geometry.rs` (861 lines, roughly 430 production and 430 test) and the `lib.rs`
+module declaration. Coverage validation checks containment plus pairwise non-overlap plus an exact
+total area, which is equivalent to gap-free full coverage without materialising a per-pixel map; an
+empty slot set is vacuously valid because a workspace is allowed to have no container in a slot.
+`with_edge_at` is the single growth primitive absorption needs, so an expanding container can only
+change width or height, never both. Verification: 22 focused tests passed;
+`cargo test --workspace -- --test-threads=1` passed with komorebi 182 passed/1 ignored (up from
+160), layouts 128, bar 3; `cargo fmt --check` clean; `cargo clippy --workspace --all-targets`
+reported only the pre-existing upstream warning; `cargo check -p komorebi --features schemars`
+passed. Commit: `60ae742f`.
+
+### Phase 4B - Workspace slot authority and render conversion
+
+- [x] Make ID-keyed logical slots the workspace geometry authority.
+- [x] Calculate the arrangement without the container gap and store the result by container ID.
+- [x] Apply container gap, border offset, border width and stackbar strip only in render
+  conversion.
+- [x] Preserve integer-pixel coverage and validate it on every recalculation.
+- [x] Move cursor hit testing onto the gap-free slots.
+- [x] Drop a container's slot when it leaves the workspace; expose slots and generation in state.
+- [x] Add tiling, gap-independence, render-equivalence, identity-keying, deletion, gutter,
+  generation and serde-default tests.
+- [x] Commit as `feat: separate logical slots from window rendering`.
+
+Expected handwritten change: 300-400 lines. Likely files: `workspace.rs`, `geometry.rs`, `state.rs`.
+
+Actual files: `workspace.rs` (346 changed lines), `geometry.rs` (+40 for `RenderInsets` and
+`to_render_rect`), and `state.rs` (+2). Actual change: 361 added, 27 removed.
+
+The seam that made this safe is that `komorebi-layouts` applied `container_padding` as a uniform
+per-rectangle inset at the very end of `Arrangement::calculate`. Passing `None` therefore yields
+exactly the gap-free slots, and re-applying the same inset in `to_render_rect` reproduces the
+previous geometry bit for bit. `rendering_a_logical_slot_reproduces_the_previous_layout_geometry`
+asserts that equivalence for one to four containers at two gap sizes, so no existing layout moved.
+
+`calculate_logical_slots` is pure and makes no Win32 call, so slot geometry is testable without a
+desktop session; `record_logical_slots` stores the slots, records the available area, and logs any
+tiling violation rather than failing, because a released build must not refuse to tile over a
+geometry inconsistency. `latest_layout` keeps its existing meaning as the rendered, index-keyed
+result so no consumer had to change; identity-keyed geometry now lives beside it. The BSP layout
+already tiles exactly at odd pixel sizes: coverage validation passes for one to five containers at
+both 1920x1080 and 1001x777.
+
+Verification: `cargo test --workspace -- --test-threads=1` passed with komorebi 190 passed/1
+ignored (up from 182), layouts 128, bar 3, all other targets and doc-tests passed. `cargo fmt
+--check` clean; `cargo clippy --workspace --all-targets` reported only the pre-existing upstream
+warning; `cargo check -p komorebi --features schemars` passed. Commit: `dfe26c63`.
+
+Not run this phase: `just jsonschema` regeneration. `komorebic static-config-schema` overflows its
+stack in a debug build, and it does so identically on the pre-change commit, so this is a
+pre-existing environment limitation rather than a Phase 4 regression. `StaticConfig` was not
+touched, so `schema.json` needs no update; schema regeneration is deferred to the release-built
+verification in Phases 12 and 14.
 
 ### Phase 5 - Derived Active/Hidden container state
 
@@ -481,6 +539,22 @@ This list is updated from actual diffs, not treated as permission to change ever
   one level without the other.
 - 2026-08-29: `assert_invariants` panics only in this crate's tests and logs in production. A
   released build must not terminate a user's session over a model inconsistency.
+- 2026-08-30: `LogicalRect` uses `width`/`height` where `Rect` uses `right`/`bottom` for the same
+  quantities. The differing field names, not just the differing type, are what stop a logical slot
+  and a window rectangle from being swapped by accident.
+- 2026-08-30: `latest_layout` keeps its existing index-keyed, rendered meaning. Identity-keyed
+  logical slots were added beside it instead of redefining it, so no existing consumer changed
+  behaviour in the same phase that introduced the new authority.
+- 2026-08-30: Gap-free slots are produced by passing `None` for `container_padding` to the existing
+  arrangement rather than by writing a new tiling algorithm, because that crate already applies the
+  gap as a final per-rectangle inset. This keeps every existing layout, including custom layouts,
+  working unchanged and is asserted by a render-equivalence test.
+- 2026-08-30: Coverage violations are logged, not returned as errors, at the recalculation point.
+  Geometry invariants are enforced by tests and by `assert_invariants`; a user session must not
+  lose its tiling because one layout produced an unexpected rectangle.
+- 2026-08-30: `komorebic static-config-schema` overflows its stack in a debug build on this
+  machine, on the pre-change commit as well. Schema regeneration therefore needs a release build
+  and is deferred to Phases 12 and 14.
 
 ## Progress log
 
@@ -518,6 +592,19 @@ This list is updated from actual diffs, not treated as permission to change ever
   3C added the ownership/history invariant validator and wired it into the at-rest runtime path.
   The full serial workspace suite passed at every step (komorebi 123 -> 149 -> 160 passing).
   Next phase: logical slots and render rectangles.
+- 2026-08-30: Phase 4 turn. The plan was re-read and the worktree confirmed clean at `1a9e2d5e`
+  before editing, and `cargo check --workspace` was re-run as this turn's baseline. Phase 4 was
+  split into 4A primitives and 4B workspace adoption before coding, for the same review-size reason
+  as Phases 2 and 3. 4A added the gap-free `LogicalRect`, 50:50 splitting with the odd pixel going
+  to the existing container, adjacency by edge coordinate and edge projection, and the
+  identity-keyed `LogicalSlots` map with its geometry generation and coverage validator. 4B made
+  those slots the workspace geometry authority: the arrangement is calculated without the container
+  gap, the result is stored by `ContainerId`, and gaps, borders and the stackbar strip are applied
+  only in `to_render_rect`. A render-equivalence test pins the rendered output to the previous
+  behaviour. Full serial workspace suite passed at every step (komorebi 160 -> 182 -> 190 passing);
+  fmt and Clippy clean apart from the pre-existing upstream warning. Next phase: derived
+  Active/Hidden container state, which is what makes the coverage invariant apply to active
+  containers only.
 - 2026-08-29: Phase 3 was split into 3A identity and 3B histories/invariants after call-site review
   showed that doing both together would exceed the phase review-size limit. Phase 3A added
   transparent typed workspace/container IDs, migrated managed ownership and UI integration
