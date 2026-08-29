@@ -451,15 +451,50 @@ ignored (up from 204), layouts 128, bar 3. `cargo fmt --check` clean; `cargo cli
 
 ### Phase 5C - Container-owned minimized windows
 
-- [ ] Make minimize a visibility change which keeps container membership instead of a removal.
-- [ ] Record and prune the workspace minimize history around that transition.
-- [ ] Restore the last minimized window through the transition methods and both MRUs.
-- [ ] Keep duplicate and out-of-order minimize/restore events idempotent.
-- [ ] Add minimize-hides-container, restore-reactivates, and history tests.
-- [ ] Commit as `feat: keep minimized windows in their containers`.
+- [x] Make minimize a visibility change which keeps container membership instead of a removal.
+- [x] Record and prune the workspace minimize history around that transition.
+- [x] Restore the last minimized window through the transition methods and both MRUs.
+- [x] Keep duplicate and out-of-order minimize/restore events idempotent.
+- [x] Add minimize-hides-container, restore-reactivates, and history tests.
+- [x] Commit as `feat: keep minimized windows in their containers`.
 
 Expected handwritten change: 300-450 lines. Likely files: `workspace.rs`, `container.rs`,
 `window_manager.rs`, `process_event.rs`, `process_command.rs`.
+
+Actual files: `workspace.rs`, `window_manager.rs`, `process_event.rs`. Actual change: 412 added,
+5 removed, roughly 200 production and 210 test lines.
+
+Upstream removed a minimized window from its workspace, so it lost its container, its stack
+position and both of its history entries, and returning from the taskbar re-managed it as a
+brand-new window. `Workspace::minimize_window` and `unminimize_window` change only visibility;
+the container keeps everything else and simply stops occupying a slot once it has no visible
+stored window left. Container focus moves off a window as it is minimized, because a minimized
+window is not a focus target, but its stack position and its place in the container's window
+count are untouched.
+
+`restore_last_minimized_window` reverses exactly that through `take_last_minimized_window`, which
+already discards stale entries, and returns the window with the placement and presentation it was
+minimized with.
+
+Both transitions return whether anything changed, and `set_managed_window_minimized` only retiles
+on a real change. The taskbar restore path is the same reconciliation, driven from the ordinary
+show/focus/uncloak/manage events when Win32 reports the window is no longer minimized, so a
+duplicated or out-of-order event converges instead of retiling repeatedly. Because the window
+never left its container, the existing `contains_window` guard in the show path already stops it
+from being re-managed as a new window.
+
+`HIDDEN_HWNDS` still distinguishes a programmatic hide from a user minimize, and the model's own
+visibility - not the Win32 state - decides what `Container::restore` brings back, so a workspace
+hidden with `HidingBehaviour::Minimize` still restores correctly.
+
+Not in this phase: the socket message and `komorebic` verb for restoring the last minimized
+window. The core operation exists and is tested; the command surface is finalized in Phase 12 as
+planned.
+
+Verification: `cargo test --workspace -- --test-threads=1` passed with komorebi 226 passed/1
+ignored (up from 213), layouts 128, bar 3. `cargo fmt --check` clean; `cargo clippy --workspace
+--all-targets` reported only the pre-existing upstream warning; `cargo check -p komorebi
+--features schemars` passed. Commit: `e051a934`.
 
 ### Phase 5D - Presentation replaces maximized and monocle ownership
 
@@ -681,6 +716,10 @@ This list is updated from actual diffs, not treated as permission to change ever
   and ignored rather than migrated. Static configuration does not contain the field, so
   configuration compatibility is untouched.
 
+- 2026-08-30: Minimize keeps container ownership, so restoring a window from the taskbar is a
+  reconciliation rather than a fresh `manage`. This is an intended behaviour change from upstream
+  komorebi and is what makes the minimize history able to name windows the workspace still owns.
+
 ## Progress log
 
 - 2026-08-29: Phase 0 baseline captured. No source changes existed at start. Full workspace tests
@@ -738,9 +777,12 @@ This list is updated from actual diffs, not treated as permission to change ever
   test race that 5A's timing exposed was fixed first, in its own commit. 5B removed the
   workspace-level floating window list, which is the single largest ownership change in the task:
   a floating window is now an ordinary member of a container which the container does not
-  position. Full serial workspace suite passed at every step (komorebi 190 -> 204 -> 213
-  passing); fmt and Clippy clean apart from the pre-existing upstream warning. Next phase:
-  container-owned minimized windows.
+  position. 5C made minimizing a visibility change rather than a removal, which is what makes a
+  container able to become Hidden through the minimize path and what stops a restored window
+  from being re-managed as a new window. Full serial workspace suite passed at every step
+  (komorebi 190 -> 204 -> 213 -> 226 passing); fmt and Clippy clean apart from the pre-existing
+  upstream warning. Next phase: 5D, replacing maximized and monocle ownership with window
+  presentation, which is the last alternate ownership path in the model.
 - 2026-08-29: Phase 3 was split into 3A identity and 3B histories/invariants after call-site review
   showed that doing both together would exceed the phase review-size limit. Phase 3A added
   transparent typed workspace/container IDs, migrated managed ownership and UI integration
