@@ -85,9 +85,6 @@ pub struct Workspace {
     pub monocle_container: Option<Container>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub monocle_container_restore_idx: Option<usize>,
-    pub maximized_window: Option<Window>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub maximized_window_restore_idx: Option<usize>,
     pub layout: Layout,
     pub layout_options: Option<LayoutOptions>,
     pub layout_rules: Vec<(usize, Layout)>,
@@ -169,8 +166,6 @@ impl Default for Workspace {
             container_focus_history: Mru::default(),
             minimize_history: Mru::default(),
             monocle_container: None,
-            maximized_window: None,
-            maximized_window_restore_idx: None,
             monocle_container_restore_idx: None,
             layout: Layout::Default(DefaultLayout::BSP),
             layout_options: None,
@@ -205,8 +200,7 @@ impl Default for Workspace {
 
 #[derive(Debug)]
 pub enum WorkspaceWindowLocation {
-    Monocle(usize), // window_idx
-    Maximized,
+    Monocle(usize),          // window_idx
     Container(usize, usize), // container_idx, window_idx
     Floating(usize),         // idx in the derived floating window order
 }
@@ -433,10 +427,6 @@ impl Workspace {
             container.hide(omit)
         }
 
-        if let Some(window) = self.maximized_window {
-            window.hide();
-        }
-
         if let Some(container) = &self.monocle_container {
             container.hide(omit)
         }
@@ -593,20 +583,21 @@ impl Workspace {
             container.focus_window(container.focused_window_idx());
         }
 
-        // Do this here to make sure that an error doesn't stop the restoration of other windows
+        // Do this here to make sure that an error doesn't stop the restoration of other windows.
         // Maximised windows and floating windows should always be drawn at the top of the Z order
-        // when switching to a workspace
+        // when switching to a workspace. A maximized window has already been shown maximized by
+        // the container which owns it, so only the Z order is still left to settle here.
+        let maximized_window = self.maximized_window();
+
         if let Some(window) = to_focus {
-            if self.maximized_window.is_none() && matches!(self.layer, WorkspaceLayer::Tiling) {
+            if maximized_window.is_none() && matches!(self.layer, WorkspaceLayer::Tiling) {
                 window.focus(mouse_follows_focus)?;
-            } else if let Some(maximized_window) = self.maximized_window {
-                maximized_window.restore();
+            } else if let Some(maximized_window) = maximized_window {
                 maximized_window.focus(mouse_follows_focus)?;
             } else if let Some(floating_window) = self.focused_floating_window() {
                 floating_window.focus(mouse_follows_focus)?;
             }
-        } else if let Some(maximized_window) = self.maximized_window {
-            maximized_window.restore();
+        } else if let Some(maximized_window) = maximized_window {
             maximized_window.focus(mouse_follows_focus)?;
         } else if let Some(floating_window) = self.focused_floating_window() {
             floating_window.focus(mouse_follows_focus)?;
@@ -716,8 +707,6 @@ impl Workspace {
             self.window_container_behaviour = updated_behaviour;
         }
 
-        let managed_maximized_window = self.maximized_window.is_some();
-
         if self.tile {
             if let Some(container) = &mut self.monocle_container {
                 if let Some(window) = container.focused_window_mut() {
@@ -726,8 +715,6 @@ impl Workspace {
                     adjusted_work_area.add_padding(border_width);
                     window.set_position(&adjusted_work_area, true)?;
                 };
-            } else if let Some(window) = &mut self.maximized_window {
-                window.maximize();
             } else if !self.containers().is_empty() {
                 let effective_layout_options = self.effective_layout_options();
 
@@ -804,13 +791,21 @@ impl Workspace {
                                     window.add_title_bar()?;
                                 }
 
-                                // If a window has been unmaximized via toggle-maximize, this block
-                                // will make sure that it is unmaximized via restore_window
-                                if window.is_maximized() && !managed_maximized_window {
+                                // The model owns the presentation, so a window Win32 still has
+                                // maximized after the model returned it to Normal is restored
+                                // here rather than left disagreeing with its own state.
+                                if window.window.is_maximized() && !window.is_maximized() {
                                     WindowsApi::restore_window(window.hwnd);
                                 }
                             }
-                            window.set_position(layout, false)?;
+
+                            // A maximized window keeps its container's slot but is not drawn in
+                            // it; drawing it into the slot would silently unmaximize it.
+                            if window.is_maximized() {
+                                window.window.maximize();
+                            } else {
+                                window.set_position(layout, false)?;
+                            }
                         }
                     }
                 }
@@ -938,6 +933,173 @@ impl Workspace {
         self.focused_floating_window()
             .and_then(|window| self.floating_window_idx(window.hwnd))
             .unwrap_or_default()
+    }
+
+    /// The window this workspace currently presents maximized, if it has one.
+    ///
+    /// Maximizing is a presentation change, so the maximized window is an ordinary member of the
+    /// container which has owned it all along. This is a listing derived from that ownership, not
+    /// a second place a window can be stored.
+    #[must_use]
+    pub fn maximized_managed_window(&self) -> Option<&ManagedWindow> {
+        self.containers()
+            .iter()
+            .find_map(Container::maximized_managed_window)
+    }
+
+    #[must_use]
+    pub fn maximized_window(&self) -> Option<Window> {
+        self.maximized_managed_window().map(|window| window.window)
+    }
+
+    #[must_use]
+    pub fn is_maximized_window(&self, hwnd: isize) -> bool {
+        self.maximized_managed_window()
+            .is_some_and(|window| window.hwnd == hwnd)
+    }
+
+    /// Whether the container a move would take away currently presents a maximized window.
+    ///
+    /// A maximized window used to be held outside every container, so any maximized window in the
+    /// workspace blocked a container move. Now that it stays where it belongs, only the container
+    /// actually being moved can block one.
+    #[must_use]
+    pub fn focused_container_has_maximized_window(&self) -> bool {
+        self.focused_container()
+            .and_then(Container::maximized_managed_window)
+            .is_some()
+    }
+
+    /// The rendered rectangle the container at `idx` currently occupies, if it owns a slot.
+    fn render_rect_at(&self, idx: usize) -> Option<Rect> {
+        let container = self.containers().get(idx)?;
+        let slot = self.logical_slots.get(&container.id)?;
+
+        let container_padding = self
+            .container_padding
+            .or(self.globals.container_padding)
+            .unwrap_or_default();
+
+        let stackbar_height = if stackbar_manager::should_have_stackbar(container.windows().len()) {
+            STACKBAR_TAB_HEIGHT.load(Ordering::SeqCst) + container_padding
+        } else {
+            0
+        };
+
+        Some(slot.to_render_rect(RenderInsets {
+            container_padding,
+            border_offset: self.globals.border_offset,
+            border_width: self.globals.border_width,
+            stackbar_height,
+        }))
+    }
+
+    /// The window a maximize request acts on.
+    ///
+    /// The floating layer acts on the floating window it is cycling; otherwise the focused
+    /// container's focused window is the subject. A minimized window is never a subject, because
+    /// maximizing it would make the model claim a presentation nothing is drawing.
+    fn maximize_subject(&self) -> Option<isize> {
+        if matches!(self.layer, WorkspaceLayer::Floating)
+            && let Some(window) = self.focused_floating_window()
+        {
+            return Some(window.hwnd);
+        }
+
+        self.focused_container()
+            .and_then(Container::focused_managed_window)
+            .filter(|window| window.visibility == Visibility::Visible)
+            .map(|window| window.hwnd)
+    }
+
+    /// Maximize the window this workspace currently acts on, in place.
+    ///
+    /// The window keeps its container, its position in that container's stack and both of its
+    /// history entries. Only its presentation changes, which is why a maximize toggle no longer
+    /// destroys a container and rebuilds a different one in its place.
+    pub fn maximize_focused_window(&mut self) -> eyre::Result<()> {
+        let hwnd = self
+            .maximize_subject()
+            .ok_or_eyre("there is no window to maximize")?;
+
+        self.maximize_window(hwnd)
+    }
+
+    pub fn maximize_window(&mut self, hwnd: isize) -> eyre::Result<()> {
+        let container_idx = self
+            .container_idx_for_window(hwnd)
+            .ok_or_eyre("this workspace does not own that window")?;
+
+        // Read before the mutable borrow: the rectangle the window has now is the one it should
+        // come back to when it stops being maximized.
+        let current_rect = WindowsApi::window_rect(hwnd).unwrap_or_default();
+
+        let container = self
+            .containers_mut()
+            .get_mut(container_idx)
+            .ok_or_eyre("there is no container")?;
+
+        let window_idx = container
+            .idx_for_window(hwnd)
+            .ok_or_eyre("that container does not own that window")?;
+
+        let changed = container.windows_mut()[window_idx].set_maximized(current_rect);
+        let window = container.windows()[window_idx].window;
+        container.focus_window(window_idx);
+        self.focus_container(container_idx);
+
+        // Reapplying the Win32 state of a window which is already maximized is what makes a
+        // duplicated command or event converge instead of toggling.
+        window.maximize();
+
+        if !changed {
+            tracing::debug!("window {hwnd} was already maximized");
+        }
+
+        Ok(())
+    }
+
+    /// Return the maximized window to the presentation its placement implies.
+    pub fn unmaximize_window(&mut self) -> eyre::Result<()> {
+        let hwnd = self
+            .maximized_window()
+            .ok_or_eyre("there is no maximized window")?
+            .hwnd;
+
+        let container_idx = self
+            .container_idx_for_window(hwnd)
+            .ok_or_eyre("this workspace does not own that window")?;
+
+        let fallback = self.render_rect_at(container_idx).unwrap_or_default();
+
+        let container = self
+            .containers_mut()
+            .get_mut(container_idx)
+            .ok_or_eyre("there is no container")?;
+
+        let window_idx = container
+            .idx_for_window(hwnd)
+            .ok_or_eyre("that container does not own that window")?;
+
+        let managed = &mut container.windows_mut()[window_idx];
+        let placement = managed.placement;
+        let target = managed.set_normal(fallback);
+        let window = container.windows()[window_idx].window;
+
+        window.unmaximize();
+
+        // A stored window is put back in its slot by the retile which follows; a floating window
+        // has no slot, so the rectangle it kept is applied directly. The model transition has
+        // already committed, so a failed Win32 call is reported rather than rolled back: the
+        // next retile reapplies the same rectangle from the same state.
+        if placement == ManagedPlacement::Floating
+            && let Some(target) = target
+            && let Err(error) = window.set_position(&target, false)
+        {
+            tracing::warn!("could not restore the floating rectangle of window {hwnd}: {error}");
+        }
+
+        Ok(())
     }
 
     /// Make an owned window float without changing which container owns it.
@@ -1175,13 +1337,6 @@ impl Workspace {
             }
         }
 
-        if let Some(window) = self.maximized_window
-            && let Ok(window_exe) = window.exe()
-            && exe == window_exe
-        {
-            return Option::from(window.hwnd);
-        }
-
         if let Some(container) = &self.monocle_container
             && let Some(hwnd) = container.hwnd_from_exe(exe)
         {
@@ -1199,13 +1354,6 @@ impl Workspace {
                     window_idx,
                 ));
             }
-        }
-
-        if let Some(window) = self.maximized_window
-            && let Ok(window_exe) = window.exe()
-            && exe == window_exe
-        {
-            return Some(WorkspaceWindowLocation::Maximized);
         }
 
         if let Some(container) = &self.monocle_container
@@ -1232,12 +1380,6 @@ impl Workspace {
             }
         }
 
-        if let Some(window) = self.maximized_window
-            && hwnd == window.hwnd
-        {
-            return true;
-        }
-
         if let Some(container) = &self.monocle_container
             && container.contains_window(hwnd)
         {
@@ -1249,9 +1391,7 @@ impl Workspace {
 
     pub fn is_focused_window_monocle_or_maximized(&self) -> eyre::Result<bool> {
         let hwnd = WindowsApi::foreground_window()?;
-        if let Some(window) = self.maximized_window
-            && hwnd == window.hwnd
-        {
+        if self.is_maximized_window(hwnd) {
             return Ok(true);
         }
 
@@ -1265,9 +1405,7 @@ impl Workspace {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.containers().is_empty()
-            && self.maximized_window.is_none()
-            && self.monocle_container.is_none()
+        self.containers().is_empty() && self.monocle_container.is_none()
     }
 
     pub fn contains_window(&self, hwnd: isize) -> bool {
@@ -1275,12 +1413,6 @@ impl Workspace {
             if container.contains_window(hwnd) {
                 return true;
             }
-        }
-
-        if let Some(window) = self.maximized_window
-            && hwnd == window.hwnd
-        {
-            return true;
         }
 
         if let Some(container) = &self.monocle_container
@@ -1410,15 +1542,6 @@ impl Workspace {
             return Ok(());
         }
 
-        if let Some(window) = self.maximized_window
-            && window.hwnd == hwnd
-        {
-            window.unmaximize();
-            self.maximized_window = None;
-            self.maximized_window_restore_idx = None;
-            return Ok(());
-        }
-
         let container_idx = self
             .container_idx_for_window(hwnd)
             .ok_or_eyre("there is no window")?;
@@ -1485,18 +1608,6 @@ impl Workspace {
             }
 
             return Ok(window);
-        }
-
-        if let Some(window) = self.maximized_window.filter(|window| window.hwnd == hwnd) {
-            self.maximized_window = None;
-            self.maximized_window_restore_idx = None;
-            return Ok(ManagedWindow::from_observed(
-                window,
-                ContainerId::default(),
-                false,
-                true,
-                false,
-            ));
         }
 
         let container_idx = self
@@ -1912,13 +2023,13 @@ impl Workspace {
 
     /// Float the focused window, keeping it in the container which owns it.
     ///
-    /// A window held by the transitional maximized or monocle path is not owned by a container,
-    /// so it is reintegrated first; floating it then leaves ownership where the model requires
+    /// A maximized window is returned to Normal first, and a window held by the transitional
+    /// monocle path is reintegrated first, so floating leaves ownership where the model requires
     /// it. Nothing is removed from a container here, which is why an emptied container can no
     /// longer appear as a side effect of floating a window.
     pub fn new_floating_window(&mut self) -> eyre::Result<()> {
-        if self.maximized_window.is_some() {
-            self.reintegrate_maximized_window()?;
+        if self.maximized_window().is_some() {
+            self.unmaximize_window()?;
         } else if self.monocle_container.is_some() {
             self.reintegrate_monocle_container()?;
         }
@@ -2301,112 +2412,6 @@ impl Workspace {
         Ok(())
     }
 
-    pub fn new_maximized_window(&mut self) -> eyre::Result<()> {
-        let focused_idx = self.focused_container_idx();
-
-        if matches!(self.layer, WorkspaceLayer::Floating)
-            && let Some(floating_window) = self.focused_floating_window()
-        {
-            self.detach_window(floating_window.hwnd)?;
-            self.maximized_window = Option::from(floating_window);
-            self.maximized_window_restore_idx = Option::from(focused_idx);
-            floating_window.maximize();
-
-            return Ok(());
-        }
-
-        let monocle_restore_idx = self.monocle_container_restore_idx;
-        if let Some(monocle_container) = &mut self.monocle_container {
-            let window = monocle_container
-                .remove_focused_window()
-                .ok_or_eyre("there is no window")?;
-
-            if monocle_container.windows().is_empty() {
-                self.monocle_container = None;
-                self.monocle_container_restore_idx = None;
-            } else {
-                monocle_container.load_focused_window();
-            }
-
-            self.maximized_window = Option::from(window.window);
-            self.maximized_window_restore_idx = monocle_restore_idx;
-            if let Some(window) = self.maximized_window {
-                window.maximize();
-            }
-
-            return Ok(());
-        }
-
-        let container = self
-            .focused_container_mut()
-            .ok_or_eyre("there is no container")?;
-
-        let window = container
-            .remove_focused_window()
-            .ok_or_eyre("there is no window")?;
-
-        if container.windows().is_empty() {
-            let emptied_id = container.id.clone();
-            // we shouldn't use remove_container_by_idx here because it doesn't make sense for
-            // monocle and maximized toggles which take over the whole screen before being reinserted
-            // at the same index to respect locked container indexes
-            self.containers_mut().remove(focused_idx);
-            self.logical_slots.remove(&emptied_id);
-            if self.resize_dimensions.get(focused_idx).is_some() {
-                self.resize_dimensions.remove(focused_idx);
-            }
-        } else {
-            container.load_focused_window();
-        }
-
-        self.maximized_window = Option::from(window.window);
-        self.maximized_window_restore_idx = Option::from(focused_idx);
-
-        if let Some(window) = self.maximized_window {
-            window.maximize();
-        }
-
-        self.focus_previous_container();
-
-        Ok(())
-    }
-
-    pub fn reintegrate_maximized_window(&mut self) -> eyre::Result<()> {
-        let restore_idx = self
-            .maximized_window_restore_idx
-            .ok_or_eyre("there is no monocle restore index")?;
-
-        let window = self
-            .maximized_window
-            .as_ref()
-            .ok_or_eyre("there is no monocle container")?;
-
-        let window = *window;
-        if !self.containers().is_empty() && restore_idx > self.containers().len().saturating_sub(1)
-        {
-            self.containers_mut()
-                .resize(restore_idx, Container::default());
-        }
-
-        let mut container = Container::default();
-        container.add_window(window);
-
-        // we shouldn't use insert_container_at_index here because it doesn't make sense for
-        // monocle and maximized toggles which take over the whole screen before being reinserted
-        // at the same index to respect locked container indexes
-        self.containers_mut().insert(restore_idx, container);
-        self.focus_container(restore_idx);
-
-        self.focused_container_mut()
-            .ok_or_eyre("there is no container")?
-            .load_focused_window();
-
-        self.maximized_window = None;
-        self.maximized_window_restore_idx = None;
-
-        Ok(())
-    }
-
     #[tracing::instrument(skip(self))]
     pub fn focus_container(&mut self, idx: usize) {
         tracing::info!("focusing container");
@@ -2549,8 +2554,6 @@ impl Workspace {
     pub fn visible_windows(&self) -> Vec<Option<&Window>> {
         let mut vec = vec![];
 
-        vec.push(self.maximized_window.as_ref());
-
         if let Some(monocle) = &self.monocle_container {
             vec.push(monocle.focused_window());
         }
@@ -2568,12 +2571,6 @@ impl Workspace {
 
     pub fn visible_window_details(&self) -> Vec<WindowDetails> {
         let mut vec: Vec<WindowDetails> = vec![];
-
-        if let Some(maximized) = self.maximized_window
-            && let Ok(details) = (maximized).try_into()
-        {
-            vec.push(details);
-        }
 
         if let Some(monocle) = &self.monocle_container
             && let Some(focused) = monocle.focused_window()
@@ -4130,17 +4127,181 @@ mod tests {
         assert!(workspace.containers().is_empty());
     }
 
+    fn workspace_with_stack(hwnds: &[isize]) -> Workspace {
+        let mut workspace = Workspace::default();
+        let mut container = Container::default();
+
+        for hwnd in hwnds {
+            container.windows_mut().push_back(Window::from(*hwnd));
+        }
+
+        workspace.add_container_to_back(container);
+        workspace
+    }
+
+    #[test]
+    fn maximizing_keeps_the_window_in_its_container() {
+        let mut workspace = workspace_with_stack(&[1, 2, 3]);
+        let container_id = workspace.containers()[0].id.clone();
+
+        workspace.maximize_focused_window().unwrap();
+
+        assert_eq!(workspace.containers().len(), 1);
+        assert_eq!(workspace.containers()[0].id, container_id);
+        assert_eq!(workspace.containers()[0].windows().len(), 3);
+        assert_eq!(workspace.maximized_window(), Some(Window::from(1)));
+        assert!(workspace.is_maximized_window(1));
+
+        // A maximized window is still a visible stored window, so its container keeps its slot.
+        assert!(workspace.containers()[0].is_active());
+        assert_eq!(workspace.active_container_count(), 1);
+    }
+
+    #[test]
+    fn maximizing_does_not_change_the_stack_or_the_owning_container_id() {
+        let mut workspace = workspace_with_stack(&[1, 2, 3]);
+        let owner = workspace.containers()[0].id.clone();
+
+        workspace.maximize_window(2).unwrap();
+
+        let container = &workspace.containers()[0];
+        let order: Vec<isize> = container.windows().iter().map(|w| w.hwnd).collect();
+        assert_eq!(order, vec![1, 2, 3]);
+
+        for window in container.windows() {
+            assert_eq!(window.container_id, owner);
+        }
+
+        assert_eq!(workspace.maximized_window(), Some(Window::from(2)));
+    }
+
+    #[test]
+    fn maximizing_twice_is_idempotent_and_keeps_the_first_restore_rectangle() {
+        let mut workspace = workspace_with_stack(&[1]);
+        workspace.containers_mut()[0].windows_mut()[0].restore_rect = None;
+
+        workspace.maximize_window(1).unwrap();
+        let first = workspace.containers()[0].windows()[0].restore_rect;
+
+        workspace.maximize_window(1).unwrap();
+
+        let window = &workspace.containers()[0].windows()[0];
+        assert_eq!(window.presentation, Presentation::Maximized);
+        assert_eq!(window.restore_rect, first);
+        assert_eq!(workspace.containers()[0].windows().len(), 1);
+    }
+
+    #[test]
+    fn unmaximizing_returns_the_window_to_normal_without_moving_it() {
+        let mut workspace = workspace_with_stack(&[1, 2]);
+        let container_id = workspace.containers()[0].id.clone();
+
+        workspace.maximize_window(1).unwrap();
+        workspace.unmaximize_window().unwrap();
+
+        assert_eq!(workspace.maximized_window(), None);
+        assert_eq!(workspace.containers().len(), 1);
+        assert_eq!(workspace.containers()[0].id, container_id);
+        assert_eq!(workspace.containers()[0].windows().len(), 2);
+
+        let window = &workspace.containers()[0].windows()[0];
+        assert_eq!(window.presentation, Presentation::Normal);
+        assert_eq!(window.restore_rect, None);
+        assert_eq!(window.placement, ManagedPlacement::Stored);
+    }
+
+    #[test]
+    fn unmaximizing_without_a_maximized_window_changes_nothing() {
+        let mut workspace = workspace_with_stack(&[1, 2]);
+        let before = workspace.clone();
+
+        assert!(workspace.unmaximize_window().is_err());
+        assert_eq!(workspace.containers(), before.containers());
+    }
+
+    #[test]
+    fn maximize_refuses_a_window_this_workspace_does_not_own() {
+        let mut workspace = workspace_with_stack(&[1]);
+
+        assert!(workspace.maximize_window(99).is_err());
+        assert_eq!(workspace.maximized_window(), None);
+        assert_eq!(workspace.containers()[0].windows().len(), 1);
+    }
+
+    #[test]
+    fn maximizing_a_floating_window_keeps_its_placement_and_rectangle() {
+        let mut workspace = workspace_with_stack(&[1, 2]);
+        let rect = Rect {
+            left: 10,
+            top: 20,
+            right: 300,
+            bottom: 400,
+        };
+        workspace.float_window(1, rect).unwrap();
+
+        workspace.maximize_window(1).unwrap();
+
+        let window = &workspace.containers()[0].windows()[0];
+        assert_eq!(window.placement, ManagedPlacement::Floating);
+        assert_eq!(window.floating_rect, Some(rect));
+        assert_eq!(window.presentation, Presentation::Maximized);
+
+        workspace.unmaximize_window().unwrap();
+
+        let window = &workspace.containers()[0].windows()[0];
+        assert_eq!(window.placement, ManagedPlacement::Floating);
+        assert_eq!(window.floating_rect, Some(rect));
+        assert_eq!(window.presentation, Presentation::Normal);
+    }
+
+    #[test]
+    fn a_minimized_window_is_never_a_maximize_subject() {
+        let mut workspace = workspace_with_stack(&[1]);
+        workspace.minimize_window(1).unwrap();
+
+        assert!(workspace.maximize_focused_window().is_err());
+        assert_eq!(workspace.maximized_window(), None);
+        assert_eq!(
+            workspace.containers()[0].windows()[0].visibility,
+            Visibility::Minimized
+        );
+    }
+
+    #[test]
+    fn a_maximized_window_only_blocks_a_move_of_its_own_container() {
+        let mut workspace = workspace_with_stack(&[1]);
+        let mut second = Container::default();
+        second.windows_mut().push_back(Window::from(2));
+        workspace.add_container_to_back(second);
+
+        workspace.maximize_window(1).unwrap();
+
+        workspace.focus_container(1);
+        assert!(!workspace.focused_container_has_maximized_window());
+
+        workspace.focus_container(0);
+        assert!(workspace.focused_container_has_maximized_window());
+    }
+
+    #[test]
+    fn maximizing_keeps_the_window_in_both_focus_histories() {
+        let mut workspace = workspace_with_stack(&[1, 2]);
+        let container_id = workspace.containers()[0].id.clone();
+
+        workspace.maximize_window(2).unwrap();
+
+        assert_eq!(
+            workspace.container_focus_history.iter().next(),
+            Some(&container_id)
+        );
+        assert_eq!(
+            workspace.containers()[0].focus_history().most_recent(),
+            Some(&2)
+        );
+    }
+
     #[test]
     fn detach_removes_alternate_legacy_ownership_paths() {
-        let mut maximized_workspace = Workspace {
-            maximized_window: Some(Window::from(43)),
-            maximized_window_restore_idx: Some(0),
-            ..Workspace::default()
-        };
-        maximized_workspace.detach_window(43).unwrap();
-        assert!(maximized_workspace.maximized_window.is_none());
-        assert!(maximized_workspace.maximized_window_restore_idx.is_none());
-
         let mut monocle_container = Container::default();
         monocle_container.windows_mut().push_back(Window::from(44));
         let mut monocle_workspace = Workspace {
@@ -4290,11 +4451,10 @@ mod tests {
         }
 
         {
-            // visible_windows should return None and 100
+            // There is no monocle container, so only the containers contribute a visible window
             let visible_windows = workspace.visible_windows();
-            assert_eq!(visible_windows.len(), 2);
-            assert!(visible_windows[0].is_none());
-            assert_eq!(visible_windows[1].unwrap().hwnd, 100);
+            assert_eq!(visible_windows.len(), 1);
+            assert_eq!(visible_windows[0].unwrap().hwnd, 100);
         }
 
         {
@@ -4305,24 +4465,22 @@ mod tests {
         }
 
         {
-            // visible_windows should return None, 100, and 300
+            // visible_windows should return 100 and 300
             let visible_windows = workspace.visible_windows();
-            assert_eq!(visible_windows.len(), 3);
-            assert!(visible_windows[0].is_none());
-            assert_eq!(visible_windows[1].unwrap().hwnd, 100);
-            assert_eq!(visible_windows[2].unwrap().hwnd, 300);
+            assert_eq!(visible_windows.len(), 2);
+            assert_eq!(visible_windows[0].unwrap().hwnd, 100);
+            assert_eq!(visible_windows[1].unwrap().hwnd, 300);
         }
 
-        // Maximize window 200
-        workspace.maximized_window = Some(Window { hwnd: 200 });
+        // Maximizing window 200 makes it the window its own container shows; it does not add a
+        // separate entry, because it never leaves that container.
+        workspace.maximize_window(200).unwrap();
 
         {
-            // visible_windows should return 200, 100, and 300
             let visible_windows = workspace.visible_windows();
-            assert_eq!(visible_windows.len(), 3);
+            assert_eq!(visible_windows.len(), 2);
             assert_eq!(visible_windows[0].unwrap().hwnd, 200);
-            assert_eq!(visible_windows[1].unwrap().hwnd, 100);
-            assert_eq!(visible_windows[2].unwrap().hwnd, 300);
+            assert_eq!(visible_windows[1].unwrap().hwnd, 300);
         }
     }
 }

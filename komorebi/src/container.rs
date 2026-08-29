@@ -291,14 +291,15 @@ impl Container {
     /// Only one stored window of a stack is on screen at a time, but a floating window is not
     /// part of that stack for display purposes: it keeps its own rectangle and stays visible
     /// next to whichever stored window is on top. A minimized window is never restored here,
-    /// because being minimized is a window state this container does not own.
+    /// because being minimized is a window state this container does not own. Every window is
+    /// shown through its own presentation, so a maximized window comes back maximized.
     pub fn restore(&self) {
-        if let Some(window) = self.focused_visible_stored_window() {
-            window.restore();
+        if let Some(window) = self.focused_visible_stored_managed_window() {
+            window.show(true);
         }
 
         for window in self.visible_floating_windows() {
-            window.restore();
+            window.show(true);
         }
     }
 
@@ -314,10 +315,10 @@ impl Container {
         for (i, window) in self.windows_mut().iter_mut().enumerate() {
             match (window.placement, window.visibility) {
                 (_, Visibility::Minimized) => {}
-                (ManagedPlacement::Floating, _) => window.restore_with_border(false),
+                (ManagedPlacement::Floating, _) => window.show(false),
                 (ManagedPlacement::Stored, _) => {
                     if i == focused_idx {
-                        window.restore_with_border(false);
+                        window.show(false);
                     } else {
                         window.hide_with_border(false);
                     }
@@ -331,10 +332,25 @@ impl Container {
     /// The ring focus can be on a floating or a minimized window, which is exactly when this
     /// falls back to the first stored window the container could show instead.
     pub fn focused_visible_stored_window(&self) -> Option<&Window> {
+        self.focused_visible_stored_managed_window()
+            .map(|window| &window.window)
+    }
+
+    /// [`Self::focused_visible_stored_window`] with the managed state the caller needs to show it.
+    pub fn focused_visible_stored_managed_window(&self) -> Option<&ManagedWindow> {
         self.focused_managed_window()
             .filter(|window| window.is_visible_stored())
             .or_else(|| self.visible_stored_windows().next())
-            .map(|window| &window.window)
+    }
+
+    /// The window this container currently presents maximized, if it has one.
+    ///
+    /// A maximized window is an ordinary member of its container: it keeps its stack position and
+    /// its history entries, and only the presentation it is drawn with differs.
+    pub fn maximized_managed_window(&self) -> Option<&ManagedWindow> {
+        self.windows()
+            .iter()
+            .find(|window| window.is_maximized() && window.visibility == Visibility::Visible)
     }
 
     pub fn visible_floating_windows(&self) -> impl Iterator<Item = &ManagedWindow> {

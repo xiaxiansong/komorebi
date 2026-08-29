@@ -258,13 +258,6 @@ impl WindowManager {
                         WorkspaceWindowLocation::Monocle(window_idx) => {
                             self.focus_container_window(window_idx)?;
                         }
-                        WorkspaceWindowLocation::Maximized => {
-                            if let Some(window) =
-                                &mut self.focused_workspace_mut()?.maximized_window
-                            {
-                                window.focus(self.mouse_follows_focus)?;
-                            }
-                        }
                         WorkspaceWindowLocation::Container(container_idx, window_idx) => {
                             let focused_container_idx = self.focused_container_idx()?;
                             if container_idx != focused_container_idx {
@@ -1173,7 +1166,6 @@ impl WindowManager {
                         && workspace.containers().is_empty()
                         && workspace.floating_windows().is_empty()
                         && workspace.monocle_container.is_none()
-                        && workspace.maximized_window.is_none()
                         && workspace.name.is_none()
                     {
                         can_close = true;

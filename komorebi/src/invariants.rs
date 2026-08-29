@@ -210,16 +210,11 @@ impl ValidateInvariants for Workspace {
             ));
         }
 
-        // Alternate ownership through the maximized window and the monocle container is
-        // transitional: those windows are removed from the model while they are held there.
-        // Holding the same window in both places is still a defect. Floating windows are not
-        // listed here any more, because they are owned by a container like every other managed
-        // window.
+        // Alternate ownership through the monocle container is transitional: those windows are
+        // removed from the model while they are held there. Holding the same window in both
+        // places is still a defect. Floating and maximized windows are not listed here any more,
+        // because they are owned by a container like every other managed window.
         let mut alternate = Vec::new();
-
-        if let Some(window) = self.maximized_window {
-            alternate.push(window.hwnd);
-        }
 
         if let Some(container) = &self.monocle_container {
             alternate.extend(container.windows().iter().map(|window| window.hwnd));
@@ -479,8 +474,8 @@ mod tests {
     #[test]
     fn a_window_held_by_a_container_and_by_the_workspace_is_reported() {
         let mut workspace = workspace_with(vec![container_with(&[1])]);
-        // The maximized window is the remaining transitional ownership path.
-        workspace.maximized_window = Some(Window::from(1));
+        // The monocle container is the remaining transitional ownership path.
+        workspace.monocle_container = Some(container_with(&[1]));
 
         assert_eq!(
             invariants(&workspace.validate_invariants()),

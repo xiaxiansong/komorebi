@@ -391,7 +391,7 @@ impl Monitor {
             .focused_workspace_mut()
             .ok_or_eyre("there is no workspace")?;
 
-        if workspace.maximized_window.is_some() {
+        if workspace.focused_container_has_maximized_window() {
             bail!("cannot move native maximized window to another monitor or workspace");
         }
 

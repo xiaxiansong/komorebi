@@ -214,13 +214,6 @@ impl WindowManager {
                     }
                 }
 
-                if let Some(window) = workspace.maximized_window
-                    && window.exe().is_err()
-                {
-                    can_apply = false;
-                    break;
-                }
-
                 if let Some(container) = &workspace.monocle_container {
                     for window in container.windows() {
                         if window.exe().is_err() {
@@ -1129,36 +1122,11 @@ impl WindowManager {
                 // restore to avoid that issue.
                 self.uncloack_to_ignore = uncloack_amount;
             }
-        } else if origin_workspace
-            .maximized_window
-            .as_ref()
-            .map(|max| max.hwnd == w_hwnd)
-            .unwrap_or_default()
-        {
-            // Moving maximized_window
-            if let Some(maximized_idx) = origin_workspace.maximized_window_restore_idx {
-                self.focus_monitor(origin_monitor_idx)?;
-                let origin_monitor = self
-                    .focused_monitor_mut()
-                    .ok_or_eyre("there is no origin monitor")?;
-                origin_monitor.focus_workspace(origin_workspace_idx)?;
-                self.unmaximize_window()?;
-                self.focus_monitor(target_monitor_idx)?;
-                let target_monitor = self
-                    .focused_monitor_mut()
-                    .ok_or_eyre("there is no target monitor")?;
-                target_monitor.focus_workspace(target_workspace_idx)?;
-
-                self.transfer_container(
-                    (origin_monitor_idx, origin_workspace_idx, maximized_idx),
-                    (
-                        target_monitor_idx,
-                        target_workspace_idx,
-                        target_container_idx,
-                    ),
-                )?;
-            }
         }
+
+        // There is no separate maximized-window branch any more. A maximized window is owned by a
+        // container like every other managed window, so the first branch above already moves it,
+        // and its presentation travels with it.
         Ok(())
     }
 
@@ -1288,7 +1256,7 @@ impl WindowManager {
             .update_focused_workspace(offset)?;
 
         if follow_focus {
-            if let Some(window) = self.focused_workspace()?.maximized_window {
+            if let Some(window) = self.focused_workspace()?.maximized_window() {
                 if trigger_focus {
                     window.focus(self.mouse_follows_focus)?;
                 }
@@ -1332,7 +1300,7 @@ impl WindowManager {
                 // and we have a stack with >1 windows
                 if self.focused_container_mut()?.windows().len() > 1
                     // and we don't have a maxed window
-                    && self.focused_workspace()?.maximized_window.is_none()
+                    && self.focused_workspace()?.maximized_window().is_none()
                     // and we don't have a monocle container
                     && self.focused_workspace()?.monocle_container.is_none()
                     // and we don't have any floating windows that should show on top
@@ -1805,7 +1773,7 @@ impl WindowManager {
             .focused_workspace_mut()
             .ok_or_eyre("there is no workspace")?;
 
-        if workspace.maximized_window.is_some() {
+        if workspace.focused_container_has_maximized_window() {
             bail!("cannot move native maximized window to another monitor or workspace");
         }
 
@@ -2161,7 +2129,7 @@ impl WindowManager {
         let mouse_follows_focus = self.mouse_follows_focus;
 
         if let Ok(focused_workspace) = self.focused_workspace_mut() {
-            if let Some(window) = focused_workspace.maximized_window {
+            if let Some(window) = focused_workspace.maximized_window() {
                 window.focus(mouse_follows_focus)?;
                 cross_monitor_monocle_or_max = true;
             } else if let Some(monocle) = &focused_workspace.monocle_container {
@@ -2247,7 +2215,7 @@ impl WindowManager {
         tracing::info!("preselecting container");
 
         let new_idx =
-            if workspace.maximized_window.is_some() || workspace.monocle_container.is_some() {
+            if workspace.maximized_window().is_some() || workspace.monocle_container.is_some() {
                 None
             } else {
                 workspace.new_idx_for_direction(direction)
@@ -2301,7 +2269,7 @@ impl WindowManager {
         }
 
         let new_idx =
-            if workspace.maximized_window.is_some() || workspace.monocle_container.is_some() {
+            if workspace.maximized_window().is_some() || workspace.monocle_container.is_some() {
                 None
             } else {
                 workspace.new_idx_for_direction(direction)
@@ -2390,7 +2358,7 @@ impl WindowManager {
                 let mouse_follows_focus = self.mouse_follows_focus;
 
                 if let Ok(focused_workspace) = self.focused_workspace_mut() {
-                    if let Some(window) = focused_workspace.maximized_window {
+                    if let Some(window) = focused_workspace.maximized_window() {
                         window.focus(mouse_follows_focus)?;
                         cross_monitor_monocle_or_max = true;
                     } else if let Some(monocle) = &focused_workspace.monocle_container {
@@ -2779,7 +2747,7 @@ impl WindowManager {
         let mut maximize_next = false;
         let mut monocle_next = false;
 
-        if self.focused_workspace_mut()?.maximized_window.is_some() {
+        if self.focused_workspace_mut()?.maximized_window().is_some() {
             maximize_next = true;
             self.unmaximize_window()?;
         }
@@ -3329,7 +3297,7 @@ impl WindowManager {
 
         let workspace = self.focused_workspace_mut()?;
 
-        match workspace.maximized_window {
+        match workspace.maximized_window() {
             None => self.maximize_window()?,
             Some(_) => self.unmaximize_window()?,
         }
@@ -3342,7 +3310,7 @@ impl WindowManager {
         tracing::info!("maximizing windowj");
 
         let workspace = self.focused_workspace_mut()?;
-        workspace.new_maximized_window()
+        workspace.maximize_focused_window()
     }
 
     #[tracing::instrument(skip(self))]
@@ -3350,7 +3318,7 @@ impl WindowManager {
         tracing::info!("unmaximizing window");
 
         let workspace = self.focused_workspace_mut()?;
-        workspace.reintegrate_maximized_window()
+        workspace.unmaximize_window()
     }
 
     #[tracing::instrument(skip(self))]
@@ -4064,10 +4032,6 @@ impl WindowManager {
                 }
 
                 for window in workspace.floating_windows() {
-                    known_hwnds.insert(window.hwnd, (m_idx, w_idx));
-                }
-
-                if let Some(window) = workspace.maximized_window {
                     known_hwnds.insert(window.hwnd, (m_idx, w_idx));
                 }
 
@@ -5847,7 +5811,7 @@ mod tests {
         {
             // No windows should be maximized
             let workspace = wm.focused_workspace().unwrap();
-            let maximized_window = workspace.maximized_window;
+            let maximized_window = workspace.maximized_window();
             assert_eq!(maximized_window, None);
         }
 
@@ -5857,7 +5821,7 @@ mod tests {
         {
             // Window 0 should be maximized
             let workspace = wm.focused_workspace().unwrap();
-            let maximized_window = workspace.maximized_window;
+            let maximized_window = workspace.maximized_window();
             assert_eq!(maximized_window, Some(Window::from(0)));
         }
 
@@ -5866,16 +5830,15 @@ mod tests {
         {
             // No windows should be maximized
             let workspace = wm.focused_workspace().unwrap();
-            let maximized_window = workspace.maximized_window;
+            let maximized_window = workspace.maximized_window();
             assert_eq!(maximized_window, None);
         }
 
-        // Focus container at index 1
-        wm.focused_workspace_mut().unwrap().focus_container(1);
-
+        // Maximizing no longer splits the container, so the stack is still intact and the
+        // second window of that same container is the next subject.
         {
-            // Focus the window at index 1
             let container = wm.focused_container_mut().unwrap();
+            assert_eq!(container.windows().len(), 3);
             container.focus_window(1);
         }
 
@@ -5883,10 +5846,12 @@ mod tests {
         wm.maximize_window().ok();
 
         {
-            // Window 2 should be maximized
+            // Window 1 should be maximized, and it should still be in its container
             let workspace = wm.focused_workspace().unwrap();
-            let maximized_window = workspace.maximized_window;
-            assert_eq!(maximized_window, Some(Window::from(2)));
+            let maximized_window = workspace.maximized_window();
+            assert_eq!(maximized_window, Some(Window::from(1)));
+            assert_eq!(workspace.containers().len(), 1);
+            assert_eq!(workspace.containers()[0].windows().len(), 3);
         }
 
         wm.unmaximize_window().ok();
@@ -5894,7 +5859,7 @@ mod tests {
         {
             // No windows should be maximized
             let workspace = wm.focused_workspace().unwrap();
-            let maximized_window = workspace.maximized_window;
+            let maximized_window = workspace.maximized_window();
             assert_eq!(maximized_window, None);
         }
     }
@@ -5940,7 +5905,7 @@ mod tests {
         {
             // Window 0 should be maximized
             let workspace = wm.focused_workspace().unwrap();
-            let maximized_window = workspace.maximized_window;
+            let maximized_window = workspace.maximized_window();
             assert_eq!(maximized_window, Some(Window::from(0)));
         }
 
@@ -5950,7 +5915,7 @@ mod tests {
         {
             // No windows should be maximized
             let workspace = wm.focused_workspace().unwrap();
-            let maximized_window = workspace.maximized_window;
+            let maximized_window = workspace.maximized_window();
             assert_eq!(maximized_window, None);
         }
     }

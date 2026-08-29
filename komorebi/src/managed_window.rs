@@ -5,6 +5,7 @@ use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
 
+use crate::border_manager;
 use crate::core::Rect;
 use crate::model::ContainerId;
 use crate::window::Window;
@@ -161,6 +162,31 @@ impl ManagedWindow {
 
     pub fn is_visible_stored(&self) -> bool {
         self.visibility == Visibility::Visible && self.placement == ManagedPlacement::Stored
+    }
+
+    #[must_use]
+    pub fn is_maximized(&self) -> bool {
+        self.presentation == Presentation::Maximized
+    }
+
+    /// Bring this window back on screen the way its recorded presentation requires.
+    ///
+    /// A plain restore is `SW_RESTORE`, which also unmaximizes. Showing a maximized window that
+    /// way would leave Win32 and the model disagreeing about a presentation the model owns, so a
+    /// maximized window is shown by maximizing it instead.
+    pub fn show(&self, with_border: bool) {
+        match self.presentation {
+            Presentation::Maximized => {
+                self.window.maximize();
+
+                if with_border {
+                    border_manager::show_border(self.window.hwnd);
+                }
+            }
+            Presentation::Normal | Presentation::Fullscreen => {
+                self.window.restore_with_border(with_border);
+            }
+        }
     }
 
     pub fn set_floating(&mut self, current_rect: Rect) -> bool {

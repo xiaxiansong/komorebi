@@ -498,15 +498,97 @@ ignored (up from 213), layouts 128, bar 3. `cargo fmt --check` clean; `cargo cli
 
 ### Phase 5D - Presentation replaces maximized and monocle ownership
 
-- [ ] Remove alternate ownership through `maximized_window` and `monocle_container`; presentation
-  becomes window state.
-- [ ] Route maximize, fullscreen and monocle through the multidimensional transition methods.
-- [ ] Make the transitions idempotent and remove the transitional debt clause from the validator.
-- [ ] Add maximize/fullscreen/monocle ownership and restore-rectangle tests.
-- [ ] Commit as `feat: make presentation a window state`.
+Split into 5D-1, 5D-2 and 5D-3 on 2026-08-30, before coding. A call-site census counted 209
+references to `maximized_window` and `monocle_container` across twelve files, which is several
+times the per-phase review limit. The two alternate paths are almost disjoint per file, so each
+can be removed on its own while the other keeps compiling unchanged.
 
-Expected handwritten change: 400-600 lines. Likely files: `workspace.rs`, `window_manager.rs`,
-`process_event.rs`, `process_command.rs`, `monitor.rs`, `state.rs`.
+#### Phase 5D-1 - Maximize is a window presentation
+
+- [x] Remove `Workspace::maximized_window` and `maximized_window_restore_idx` ownership; derive the
+  maximized window from the containers instead.
+- [x] Route maximize and unmaximize through `ManagedWindow::set_maximized`/`set_normal` so a
+  maximized window keeps its container, its stack position and both histories.
+- [x] Make container show/hide and the render loop presentation-aware so a maximized window is not
+  silently restored into its slot.
+- [x] Narrow the "cannot move a native maximized window" refusals to the container actually being
+  moved instead of the whole workspace.
+- [x] Stop reporting the maximized window as alternate ownership in the validator.
+- [x] Add ownership-preserving maximize, idempotency, restore-rectangle and stack tests.
+- [x] Commit as `feat: make maximize a window presentation`.
+
+Expected handwritten change: 350-500 lines. Likely files: `workspace.rs`, `container.rs`,
+`managed_window.rs`, `window_manager.rs`, `monitor.rs`, `process_event.rs`, `process_command.rs`,
+`monitor_reconciliator/mod.rs`, `invariants.rs`, `state.rs`.
+
+Actual files: `workspace.rs`, `container.rs`, `managed_window.rs`, `window_manager.rs`,
+`monitor.rs`, `process_event.rs`, `process_command.rs`, `monitor_reconciliator/mod.rs`,
+`invariants.rs`, and `state.rs`. Actual Rust change: 465 added, 348 removed, roughly half of it
+tests. Every predicted file was touched and no other file needed to change; `komorebi-bar` and the
+client were unaffected because neither reads the maximized window.
+
+`Workspace::maximized_managed_window` is a listing derived from container ownership, in container
+order and then stack order, exactly like `floating_windows()` from Phase 5B. `maximize_window` and
+`unmaximize_window` are the whole mutation surface, and both are idempotent: maximizing a window
+which is already maximized reapplies the Win32 state without overwriting the restore rectangle,
+and unmaximizing without a maximized window is refused before anything changes.
+
+Three upstream behaviours changed as a direct consequence, and all three are what the model
+requires. Maximizing no longer removes the window from its container, so it no longer empties and
+destroys a container and no longer rebuilds a different container with a new ID on the way back;
+`test_maximize_and_unmaximize_window` asserts the new contract, which is why its second half now
+maximizes the second window of the same stack instead of a window of a container that the old
+split had created. A maximized window now blocks a container move only when it is in the container
+being moved, rather than anywhere in the workspace. And the separate maximized branch in
+`move_window_to_monitor` became unreachable once the window lives in a container, so it was
+removed rather than left as dead code that reads like a live path.
+
+`ManagedWindow::show` is what keeps Win32 and the model in agreement: a plain restore is
+`SW_RESTORE`, which also unmaximizes, so `Container::restore` and `Container::load_focused_window`
+would have silently dropped a presentation the model owns. The render loop makes the same
+distinction in the other direction: a maximized window keeps its container's slot, because its
+container is still Active, but it is drawn maximized instead of into that slot, and a window Win32
+still reports as maximized after the model returned it to Normal is restored there.
+
+Old runtime-state JSON which still carries `maximized_window` and `maximized_window_restore_idx`
+deserializes, and those fields are ignored rather than migrated, matching the Phase 5B precedent
+for `floating_windows`. `StaticConfig` is unaffected. `WorkspaceWindowLocation::Maximized` was
+removed because a maximized window is now found by the container arm before it could ever be
+reached.
+
+Not in this phase: the monocle container, which still holds windows outside the ring and is still
+reported as the one remaining alternate ownership path by the validator. That is Phase 5D-2.
+
+Verification: `cargo test --workspace -- --test-threads=1` passed with komorebi 236 passed/1
+ignored (up from 226), layouts 128, bar 3, all other targets and doc-tests passed. `cargo fmt
+--check` clean; `cargo clippy --workspace --all-targets` reported only the pre-existing upstream
+warning; `cargo check --workspace --all-targets` and `cargo check -p komorebi --features schemars`
+passed.
+
+#### Phase 5D-2 - Monocle is a workspace reference, not workspace storage
+
+- [ ] Replace `monocle_container`/`monocle_container_restore_idx` with a `ContainerId` reference to
+  a container which stays in the workspace ring.
+- [ ] Make monocle a slot-authority decision rather than a removal, preserving container ID, stack
+  order and both histories.
+- [ ] Remove the transitional debt clause from the validator.
+- [ ] Add monocle ownership, cycle, reintegration and idempotency tests.
+- [ ] Commit as `feat: make monocle a container reference`.
+
+Expected handwritten change: 350-500 lines. Likely files: `workspace.rs`, `window_manager.rs`,
+`process_event.rs`, `process_command.rs`, `monitor.rs`, `monitor_reconciliator/mod.rs`,
+`border_manager/mod.rs`, `transparency_manager.rs`, `stackbar_manager/mod.rs`, `state.rs`,
+`komorebi-bar/src/widgets/komorebi.rs`.
+
+#### Phase 5D-3 - Fullscreen distinct from maximize
+
+- [ ] Add fullscreen enter/exit as its own presentation transition with its own restore rectangle.
+- [ ] Keep fullscreen, maximize and minimize independent and idempotent in both directions.
+- [ ] Add fullscreen/maximize independence and restore-rectangle tests.
+- [ ] Commit as `feat: separate fullscreen from maximized presentation`.
+
+Expected handwritten change: 200-350 lines. Likely files: `managed_window.rs`, `workspace.rs`,
+`window_manager.rs`, `process_command.rs`, `core/mod.rs`.
 
 ### Phase 6 - Hidden slot absorption and restoration
 

@@ -512,13 +512,6 @@ where
                                         }
                                     }
 
-                                    // Restore maximized window
-                                    if let Some(window) = &workspace.maximized_window
-                                        && WindowsApi::is_window(window.hwnd)
-                                    {
-                                        WindowsApi::restore_window(window.hwnd);
-                                    }
-
                                     // Restore monocle container
                                     if let Some(container) = &workspace.monocle_container
                                         && let Some(window) = container.focused_window()
@@ -629,15 +622,6 @@ where
                                                 window.minimize();
                                             }
                                         }
-                                    }
-                                }
-
-                                if let Some(maximized) = &workspace.maximized_window {
-                                    windows_to_remove.push(maximized.hwnd);
-                                    // Minimize the focused window since Windows might try
-                                    // to move it to another monitor if it was focused.
-                                    if maximized.is_focused() {
-                                        maximized.minimize();
                                     }
                                 }
 
@@ -851,18 +835,6 @@ where
                                             workspace.remove_container(empty_idx);
                                         } else {
                                             workspace.remove_container_by_idx(empty_idx);
-                                        }
-                                    }
-
-                                    if let Some(window) = &workspace.maximized_window {
-                                        if window.exe().is_err()
-                                            || known_hwnds.contains_key(&window.hwnd)
-                                        {
-                                            workspace.maximized_window = None;
-                                        } else if is_focused_workspace
-                                            && WindowsApi::is_window(window.hwnd)
-                                        {
-                                            WindowsApi::restore_window(window.hwnd);
                                         }
                                     }
 
