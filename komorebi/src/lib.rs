@@ -7,6 +7,7 @@ pub mod com;
 pub mod ring;
 pub mod container;
 pub mod core;
+pub mod focus_history;
 pub mod focus_manager;
 pub mod lockable_sequence;
 pub mod managed_window;

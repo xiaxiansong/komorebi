@@ -7,7 +7,9 @@ use serde::Deserializer;
 use serde::Serialize;
 
 use crate::Lockable;
+use crate::focus_history::Mru;
 use crate::managed_window::ManagedWindow;
+use crate::managed_window::Visibility;
 use crate::model::ContainerId;
 use crate::ring::Ring;
 use crate::window::Window;
@@ -19,6 +21,13 @@ pub struct Container {
     #[serde(default)]
     pub locked: bool,
     windows: Ring<ManagedWindow>,
+    /// Most-recently-used order of this container's window handles.
+    ///
+    /// The ring focus index is a position in the stack, so it cannot answer which window should
+    /// be focused after the current one goes away. This history can, and it is the only source
+    /// used for that decision.
+    #[serde(default)]
+    focus_history: Mru<isize>,
 }
 
 #[derive(Deserialize)]
@@ -27,6 +36,8 @@ struct ContainerRepr {
     #[serde(default)]
     locked: bool,
     windows: Ring<ManagedWindow>,
+    #[serde(default)]
+    focus_history: Mru<isize>,
 }
 
 pub trait IntoManagedWindow {
@@ -92,6 +103,7 @@ impl<'de> Deserialize<'de> for Container {
             id: repr.id,
             locked: repr.locked,
             windows: repr.windows,
+            focus_history: repr.focus_history,
         };
 
         // The container is the authority for ownership. This both migrates legacy serialized
@@ -100,6 +112,8 @@ impl<'de> Deserialize<'de> for Container {
         for window in container.windows_mut() {
             window.container_id.clone_from(&container_id);
         }
+
+        container.repair_focus_history();
 
         Ok(container)
     }
@@ -111,6 +125,7 @@ impl Default for Container {
             id: ContainerId::new(),
             locked: false,
             windows: Ring::default(),
+            focus_history: Mru::default(),
         }
     }
 }
@@ -164,6 +179,7 @@ impl Container {
             id: ContainerId::from("PRESELECT"),
             locked: false,
             windows: Default::default(),
+            focus_history: Mru::default(),
         }
     }
 
@@ -255,6 +271,11 @@ impl Container {
 
     pub fn remove_window_by_idx(&mut self, idx: usize) -> Option<ManagedWindow> {
         let window = self.windows_mut().remove(idx);
+
+        if let Some(window) = &window {
+            self.focus_history.remove(&window.hwnd);
+        }
+
         self.focus_window(idx.saturating_sub(1));
         window
     }
@@ -287,6 +308,69 @@ impl Container {
     pub fn focus_window(&mut self, idx: usize) {
         tracing::info!("focusing window");
         self.windows.focus(idx);
+
+        if let Some(window) = self.windows.elements().get(idx) {
+            let hwnd = window.hwnd;
+            self.focus_history.record(hwnd);
+        }
+    }
+
+    /// Focus the window with `hwnd` if this container owns it.
+    pub fn focus_window_by_hwnd(&mut self, hwnd: isize) -> bool {
+        match self.idx_for_window(hwnd) {
+            Some(idx) => {
+                self.focus_window(idx);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub const fn focus_history(&self) -> &Mru<isize> {
+        &self.focus_history
+    }
+
+    /// The most recently focused window which can currently take focus.
+    ///
+    /// Minimized windows are never focus candidates. A container whose history has been emptied
+    /// still answers with the top of its stack so focus selection cannot dead-end.
+    pub fn first_focusable_window(&self) -> Option<&ManagedWindow> {
+        let by_history = self
+            .focus_history
+            .iter()
+            .filter_map(|hwnd| self.windows().iter().find(|window| window.hwnd == *hwnd))
+            .find(|window| window.visibility == Visibility::Visible);
+
+        by_history.or_else(|| {
+            self.windows()
+                .iter()
+                .rev()
+                .find(|window| window.visibility == Visibility::Visible)
+        })
+    }
+
+    pub fn has_focusable_window(&self) -> bool {
+        self.first_focusable_window().is_some()
+    }
+
+    /// Drop history entries for windows this container no longer owns and give every owned window
+    /// which is missing from the history an oldest-position entry.
+    ///
+    /// Serialized state may predate the history, may have been written by another container, or
+    /// may reference windows which have since been closed.
+    pub fn repair_focus_history(&mut self) {
+        let hwnds = self
+            .windows()
+            .iter()
+            .map(|window| window.hwnd)
+            .collect::<Vec<_>>();
+
+        self.focus_history.retain(|hwnd| hwnds.contains(hwnd));
+
+        // Reverse stack order: the top of the stack is the better recency guess.
+        for hwnd in hwnds.iter().rev() {
+            self.focus_history.record_oldest(*hwnd);
+        }
     }
 }
 
@@ -481,6 +565,141 @@ mod tests {
         assert_eq!(
             container.windows()[0].placement,
             crate::ManagedPlacement::Floating
+        );
+    }
+
+    #[test]
+    fn focusing_a_window_records_it_as_most_recent() {
+        let mut container = Container::default();
+
+        for i in 0..3 {
+            container.add_window(Window::from(i));
+        }
+
+        // Adding focuses, so the history already reflects insertion order.
+        assert_eq!(
+            container
+                .focus_history()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![2, 1, 0]
+        );
+
+        container.focus_window(0);
+        container.focus_window(1);
+
+        assert_eq!(
+            container
+                .focus_history()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![1, 0, 2]
+        );
+        assert_eq!(container.focus_history().len(), 3);
+    }
+
+    #[test]
+    fn focusing_by_hwnd_only_succeeds_for_owned_windows() {
+        let mut container = Container::default();
+        container.add_window(Window::from(1));
+        container.add_window(Window::from(2));
+
+        assert!(container.focus_window_by_hwnd(1));
+        assert_eq!(container.focused_window_idx(), 0);
+        assert_eq!(container.focus_history().most_recent(), Some(&1));
+
+        assert!(!container.focus_window_by_hwnd(9));
+        assert_eq!(container.focused_window_idx(), 0);
+    }
+
+    #[test]
+    fn removing_a_window_drops_its_history_entry() {
+        let mut container = Container::default();
+
+        for i in 0..3 {
+            container.add_window(Window::from(i));
+        }
+
+        container.focus_window(1);
+        container.remove_window_by_idx(1);
+
+        assert!(!container.focus_history().contains(&1));
+        assert_eq!(container.focus_history().len(), 2);
+    }
+
+    #[test]
+    fn focus_selection_prefers_recency_and_skips_minimized_windows() {
+        let mut container = Container::default();
+
+        for i in 0..3 {
+            container.add_window(Window::from(i));
+        }
+
+        container.focus_window(0);
+
+        assert_eq!(container.first_focusable_window().unwrap().hwnd, 0);
+
+        container.windows_mut()[0].set_minimized();
+
+        // 2 was focused before 0, because adding a window focuses it.
+        assert_eq!(container.first_focusable_window().unwrap().hwnd, 2);
+
+        for window in container.windows_mut() {
+            window.set_minimized();
+        }
+
+        assert!(container.first_focusable_window().is_none());
+        assert!(!container.has_focusable_window());
+    }
+
+    #[test]
+    fn focus_selection_falls_back_to_the_top_of_the_stack() {
+        let mut container = Container::default();
+        container.windows_mut().push_back(Window::from(1));
+        container.windows_mut().push_back(Window::from(2));
+
+        // Direct ring insertion does not record focus.
+        assert!(container.focus_history().is_empty());
+        assert_eq!(container.first_focusable_window().unwrap().hwnd, 2);
+    }
+
+    #[test]
+    fn deserialization_repairs_a_stale_or_missing_focus_history() {
+        let json = r#"{
+            "id": "container-1",
+            "windows": { "elements": [ { "hwnd": 5 }, { "hwnd": 9 } ], "focused": 0 },
+            "focus_history": [ 404, 9 ]
+        }"#;
+        let container: Container = serde_json::from_str(json).unwrap();
+
+        // 404 is not owned by this container and 5 was missing from the history.
+        assert_eq!(
+            container
+                .focus_history()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![9, 5]
+        );
+    }
+
+    #[test]
+    fn legacy_container_json_without_a_focus_history_gets_one() {
+        let json = r#"{
+            "id": "container-1",
+            "windows": { "elements": [ { "hwnd": 5 }, { "hwnd": 9 } ], "focused": 0 }
+        }"#;
+        let container: Container = serde_json::from_str(json).unwrap();
+
+        assert_eq!(
+            container
+                .focus_history()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![9, 5]
         );
     }
 

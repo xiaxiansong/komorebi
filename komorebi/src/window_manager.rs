@@ -269,6 +269,10 @@ impl WindowManager {
                             workspace.workspace_padding = workspace_padding;
                             workspace.layout_options = layout_options;
 
+                            // Imported state may be older than the histories, may reference
+                            // windows which have since been closed, or may have been edited.
+                            workspace.prune_histories();
+
                             if state_monitor.focused_workspace_idx() == workspace_idx {
                                 focused_workspace = workspace_idx;
                             }

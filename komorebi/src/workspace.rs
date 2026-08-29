@@ -34,8 +34,11 @@ use crate::core::PlacementMatchingRules;
 use crate::core::PlacementTarget;
 use crate::core::Rect;
 use crate::core::WindowPlacement;
+use crate::focus_history::Mru;
 use crate::lockable_sequence::LockableSequence;
 use crate::managed_window::ManagedWindow;
+use crate::managed_window::Visibility;
+use crate::model::ContainerId;
 use crate::model::WorkspaceId;
 use crate::ring::Ring;
 use crate::should_act;
@@ -62,6 +65,18 @@ pub struct Workspace {
     pub id: WorkspaceId,
     pub name: Option<String>,
     pub containers: Ring<Container>,
+    /// Most-recently-used order of this workspace's container IDs.
+    ///
+    /// Container order is a spatial arrangement, so it cannot answer which container should be
+    /// focused when this workspace is shown again or when the focused container goes away.
+    #[serde(default)]
+    pub container_focus_history: Mru<ContainerId>,
+    /// Most-recently-minimized window handles owned by this workspace.
+    ///
+    /// Minimizing keeps the window in its container, so this history is the only record of the
+    /// order in which windows were minimized.
+    #[serde(default)]
+    pub minimize_history: Mru<isize>,
     pub monocle_container: Option<Container>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub monocle_container_restore_idx: Option<usize>,
@@ -134,6 +149,8 @@ impl Default for Workspace {
             id: WorkspaceId::new(),
             name: None,
             containers: Ring::default(),
+            container_focus_history: Mru::default(),
+            minimize_history: Mru::default(),
             monocle_container: None,
             maximized_window: None,
             maximized_window_restore_idx: None,
@@ -1062,7 +1079,23 @@ impl Workspace {
             self.resize_dimensions.remove(idx);
         }
 
+        if let Some(container) = &container {
+            self.forget_container(container);
+        }
+
         container
+    }
+
+    /// Drop every history entry belonging to a container which has left this workspace.
+    ///
+    /// The container keeps its own window history so a move can restore it at the destination;
+    /// only this workspace's references are dropped.
+    fn forget_container(&mut self, container: &Container) {
+        self.container_focus_history.remove(&container.id);
+
+        for window in container.windows() {
+            self.minimize_history.remove(&window.hwnd);
+        }
     }
 
     pub fn container_idx_for_window(&self, hwnd: isize) -> Option<usize> {
@@ -1078,6 +1111,7 @@ impl Workspace {
 
     pub fn remove_window(&mut self, hwnd: isize) -> eyre::Result<()> {
         border_manager::delete_border(hwnd);
+        self.minimize_history.remove(&hwnd);
 
         if self.floating_windows().iter().any(|w| w.hwnd == hwnd) {
             self.floating_windows_mut().retain(|w| w.hwnd != hwnd);
@@ -1155,6 +1189,7 @@ impl Workspace {
     /// managed by this workspace.
     pub fn detach_window(&mut self, hwnd: isize) -> eyre::Result<()> {
         border_manager::delete_border(hwnd);
+        self.minimize_history.remove(&hwnd);
 
         if let Some(window_idx) = self
             .floating_windows()
@@ -1996,6 +2031,119 @@ impl Workspace {
         tracing::info!("focusing container");
 
         self.containers.focus(idx);
+
+        // A preselect container is a transient insertion marker with a fixed ID, so it must never
+        // enter a history whose entries are stable identities.
+        if let Some(container) = self.containers.elements().get(idx)
+            && !container.is_preselect()
+        {
+            let id = container.id.clone();
+            self.container_focus_history.record(id);
+        }
+    }
+
+    /// Record a window focus at both history levels and move the ring focus to match.
+    ///
+    /// This is the single entry point used when a managed window gains focus, so a container
+    /// MRU update can never happen without the corresponding workspace MRU update.
+    pub fn record_focused_window(&mut self, hwnd: isize) -> bool {
+        let Some(container_idx) = self.container_idx_for_window(hwnd) else {
+            return false;
+        };
+
+        let focused = self
+            .containers_mut()
+            .get_mut(container_idx)
+            .is_some_and(|container| container.focus_window_by_hwnd(hwnd));
+
+        if focused {
+            self.focus_container(container_idx);
+        }
+
+        focused
+    }
+
+    /// The container and window to focus when this workspace is shown again.
+    ///
+    /// The most recent container with a focusable window wins, and inside it the most recent
+    /// focusable window wins. Minimized windows are never selected.
+    pub fn focus_target_from_history(&self) -> Option<(usize, isize)> {
+        for id in self.container_focus_history.iter() {
+            if let Some(idx) = self
+                .containers()
+                .iter()
+                .position(|container| &container.id == id)
+                && let Some(window) = self.containers()[idx].first_focusable_window()
+            {
+                return Some((idx, window.hwnd));
+            }
+        }
+
+        // Containers which never took focus are still valid targets after a restart or an import.
+        self.containers()
+            .iter()
+            .enumerate()
+            .find_map(|(idx, container)| {
+                container
+                    .first_focusable_window()
+                    .map(|window| (idx, window.hwnd))
+            })
+    }
+
+    /// Record that `hwnd` was minimized, as the most recent entry of this workspace's history.
+    pub fn record_minimized_window(&mut self, hwnd: isize) {
+        self.minimize_history.record(hwnd);
+    }
+
+    /// Drop `hwnd` from the minimize history, whatever caused it to stop being minimized.
+    pub fn forget_minimized_window(&mut self, hwnd: isize) -> bool {
+        self.minimize_history.remove(&hwnd)
+    }
+
+    /// Take the most recently minimized window which this workspace still owns.
+    ///
+    /// Stale entries examined on the way are discarded, so a history full of closed windows
+    /// leaves an empty history and no side effect.
+    pub fn take_last_minimized_window(&mut self) -> Option<isize> {
+        let minimized = self
+            .containers()
+            .iter()
+            .flat_map(|container| container.windows().iter())
+            .filter(|window| window.visibility == Visibility::Minimized)
+            .map(|window| window.hwnd)
+            .collect::<Vec<_>>();
+
+        self.minimize_history
+            .take_first_valid(|hwnd| minimized.contains(hwnd))
+    }
+
+    /// Drop every history entry which no longer resolves to a container or window of this
+    /// workspace, and repair each container's own window history.
+    ///
+    /// Runtime removal paths already prune what they remove. This exists for state which was
+    /// deserialized or assembled elsewhere.
+    pub fn prune_histories(&mut self) {
+        let ids = self
+            .containers()
+            .iter()
+            .filter(|container| !container.is_preselect())
+            .map(|container| container.id.clone())
+            .collect::<Vec<_>>();
+
+        self.container_focus_history.retain(|id| ids.contains(id));
+
+        for container in self.containers_mut() {
+            container.repair_focus_history();
+        }
+
+        let hwnds = self
+            .containers()
+            .iter()
+            .flat_map(|container| container.windows().iter())
+            .map(|window| window.hwnd)
+            .collect::<Vec<_>>();
+
+        self.minimize_history.retain(|hwnd| hwnds.contains(hwnd));
     }
 
     pub fn swap_containers(&mut self, i: usize, j: usize) {
@@ -2126,6 +2274,224 @@ mod tests {
         let roundtrip: Workspace =
             serde_json::from_str(&serde_json::to_string(&workspaces[1]).unwrap()).unwrap();
         assert_eq!(roundtrip.id, first_id);
+    }
+
+    fn workspace_with_containers(counts: &[usize]) -> Workspace {
+        let mut workspace = Workspace::default();
+        let mut hwnd = 0;
+
+        for count in counts {
+            let mut container = Container::default();
+            for _ in 0..*count {
+                container.add_window(Window::from(hwnd));
+                hwnd += 1;
+            }
+            workspace.add_container_to_back(container);
+        }
+
+        workspace
+    }
+
+    #[test]
+    fn focusing_a_container_records_it_as_most_recent() {
+        let mut workspace = workspace_with_containers(&[1, 1, 1]);
+        let ids = workspace
+            .containers()
+            .iter()
+            .map(|container| container.id.clone())
+            .collect::<Vec<_>>();
+
+        workspace.focus_container(0);
+        workspace.focus_container(2);
+
+        assert_eq!(
+            workspace
+                .container_focus_history
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![ids[2].clone(), ids[0].clone(), ids[1].clone()]
+        );
+    }
+
+    #[test]
+    fn a_preselect_container_never_enters_the_focus_history() {
+        let mut workspace = workspace_with_containers(&[1]);
+        let before = workspace.container_focus_history.len();
+
+        workspace.preselect_container_idx(0);
+
+        assert_eq!(workspace.container_focus_history.len(), before);
+        assert!(
+            !workspace
+                .container_focus_history
+                .contains(&"PRESELECT".into())
+        );
+    }
+
+    #[test]
+    fn recording_a_window_focus_updates_both_histories() {
+        let mut workspace = workspace_with_containers(&[2, 2]);
+        let first_id = workspace.containers()[0].id.clone();
+
+        assert!(workspace.record_focused_window(0));
+
+        assert_eq!(workspace.focused_container_idx(), 0);
+        assert_eq!(
+            workspace.container_focus_history.most_recent(),
+            Some(&first_id)
+        );
+        assert_eq!(
+            workspace.containers()[0].focus_history().most_recent(),
+            Some(&0)
+        );
+
+        assert!(!workspace.record_focused_window(404));
+        assert_eq!(workspace.focused_container_idx(), 0);
+    }
+
+    #[test]
+    fn focus_selection_uses_the_most_recent_container_with_a_focusable_window() {
+        let mut workspace = workspace_with_containers(&[2, 1]);
+
+        workspace.record_focused_window(2);
+        workspace.record_focused_window(1);
+
+        assert_eq!(workspace.focus_target_from_history(), Some((0, 1)));
+
+        // The whole most recent container is minimized, so the next one in history wins.
+        for window in workspace.containers_mut()[0].windows_mut() {
+            window.set_minimized();
+        }
+
+        assert_eq!(workspace.focus_target_from_history(), Some((1, 2)));
+
+        for window in workspace.containers_mut()[1].windows_mut() {
+            window.set_minimized();
+        }
+
+        assert_eq!(workspace.focus_target_from_history(), None);
+    }
+
+    #[test]
+    fn focus_selection_still_answers_without_any_history() {
+        let mut workspace = workspace_with_containers(&[1, 1]);
+        workspace.container_focus_history.clear();
+
+        assert_eq!(workspace.focus_target_from_history(), Some((0, 0)));
+    }
+
+    #[test]
+    fn removing_a_container_drops_its_workspace_history_entries() {
+        let mut workspace = workspace_with_containers(&[1, 1]);
+        let removed_id = workspace.containers()[1].id.clone();
+
+        workspace.record_focused_window(1);
+        workspace.record_minimized_window(1);
+        workspace.remove_container_by_idx(1);
+
+        assert!(!workspace.container_focus_history.contains(&removed_id));
+        assert!(!workspace.minimize_history.contains(&1));
+    }
+
+    #[test]
+    fn removing_the_last_window_of_a_container_clears_both_levels() {
+        let mut workspace = workspace_with_containers(&[1, 1]);
+        let removed_id = workspace.containers()[1].id.clone();
+
+        workspace.record_minimized_window(1);
+        workspace.remove_window(1).unwrap();
+
+        assert_eq!(workspace.containers().len(), 1);
+        assert!(!workspace.container_focus_history.contains(&removed_id));
+        assert!(!workspace.minimize_history.contains(&1));
+    }
+
+    #[test]
+    fn the_minimize_history_returns_owned_minimized_windows_most_recent_first() {
+        let mut workspace = workspace_with_containers(&[3]);
+
+        for hwnd in 0..3 {
+            workspace.containers_mut()[0].windows_mut()[hwnd].set_minimized();
+            workspace.record_minimized_window(hwnd as isize);
+        }
+
+        assert_eq!(workspace.take_last_minimized_window(), Some(2));
+        assert_eq!(workspace.take_last_minimized_window(), Some(1));
+        assert_eq!(workspace.take_last_minimized_window(), Some(0));
+        assert_eq!(workspace.take_last_minimized_window(), None);
+    }
+
+    #[test]
+    fn the_minimize_history_skips_windows_which_are_no_longer_minimized() {
+        let mut workspace = workspace_with_containers(&[2]);
+
+        workspace.containers_mut()[0].windows_mut()[0].set_minimized();
+        workspace.record_minimized_window(0);
+        workspace.record_minimized_window(1);
+        workspace.record_minimized_window(404);
+
+        assert_eq!(workspace.take_last_minimized_window(), Some(0));
+        assert!(workspace.minimize_history.is_empty());
+    }
+
+    #[test]
+    fn recording_a_minimized_window_twice_does_not_duplicate_it() {
+        let mut workspace = workspace_with_containers(&[2]);
+
+        workspace.record_minimized_window(1);
+        workspace.record_minimized_window(0);
+        workspace.record_minimized_window(1);
+
+        assert_eq!(
+            workspace
+                .minimize_history
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![1, 0]
+        );
+        assert!(workspace.forget_minimized_window(1));
+        assert!(!workspace.forget_minimized_window(1));
+    }
+
+    #[test]
+    fn pruning_drops_history_entries_for_objects_which_left_the_workspace() {
+        let mut workspace = workspace_with_containers(&[2, 1]);
+
+        workspace.container_focus_history.record("gone".into());
+        workspace.minimize_history.record(404);
+
+        workspace.prune_histories();
+
+        assert!(!workspace.container_focus_history.contains(&"gone".into()));
+        assert_eq!(workspace.container_focus_history.len(), 2);
+        assert!(workspace.minimize_history.is_empty());
+        assert_eq!(workspace.containers()[0].focus_history().len(), 2);
+    }
+
+    #[test]
+    fn histories_survive_serialization_and_legacy_json_is_accepted() {
+        let mut workspace = workspace_with_containers(&[2]);
+        workspace.record_focused_window(0);
+        workspace.record_minimized_window(1);
+
+        let mut json = serde_json::to_value(&workspace).unwrap();
+        let restored: Workspace = serde_json::from_value(json.clone()).unwrap();
+
+        assert_eq!(
+            restored.container_focus_history,
+            workspace.container_focus_history
+        );
+        assert_eq!(restored.minimize_history, workspace.minimize_history);
+
+        let object = json.as_object_mut().unwrap();
+        object.remove("container_focus_history");
+        object.remove("minimize_history");
+        let legacy: Workspace = serde_json::from_value(json).unwrap();
+
+        assert!(legacy.container_focus_history.is_empty());
+        assert!(legacy.minimize_history.is_empty());
     }
 
     #[test]
