@@ -1,4 +1,6 @@
 use std::collections::VecDeque;
+use std::fmt::Display;
+use std::fmt::Formatter;
 use std::ops::Deref;
 use std::ops::DerefMut;
 
@@ -8,11 +10,37 @@ use serde::Serialize;
 
 use crate::Lockable;
 use crate::focus_history::Mru;
+use crate::managed_window::ManagedPlacement;
 use crate::managed_window::ManagedWindow;
 use crate::managed_window::Visibility;
 use crate::model::ContainerId;
 use crate::ring::Ring;
 use crate::window::Window;
+
+/// Whether a container currently takes part in the tiled arrangement.
+///
+/// This is never set by a user command and is never stored on the container. It is derived from
+/// the container's own windows on every read, which is what makes it impossible for the recorded
+/// state and the windows it describes to drift apart.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub enum ContainerState {
+    /// The container owns at least one visible, stored window, so it occupies one logical slot.
+    #[default]
+    Active,
+    /// The container still owns windows, but none of them is both visible and stored, so it
+    /// occupies no logical slot and other active containers may cover the area it had.
+    Hidden,
+}
+
+impl Display for ContainerState {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Active => write!(f, "Active"),
+            Self::Hidden => write!(f, "Hidden"),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -185,6 +213,60 @@ impl Container {
 
     pub fn is_preselect(&self) -> bool {
         self.id.as_str() == "PRESELECT"
+    }
+
+    /// This container's derived [`ContainerState`].
+    ///
+    /// A preselect marker is reported as active because it is a reserved insertion slot in the
+    /// arrangement rather than a container of the model; it holds no window by design and must
+    /// not be treated as a container which lost its last visible stored window.
+    #[must_use]
+    pub fn state(&self) -> ContainerState {
+        if self.is_preselect() || self.has_visible_stored_window() {
+            ContainerState::Active
+        } else {
+            ContainerState::Hidden
+        }
+    }
+
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.state() == ContainerState::Active
+    }
+
+    #[must_use]
+    pub fn is_hidden(&self) -> bool {
+        self.state() == ContainerState::Hidden
+    }
+
+    /// The windows which the owning container is allowed to position.
+    ///
+    /// A floating window keeps its container membership but is positioned from its own floating
+    /// rectangle, and a minimized window is not positioned at all, so neither is included.
+    pub fn visible_stored_windows(&self) -> impl Iterator<Item = &ManagedWindow> {
+        self.windows()
+            .iter()
+            .filter(|window| window.is_visible_stored())
+    }
+
+    #[must_use]
+    pub fn has_visible_stored_window(&self) -> bool {
+        self.visible_stored_windows().next().is_some()
+    }
+
+    /// The number of windows this container owns which are floating, minimized, or both.
+    ///
+    /// Floating and minimized windows still count towards the container's window total; this
+    /// only reports how many of them the container does not position.
+    #[must_use]
+    pub fn unpositioned_window_count(&self) -> usize {
+        self.windows()
+            .iter()
+            .filter(|window| {
+                window.visibility == Visibility::Minimized
+                    || window.placement == ManagedPlacement::Floating
+            })
+            .count()
     }
 
     pub fn hide(&self, omit: Option<isize>) {
@@ -384,7 +466,101 @@ impl Container {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::Rect;
+    use crate::managed_window::Presentation;
     use serde_json;
+
+    fn container_with_windows(count: isize) -> Container {
+        let mut container = Container::default();
+
+        for hwnd in 0..count {
+            container.add_window(Window::from(hwnd));
+        }
+
+        container
+    }
+
+    #[test]
+    fn a_container_with_a_visible_stored_window_is_active() {
+        let container = container_with_windows(2);
+
+        assert_eq!(container.state(), ContainerState::Active);
+        assert!(container.is_active());
+        assert!(!container.is_hidden());
+        assert_eq!(container.visible_stored_windows().count(), 2);
+        assert_eq!(container.unpositioned_window_count(), 0);
+    }
+
+    #[test]
+    fn a_container_whose_windows_all_float_is_hidden() {
+        let mut container = container_with_windows(2);
+
+        for window in container.windows_mut().iter_mut() {
+            window.set_floating(Rect::default());
+        }
+
+        assert_eq!(container.state(), ContainerState::Hidden);
+        // The windows are still owned by the container: hiding is about slots, not ownership.
+        assert_eq!(container.windows().len(), 2);
+        assert_eq!(container.unpositioned_window_count(), 2);
+    }
+
+    #[test]
+    fn a_container_whose_windows_are_all_minimized_is_hidden() {
+        let mut container = container_with_windows(2);
+
+        for window in container.windows_mut().iter_mut() {
+            window.set_minimized();
+        }
+
+        assert!(container.is_hidden());
+        assert_eq!(container.windows().len(), 2);
+    }
+
+    #[test]
+    fn one_visible_stored_window_is_enough_to_keep_a_container_active() {
+        let mut container = container_with_windows(3);
+        container.windows_mut()[0].set_floating(Rect::default());
+        container.windows_mut()[1].set_minimized();
+
+        assert!(container.is_active());
+        assert_eq!(container.visible_stored_windows().count(), 1);
+        assert_eq!(container.unpositioned_window_count(), 2);
+    }
+
+    #[test]
+    fn maximized_and_fullscreen_windows_keep_their_container_active() {
+        for presentation in [Presentation::Maximized, Presentation::Fullscreen] {
+            let mut container = container_with_windows(1);
+            container.windows_mut()[0].presentation = presentation;
+
+            assert!(container.is_active(), "{presentation:?} must stay active");
+        }
+    }
+
+    #[test]
+    fn a_mixed_floating_and_minimized_container_is_hidden() {
+        let mut container = container_with_windows(2);
+        container.windows_mut()[0].set_floating(Rect::default());
+        container.windows_mut()[1].set_minimized();
+
+        assert!(container.is_hidden());
+    }
+
+    #[test]
+    fn a_floating_and_minimized_window_alone_hides_its_container() {
+        let mut container = container_with_windows(1);
+        container.windows_mut()[0].set_floating(Rect::default());
+        container.windows_mut()[0].set_minimized();
+
+        assert!(container.is_hidden());
+    }
+
+    #[test]
+    fn a_preselect_marker_stays_active() {
+        // It owns no window by design; it is a reserved place in the arrangement.
+        assert!(Container::preselect().is_active());
+    }
 
     #[test]
     fn test_contains_window() {

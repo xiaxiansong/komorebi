@@ -3,15 +3,20 @@ use std::collections::HashSet;
 use std::fmt;
 
 use crate::container::Container;
+use crate::geometry::SlotOrder;
 use crate::monitor::Monitor;
 use crate::window_manager::WindowManager;
 use crate::workspace::Workspace;
 
 /// A model rule which must hold whenever the window manager is at rest.
 ///
-/// The variants are the ownership, lifecycle, focus, and history rules. Geometry rules are
-/// checked by the slot model and are added here once logical slots become the geometry
-/// authority.
+/// The variants are the ownership, lifecycle, focus, history, and slot-ownership rules.
+///
+/// The slot rules checked here are the ones which hold even when a background workspace has not
+/// been retiled since its last structural change: a slot always belongs to a container the
+/// workspace still owns, and recorded slots never overlap. Exact coverage of the work area and
+/// "a hidden container owns no slot" are properties of a freshly recorded arrangement, so they
+/// are validated where the arrangement is recorded rather than at every point of rest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Invariant {
     /// Every managed window belongs to exactly one container.
@@ -27,6 +32,9 @@ pub enum Invariant {
     FocusSelection,
     /// Removing an object clears every history entry and index which referenced it.
     HistoryIntegrity,
+    /// A logical slot belongs to a container the workspace still owns, and no two recorded slots
+    /// overlap.
+    SlotOwnership,
 }
 
 impl fmt::Display for Invariant {
@@ -38,6 +46,7 @@ impl fmt::Display for Invariant {
             Self::NonEmptyMonitor => "non-empty monitor",
             Self::FocusSelection => "focus selection",
             Self::HistoryIntegrity => "history integrity",
+            Self::SlotOwnership => "slot ownership",
         };
 
         f.write_str(name)
@@ -266,6 +275,45 @@ impl ValidateInvariants for Workspace {
                     Invariant::HistoryIntegrity,
                     format!("workspace {id} minimize history repeats window {hwnd}"),
                 ));
+            }
+        }
+
+        violations.extend(self.validate_slot_ownership());
+
+        violations
+    }
+}
+
+impl Workspace {
+    /// The slot rules which hold at every point of rest, not only right after a recalculation.
+    fn validate_slot_ownership(&self) -> Vec<InvariantViolation> {
+        let mut violations = Vec::new();
+        let id = &self.id;
+        let slots = self.logical_slots.ordered(SlotOrder::TopToBottom);
+
+        for (container_id, _) in &slots {
+            if !self
+                .containers()
+                .iter()
+                .any(|container| &container.id == container_id)
+            {
+                violations.push(InvariantViolation::new(
+                    Invariant::SlotOwnership,
+                    format!("workspace {id} holds a slot for absent container {container_id}"),
+                ));
+            }
+        }
+
+        for (index, (container_id, slot)) in slots.iter().enumerate() {
+            for (other_id, other) in slots.iter().skip(index + 1) {
+                if slot.overlaps(*other) {
+                    violations.push(InvariantViolation::new(
+                        Invariant::SlotOwnership,
+                        format!(
+                            "workspace {id} slots for containers {container_id} and {other_id} overlap: {slot} and {other}"
+                        ),
+                    ));
+                }
             }
         }
 

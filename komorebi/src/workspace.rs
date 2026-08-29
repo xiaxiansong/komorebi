@@ -21,6 +21,7 @@ use crate::Wallpaper;
 use crate::WindowContainerBehaviour;
 use crate::border_manager;
 use crate::container::Container;
+use crate::container::ContainerState;
 use crate::core::Axis;
 use crate::core::CustomLayout;
 use crate::core::CycleDirection;
@@ -102,6 +103,10 @@ pub struct Workspace {
     pub layout_flip: Option<Axis>,
     pub workspace_padding: Option<i32>,
     pub container_padding: Option<i32>,
+    /// The rendered rectangles of the containers which currently occupy an active logical slot,
+    /// in container order.
+    ///
+    /// Hidden containers are absent, so this is not a per-container index into `containers`.
     pub latest_layout: Vec<Rect>,
     pub resize_dimensions: Vec<Option<Rect>>,
     /// Gap-free logical slots for this workspace's containers, keyed by stable container ID.
@@ -754,39 +759,46 @@ impl Workspace {
                 );
                 // The gap-free slots are the geometry authority; the container gap is applied
                 // per slot in the render conversion below and nowhere else.
-                let logical_layouts = self.record_logical_slots(adjusted_work_area);
+                self.record_logical_slots(adjusted_work_area);
 
                 let should_remove_titlebars = REMOVE_TITLEBARS.load(Ordering::SeqCst);
                 let no_titlebar = NO_TITLEBAR.lock().clone();
                 let regex_identifiers = REGEX_IDENTIFIERS.lock().clone();
                 let stackbar_tab_height = STACKBAR_TAB_HEIGHT.load(Ordering::SeqCst);
 
-                let mut layouts = Vec::with_capacity(logical_layouts.len());
+                // A hidden container owns no slot, so it is absent here and is never repositioned
+                // by its container; its floating windows keep their own rectangles and its
+                // minimized windows stay invisible.
+                let mut layouts = Vec::new();
+                let mut rendered = HashMap::new();
 
-                for (i, slot) in logical_layouts.iter().enumerate() {
-                    let window_count = self
-                        .containers()
-                        .get(i)
-                        .map_or(0, |container| container.windows().len());
-
-                    let stackbar_height = if stackbar_manager::should_have_stackbar(window_count) {
-                        stackbar_tab_height + container_padding
-                    } else {
-                        0
+                for (i, container) in self.containers().iter().enumerate() {
+                    let Some(slot) = self.logical_slots.get(&container.id) else {
+                        continue;
                     };
 
-                    layouts.push(LogicalRect::from(*slot).to_render_rect(RenderInsets {
+                    let stackbar_height =
+                        if stackbar_manager::should_have_stackbar(container.windows().len()) {
+                            stackbar_tab_height + container_padding
+                        } else {
+                            0
+                        };
+
+                    let render_rect = slot.to_render_rect(RenderInsets {
                         container_padding,
                         border_offset,
                         border_width,
                         stackbar_height,
-                    }));
+                    });
+
+                    rendered.insert(i, render_rect);
+                    layouts.push(render_rect);
                 }
 
                 let containers = self.containers_mut();
 
                 for (i, container) in containers.iter_mut().enumerate() {
-                    if let Some(layout) = layouts.get(i) {
+                    if let Some(layout) = rendered.get(&i) {
                         for window in container.windows() {
                             if container
                                 .focused_window()
@@ -879,46 +891,136 @@ impl Workspace {
         Ok(())
     }
 
+    /// The indices of the containers which currently occupy an active logical slot.
+    ///
+    /// Container order is preserved, because the arrangement is calculated from the position of
+    /// an active container among the other active containers, not from its position among every
+    /// container the workspace owns.
+    #[must_use]
+    pub fn active_container_indices(&self) -> Vec<usize> {
+        self.containers()
+            .iter()
+            .enumerate()
+            .filter(|(_, container)| container.is_active())
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    pub fn active_containers(&self) -> impl Iterator<Item = &Container> {
+        self.containers()
+            .iter()
+            .filter(|container| container.is_active())
+    }
+
+    pub fn hidden_containers(&self) -> impl Iterator<Item = &Container> {
+        self.containers()
+            .iter()
+            .filter(|container| container.is_hidden())
+    }
+
+    /// The `N` which the new-window placement thresholds are counted against.
+    #[must_use]
+    pub fn active_container_count(&self) -> usize {
+        self.active_containers().count()
+    }
+
+    #[must_use]
+    pub fn container_state(&self, idx: usize) -> Option<ContainerState> {
+        self.containers().get(idx).map(Container::state)
+    }
+
+    /// The container a geometry operation should start from.
+    ///
+    /// Directional slot work needs an active container. A focused container with no active slot
+    /// is what happens when the focus is on a floating window in a hidden container; the most
+    /// recently used active container is then the documented starting point, and container order
+    /// is the last resort when the history holds nothing usable.
+    #[must_use]
+    pub fn active_container_idx_for_geometry(&self) -> Option<usize> {
+        let focused_idx = self.focused_container_idx();
+
+        if self
+            .containers()
+            .get(focused_idx)
+            .is_some_and(Container::is_active)
+        {
+            return Some(focused_idx);
+        }
+
+        for id in self.container_focus_history.iter() {
+            if let Some(idx) = self
+                .containers()
+                .iter()
+                .position(|container| &container.id == id && container.is_active())
+            {
+                return Some(idx);
+            }
+        }
+
+        self.active_container_indices().first().copied()
+    }
+
     /// Calculate this workspace's gap-free logical slots against `available_area`.
     ///
     /// Pure geometry: no Win32 call is made, so the slot authority can be exercised without a
     /// desktop session. The container gap is deliberately not passed to the arrangement - it is
     /// applied per slot by [`LogicalRect::to_render_rect`], so the slots returned here tile
     /// `available_area` exactly.
+    ///
+    /// Only active containers are arranged. A hidden container keeps its windows, its ID and its
+    /// history, but it is absent from this calculation, so the active containers expand over the
+    /// area it would otherwise have taken.
     #[must_use]
-    pub fn calculate_logical_slots(&self, available_area: Rect) -> Vec<Rect> {
-        let Some(len) = NonZeroUsize::new(self.containers().len()) else {
+    pub fn calculate_logical_slots(&self, available_area: Rect) -> Vec<(ContainerId, LogicalRect)> {
+        let active = self.active_container_indices();
+
+        let Some(len) = NonZeroUsize::new(active.len()) else {
             return vec![];
         };
 
-        self.layout.as_boxed_arrangement().calculate(
+        // Both of these are keyed by container index, so they have to be projected onto the
+        // active subset before the arrangement can consume them.
+        let focused_idx = active
+            .iter()
+            .position(|idx| *idx == self.focused_container_idx())
+            .unwrap_or(0);
+
+        let resize_dimensions = active
+            .iter()
+            .map(|idx| self.resize_dimensions.get(*idx).copied().flatten())
+            .collect::<Vec<_>>();
+
+        let arranged = self.layout.as_boxed_arrangement().calculate(
             &available_area,
             len,
             None,
             self.layout_flip,
-            &self.resize_dimensions,
-            self.focused_container_idx(),
+            &resize_dimensions,
+            focused_idx,
             self.effective_layout_options(),
             &self.latest_layout,
-        )
+        );
+
+        active
+            .iter()
+            .filter_map(|idx| self.containers().get(*idx))
+            .zip(arranged)
+            .map(|(container, slot)| (container.id.clone(), LogicalRect::from(slot)))
+            .collect()
     }
 
     /// Recalculate the logical slots, store them by container ID, and report any tiling violation.
     ///
-    /// Returns the slots in container order so the caller can render them.
-    pub fn record_logical_slots(&mut self, available_area: Rect) -> Vec<Rect> {
-        let logical_layouts = self.calculate_logical_slots(available_area);
+    /// Returns the active slots in container order so the caller can render them.
+    pub fn record_logical_slots(
+        &mut self,
+        available_area: Rect,
+    ) -> Vec<(ContainerId, LogicalRect)> {
+        let slots = self.calculate_logical_slots(available_area);
         let area = LogicalRect::from(available_area);
 
-        let slots = self
-            .containers()
-            .iter()
-            .zip(logical_layouts.iter())
-            .map(|(container, slot)| (container.id.clone(), LogicalRect::from(*slot)))
-            .collect::<Vec<_>>();
-
         self.logical_work_area = Some(area);
-        self.logical_slots.replace_all(slots);
+        self.logical_slots.replace_all(slots.clone());
 
         if let Err(violations) = self.logical_slots.validate_coverage(area) {
             for violation in violations {
@@ -929,7 +1031,7 @@ impl Workspace {
             }
         }
 
-        logical_layouts
+        slots
     }
 
     /// The gap-free slot the container at `idx` currently occupies.
@@ -1950,6 +2052,10 @@ impl Workspace {
             .remove(focused_idx)
             .ok_or_eyre("there is no container")?;
 
+        // The container is no longer in the ring, so it must not keep an active slot; the next
+        // update recalculates the remaining slots and reintegration recalculates them again.
+        self.logical_slots.remove(&container.id);
+
         // We don't remove any resize adjustments for a monocle, because when this container is
         // inevitably reintegrated, it would be weird if it doesn't go back to the dimensions
         // it had before
@@ -2060,10 +2166,12 @@ impl Workspace {
             .ok_or_eyre("there is no window")?;
 
         if container.windows().is_empty() {
+            let emptied_id = container.id.clone();
             // we shouldn't use remove_container_by_idx here because it doesn't make sense for
             // monocle and maximized toggles which take over the whole screen before being reinserted
             // at the same index to respect locked container indexes
             self.containers_mut().remove(focused_idx);
+            self.logical_slots.remove(&emptied_id);
             if self.resize_dimensions.get(focused_idx).is_some() {
                 self.resize_dimensions.remove(focused_idx);
             }
@@ -2462,8 +2570,8 @@ mod tests {
 
                 assert_eq!(logical.len(), expected.len());
 
-                for (slot, expected) in logical.iter().zip(expected.iter()) {
-                    let rendered = LogicalRect::from(*slot).to_render_rect(RenderInsets {
+                for ((_, slot), expected) in logical.iter().zip(expected.iter()) {
+                    let rendered = slot.to_render_rect(RenderInsets {
                         container_padding,
                         ..RenderInsets::default()
                     });
@@ -2472,6 +2580,106 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn hide_container(workspace: &mut Workspace, idx: usize) {
+        for window in workspace.containers_mut()[idx].windows_mut().iter_mut() {
+            window.set_minimized();
+        }
+    }
+
+    #[test]
+    fn a_hidden_container_occupies_no_logical_slot() {
+        let mut workspace = workspace_with_containers(&[1, 1, 1]);
+        let area = work_area(1920, 1080);
+        let hidden_id = workspace.containers()[1].id.clone();
+
+        workspace.record_logical_slots(area);
+        assert_eq!(workspace.logical_slots.len(), 3);
+
+        hide_container(&mut workspace, 1);
+        workspace.record_logical_slots(area);
+
+        assert_eq!(workspace.active_container_count(), 2);
+        assert_eq!(workspace.logical_slots.len(), 2);
+        assert!(!workspace.logical_slots.contains(&hidden_id));
+        // The container itself is untouched: it keeps its window, its ID and its position.
+        assert_eq!(workspace.containers().len(), 3);
+        assert_eq!(workspace.containers()[1].id, hidden_id);
+        assert_eq!(workspace.containers()[1].windows().len(), 1);
+    }
+
+    #[test]
+    fn the_active_containers_expand_over_a_hidden_container_area() {
+        let mut workspace = workspace_with_containers(&[1, 1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        hide_container(&mut workspace, 1);
+        workspace.record_logical_slots(area);
+
+        // Two containers, three slots' worth of area: the remaining slots still tile it exactly,
+        // which is only possible if they absorbed what the hidden container had.
+        assert!(
+            workspace
+                .logical_slots
+                .validate_coverage(LogicalRect::from(area))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn the_last_active_container_takes_the_whole_work_area() {
+        let mut workspace = workspace_with_containers(&[1, 1]);
+        let area = work_area(1920, 1080);
+
+        hide_container(&mut workspace, 0);
+        workspace.record_logical_slots(area);
+
+        let slot = workspace.logical_slots.get(&workspace.containers()[1].id);
+        assert_eq!(slot, Some(LogicalRect::from(area)));
+    }
+
+    #[test]
+    fn hiding_every_container_leaves_no_active_slot() {
+        let mut workspace = workspace_with_containers(&[1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        hide_container(&mut workspace, 0);
+        hide_container(&mut workspace, 1);
+        workspace.record_logical_slots(area);
+
+        assert_eq!(workspace.active_container_count(), 0);
+        assert!(workspace.logical_slots.is_empty());
+        assert_eq!(workspace.hidden_containers().count(), 2);
+        assert_eq!(workspace.active_container_idx_for_geometry(), None);
+    }
+
+    #[test]
+    fn geometry_starts_from_the_most_recent_active_container_when_the_focus_is_hidden() {
+        let mut workspace = workspace_with_containers(&[1, 1, 1]);
+
+        workspace.focus_container(2);
+        workspace.focus_container(0);
+        assert_eq!(workspace.active_container_idx_for_geometry(), Some(0));
+
+        hide_container(&mut workspace, 0);
+
+        assert_eq!(workspace.container_state(0), Some(ContainerState::Hidden));
+        assert_eq!(workspace.active_container_idx_for_geometry(), Some(2));
+    }
+
+    #[test]
+    fn hidden_containers_are_absent_from_the_active_selectors() {
+        let mut workspace = workspace_with_containers(&[1, 1, 1]);
+        hide_container(&mut workspace, 1);
+
+        assert_eq!(workspace.active_container_indices(), vec![0, 2]);
+        assert_eq!(workspace.active_container_count(), 2);
+        assert_eq!(workspace.hidden_containers().count(), 1);
+        assert_eq!(workspace.container_state(1), Some(ContainerState::Hidden));
+        assert_eq!(workspace.container_state(9), None);
     }
 
     #[test]
