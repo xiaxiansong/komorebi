@@ -42,6 +42,7 @@ use crate::core::Sizing;
 use crate::core::WindowContainerBehaviour;
 use crate::core::WindowManagementBehaviour;
 use crate::core::config_generation::MatchingRule;
+use crate::invariants;
 
 use crate::CrossBoundaryBehaviour;
 use crate::DATA_DIR;
@@ -3991,6 +3992,13 @@ impl WindowManager {
     /// [`known_hwnds`]: `Self.known_hwnds`
     pub fn update_known_hwnds(&mut self) {
         tracing::trace!("updating list of known hwnds");
+
+        // This runs after a command or event has been fully processed, which is where the model
+        // is expected to be consistent again.
+        if cfg!(debug_assertions) {
+            invariants::assert_invariants(self, "update_known_hwnds");
+        }
+
         let mut known_hwnds = HashMap::new();
         for (m_idx, monitor) in self.monitors().iter().enumerate() {
             for (w_idx, workspace) in monitor.workspaces().iter().enumerate() {

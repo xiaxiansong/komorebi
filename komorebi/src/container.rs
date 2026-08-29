@@ -365,7 +365,14 @@ impl Container {
             .map(|window| window.hwnd)
             .collect::<Vec<_>>();
 
-        self.focus_history.retain(|hwnd| hwnds.contains(hwnd));
+        // Collecting rebuilds the history through the deduplicating insertion path, so a
+        // serialized list which repeated an entry cannot survive the repair.
+        self.focus_history = self
+            .focus_history
+            .iter()
+            .copied()
+            .filter(|hwnd| hwnds.contains(hwnd))
+            .collect();
 
         // Reverse stack order: the top of the stack is the better recency guess.
         for hwnd in hwnds.iter().rev() {
