@@ -36,16 +36,29 @@ Recorded on 2026-08-29 (Asia/Shanghai), before task changes:
 | Repository instructions | no `AGENTS.md`; root README is absent at this commit |
 | Rust | `rustc 1.98.0 (88d9e12ae 2026-08-18)` |
 | Cargo | `cargo 1.98.0 (797e8a9bc 2026-08-05)` |
-| rustup | unavailable (`rustup` is not installed/on PATH) |
-| Clippy | unavailable (`cargo clippy`: no such command) |
-| Format check | unavailable: installed rustfmt is a deprecated pre-2018 version; it rejects `crate::` and raw identifiers and does not support `--check` |
+| rustup | unavailable at Phase 0 (`rustup` was not installed/on PATH) |
+| Clippy | unavailable at Phase 0 (`cargo clippy`: no such command) |
+| Format check | unavailable at Phase 0: the rustfmt then on PATH was a deprecated pre-2018 version; it rejects `crate::` and raw identifiers and does not support `--check` |
 | `cargo check --workspace` | passed; existing future-incompatibility warning for `net2 v0.2.39` |
 | `cargo test --workspace --no-run` | passed; existing MSVC linker informational warnings |
 | `cargo test --workspace` | passed: komorebi 98 passed/1 ignored; layouts 128 passed; bar 3 passed; remaining targets/doc-tests passed with zero tests |
 
-The Clippy limitation is an installed-toolchain mismatch, not a claim that Windows cannot run
-Clippy. If a rustup-managed toolchain is later installed, run `rustup component add clippy` for the
-repository's stable toolchain and then `cargo clippy --workspace --all-targets`.
+The Clippy limitation was an installed-toolchain mismatch, not a claim that Windows cannot run
+Clippy.
+
+**Toolchain baseline revised on 2026-08-29 during Phase 3B/3C.** A rustup-managed toolchain is now
+active and all three previously blocked checks run:
+
+| Item | Baseline |
+| --- | --- |
+| rustup | `stable-x86_64-pc-windows-msvc`, active via the repository `rust-toolchain.toml` |
+| Clippy | `clippy 0.1.98 (88d9e12ae1 2026-08-18)` |
+| rustfmt | `rustfmt 1.9.0-stable`; `rustfmt.toml` sets the nightly-only `imports_granularity`, which warns and is skipped on stable |
+| `cargo fmt --check` | clean after the Phase 3B `style:` commit reformatted the code written while rustfmt was unavailable |
+| `cargo clippy --workspace --all-targets` | one pre-existing upstream warning: `items after a test module` at `komorebi/src/window.rs:1106`. No `-D warnings`, matching repository CI. |
+
+From Phase 3B onwards, `cargo fmt --check` and `cargo clippy --workspace --all-targets` are part of
+every phase's verification and must be reported with real results.
 
 ## Current architecture findings
 
@@ -205,16 +218,66 @@ doc-tests passed. Parallel runs exposed pre-existing shared-global test isolatio
 cache/channel tests; unique cache keys were added, while the channel tests remain reliably covered
 by the passing serial run. Format/Clippy remain unavailable for the recorded toolchain reasons.
 
-### Phase 3B - Focus histories and ownership invariants
+### Phase 3B - Focus and minimize histories
 
-- [ ] Add workspace container MRU, container window MRU, and per-workspace minimize MRU.
-- [ ] Centralize record, selection, deduplication, and deletion cleanup.
-- [ ] Add `validate_invariants()` ownership/history checks enabled by tests and debug assertions.
-- [ ] Add focus, deletion, minimize-history, and invariant tests.
-- [ ] Commit as `feat: add focus histories and ownership invariants`.
+Split from the original Phase 3B before coding: histories and the invariant validator each reach
+the per-phase review limit on their own, and the validator is only meaningful once the histories
+it checks exist.
+
+- [x] Add workspace container MRU, container window MRU, and per-workspace minimize MRU.
+- [x] Centralize record, selection, deduplication, and deletion cleanup.
+- [x] Add focus, deletion, minimize-history, and serde tests.
+- [x] Commit as `feat: add focus and minimize histories`.
 
 Expected handwritten change: 300-500 lines. Likely files: `container.rs`, `workspace.rs`,
 `monitor.rs`, `window_manager.rs`, `process_event.rs`, and `state.rs`.
+
+Actual files: new `focus_history.rs`, plus `container.rs`, `workspace.rs`, `window_manager.rs`,
+`state.rs`, and `lib.rs`. Actual change: 592 added lines in existing files plus a 195-line new
+module; roughly 350 production and 440 test lines. A single deduplicating `Mru<T>` backs all three
+histories, so recording, removal, selection, and pruning cannot diverge between them.
+
+`Container::focus_window` and `Workspace::focus_container` are the only recording points, so every
+existing focus call site updates both levels without being modified; `record_focused_window` is the
+combined entry point. Preselect markers are excluded from the container history because their ID is
+fixed rather than stable. Selection (`first_focusable_window`, `focus_target_from_history`) skips
+minimized windows and falls back to stack order so it cannot dead-end. `take_last_minimized_window`
+discards the stale entries it passes. Removal paths (`remove_window`, `detach_window`,
+`remove_container_by_idx`) drop what they invalidate, container deserialization repairs stale,
+duplicated, or missing entries, and `apply_state` prunes imported state.
+
+Verification: `cargo test --workspace -- --test-threads=1` passed with komorebi 149 passed/1
+ignored (up from 123), layouts 128, bar 3, all other targets and doc-tests passed.
+`cargo check --workspace`, `cargo check -p komorebi --features schemars`, and `cargo fmt --check`
+passed. `cargo clippy --workspace --all-targets` reported only the pre-existing upstream warning.
+
+Commits: `63d73bf8` (`style:` rustfmt catch-up), `ace8cd88` (foreground-query fix removing the
+recorded environment-dependent test failure), `14f32928` (this phase).
+
+### Phase 3C - Ownership and history invariant validation
+
+- [x] Add `validate_invariants()` ownership/history checks enabled by tests and debug assertions.
+- [x] Add invariant violation and post-removal consistency tests.
+- [x] Commit as `feat: validate ownership and history invariants`.
+
+Expected handwritten change: 200-350 lines. Likely files: new `invariants.rs`, `window_manager.rs`.
+
+Actual files: new `invariants.rs` (512 lines including tests), `container.rs` (history repair now
+rebuilds through the deduplicating path), `window_manager.rs`, and `lib.rs`.
+
+`ValidateInvariants` is implemented for `Container`, `Workspace`, `Monitor`, and `WindowManager`,
+and reports every violation rather than the first. `assert_invariants` runs from
+`update_known_hwnds`, which is where a processed command or event leaves the model at rest; it
+panics in this crate's own tests and logs in production. Alternate workspace-level ownership is
+tolerated as transitional debt, but holding the same window both in a container and in the
+workspace-level floating/maximized/monocle paths is reported.
+
+Geometry invariants (6-10, 16) are intentionally absent until logical slots exist; they are added
+in Phases 4-8.
+
+Verification: `cargo test --workspace -- --test-threads=1` passed with komorebi 160 passed/1
+ignored, layouts 128, bar 3. `cargo fmt --check` clean; `cargo clippy --workspace --all-targets`
+reported only the pre-existing upstream warning. Commit: `a40f12bc`.
 
 ### Phase 4 - Logical slots and render rectangles
 
@@ -408,10 +471,16 @@ This list is updated from actual diffs, not treated as permission to change ever
   target applications with existing Win32 helpers; application-specific exceptions may be needed.
 - Open: `ApplyState` must be made transactionally aware of the runtime suspension set when state
   migration is implemented; ordinary Win32 reconciliation is already suppressed in Phase 1.
-- Open: `Monitor::move_container_to_workspace` currently requires a non-null foreground HWND even
-  when moving an empty test container. Its two unit tests fail with Win32 error 87 whenever the
-  desktop session has no foreground window; remove that incidental dependency in the workspace
-  migration phase rather than hiding the production behavior in a state-model commit.
+- 2026-08-29: Resolved in `ace8cd88`. `Monitor::move_container_to_workspace` only queried the
+  foreground window to detect a floating move subject, so a failed query now means "no floating
+  window" instead of aborting the move. The two unit tests no longer depend on the desktop session.
+- 2026-08-29: A single `Mru<T>` backs all three histories rather than three bespoke lists, so
+  deduplication, pruning, and selection semantics cannot drift apart between levels.
+- 2026-08-29: Histories are recorded inside `Container::focus_window` and
+  `Workspace::focus_container` rather than at each call site, so no future focus path can update
+  one level without the other.
+- 2026-08-29: `assert_invariants` panics only in this crate's tests and logs in production. A
+  released build must not terminate a user's session over a model inconsistency.
 
 ## Progress log
 
@@ -440,6 +509,15 @@ This list is updated from actual diffs, not treated as permission to change ever
   float/maximize/minimize transition routing was moved to Phase 5 after inspection showed it cannot
   preserve state until those workspace-owned alternate paths are removed. Next phase: typed stable
   workspace/container identities and explicit focus/minimize histories.
+- 2026-08-29: Phase 3B/3C turn. The toolchain baseline was re-checked first and had changed:
+  rustup, Clippy, and a modern rustfmt are all available now, so the recorded "unavailable"
+  limitations no longer apply and both checks were run for real. The code written under the old
+  limitation was reformatted in its own `style:` commit before any feature work, and the recorded
+  foreground-window test dependency was fixed in its own commit. Phase 3B added the three
+  most-recently-used histories with centralized recording, selection, and deletion cleanup. Phase
+  3C added the ownership/history invariant validator and wired it into the at-rest runtime path.
+  The full serial workspace suite passed at every step (komorebi 123 -> 149 -> 160 passing).
+  Next phase: logical slots and render rectangles.
 - 2026-08-29: Phase 3 was split into 3A identity and 3B histories/invariants after call-site review
   showed that doing both together would exceed the phase review-size limit. Phase 3A added
   transparent typed workspace/container IDs, migrated managed ownership and UI integration
