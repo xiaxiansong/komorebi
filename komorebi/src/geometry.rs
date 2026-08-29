@@ -297,7 +297,45 @@ pub struct SplitResult {
     pub existing_slot: LogicalRect,
 }
 
-/// Deterministic orderings used when several slots are equally valid candidates.
+/// The gaps and insets applied when a logical slot becomes a window rectangle.
+///
+/// This is the only place gaps exist. Splitting, adjacency, absorption and coverage validation
+/// never see them, so changing a gap size can never change which containers are neighbours.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RenderInsets {
+    /// The gap between neighbouring containers, applied as a uniform inset per slot.
+    pub container_padding: i32,
+    /// How far outside the window its border is drawn.
+    pub border_offset: i32,
+    /// The width of the border drawn around the window.
+    pub border_width: i32,
+    /// The strip reserved at the top of the slot for a stackbar, when the container has one.
+    pub stackbar_height: i32,
+}
+
+impl LogicalRect {
+    /// Convert a gap-free slot into the rectangle a stored window is actually positioned to.
+    ///
+    /// Insets are applied in the order the renderer has always applied them: the container gap
+    /// first, then the border offset and width, then the stackbar strip off the top edge.
+    #[must_use]
+    pub fn to_render_rect(self, insets: RenderInsets) -> Rect {
+        let mut rect: Rect = self.into();
+
+        rect.add_padding(insets.container_padding);
+        rect.add_padding(insets.border_offset);
+        rect.add_padding(insets.border_width);
+
+        if insets.stackbar_height > 0 {
+            rect.top += insets.stackbar_height;
+            rect.bottom -= insets.stackbar_height;
+        }
+
+        rect
+    }
+}
+
+// Deterministic orderings used when several slots are equally valid candidates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotOrder {
     /// Top to bottom, then left to right: used along left and right edges.

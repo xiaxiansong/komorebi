@@ -270,6 +270,8 @@ impl From<&WindowManager> for State {
                             container_padding: workspace.container_padding,
                             latest_layout: workspace.latest_layout.clone(),
                             resize_dimensions: workspace.resize_dimensions.clone(),
+                            logical_slots: workspace.logical_slots.clone(),
+                            logical_work_area: workspace.logical_work_area,
                             tile: workspace.tile,
                             work_area_offset: workspace.work_area_offset,
                             apply_window_based_work_area_offset: workspace

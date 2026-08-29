@@ -35,6 +35,9 @@ use crate::core::PlacementTarget;
 use crate::core::Rect;
 use crate::core::WindowPlacement;
 use crate::focus_history::Mru;
+use crate::geometry::LogicalRect;
+use crate::geometry::LogicalSlots;
+use crate::geometry::RenderInsets;
 use crate::lockable_sequence::LockableSequence;
 use crate::managed_window::ManagedWindow;
 use crate::managed_window::Visibility;
@@ -101,6 +104,16 @@ pub struct Workspace {
     pub container_padding: Option<i32>,
     pub latest_layout: Vec<Rect>,
     pub resize_dimensions: Vec<Option<Rect>>,
+    /// Gap-free logical slots for this workspace's containers, keyed by stable container ID.
+    ///
+    /// This is the geometry authority. Splitting, adjacency, absorption and resizing read and
+    /// write these rectangles; `latest_layout` only holds the rendered result derived from
+    /// them, which is why it is keyed by index and these are keyed by identity.
+    #[serde(default)]
+    pub logical_slots: LogicalSlots,
+    /// The gap-free area the current logical slots were calculated against.
+    #[serde(default)]
+    pub logical_work_area: Option<LogicalRect>,
     pub tile: bool,
     pub work_area_offset: Option<Rect>,
     pub apply_window_based_work_area_offset: bool,
@@ -167,6 +180,8 @@ impl Default for Workspace {
             container_padding: Option::from(DEFAULT_CONTAINER_PADDING.load(Ordering::SeqCst)),
             latest_layout: vec![],
             resize_dimensions: vec![],
+            logical_slots: LogicalSlots::default(),
+            logical_work_area: None,
             tile: true,
             work_area_offset: None,
             apply_window_based_work_area_offset: true,
@@ -737,40 +752,41 @@ impl Workspace {
                     self.layout_options,
                     self.layout_options_rules.len(),
                 );
-                let mut layouts = self.layout.as_boxed_arrangement().calculate(
-                    &adjusted_work_area,
-                    NonZeroUsize::new(self.containers().len()).ok_or_eyre(
-                        "there must be at least one container to calculate a workspace layout",
-                    )?,
-                    Some(container_padding),
-                    self.layout_flip,
-                    &self.resize_dimensions,
-                    self.focused_container_idx(),
-                    effective_layout_options,
-                    &self.latest_layout,
-                );
+                // The gap-free slots are the geometry authority; the container gap is applied
+                // per slot in the render conversion below and nowhere else.
+                let logical_layouts = self.record_logical_slots(adjusted_work_area);
 
                 let should_remove_titlebars = REMOVE_TITLEBARS.load(Ordering::SeqCst);
                 let no_titlebar = NO_TITLEBAR.lock().clone();
                 let regex_identifiers = REGEX_IDENTIFIERS.lock().clone();
+                let stackbar_tab_height = STACKBAR_TAB_HEIGHT.load(Ordering::SeqCst);
+
+                let mut layouts = Vec::with_capacity(logical_layouts.len());
+
+                for (i, slot) in logical_layouts.iter().enumerate() {
+                    let window_count = self
+                        .containers()
+                        .get(i)
+                        .map_or(0, |container| container.windows().len());
+
+                    let stackbar_height = if stackbar_manager::should_have_stackbar(window_count) {
+                        stackbar_tab_height + container_padding
+                    } else {
+                        0
+                    };
+
+                    layouts.push(LogicalRect::from(*slot).to_render_rect(RenderInsets {
+                        container_padding,
+                        border_offset,
+                        border_width,
+                        stackbar_height,
+                    }));
+                }
 
                 let containers = self.containers_mut();
 
                 for (i, container) in containers.iter_mut().enumerate() {
-                    let window_count = container.windows().len();
-
-                    if let Some(layout) = layouts.get_mut(i) {
-                        layout.add_padding(border_offset);
-                        layout.add_padding(border_width);
-
-                        if stackbar_manager::should_have_stackbar(window_count) {
-                            let tab_height = STACKBAR_TAB_HEIGHT.load(Ordering::SeqCst);
-                            let total_height = tab_height + container_padding;
-
-                            layout.top += total_height;
-                            layout.bottom -= total_height;
-                        }
-
+                    if let Some(layout) = layouts.get(i) {
                         for window in container.windows() {
                             if container
                                 .focused_window()
@@ -863,10 +879,86 @@ impl Workspace {
         Ok(())
     }
 
-    pub fn container_idx_from_current_point(&self) -> Option<usize> {
-        let mut idx = None;
+    /// Calculate this workspace's gap-free logical slots against `available_area`.
+    ///
+    /// Pure geometry: no Win32 call is made, so the slot authority can be exercised without a
+    /// desktop session. The container gap is deliberately not passed to the arrangement - it is
+    /// applied per slot by [`LogicalRect::to_render_rect`], so the slots returned here tile
+    /// `available_area` exactly.
+    #[must_use]
+    pub fn calculate_logical_slots(&self, available_area: Rect) -> Vec<Rect> {
+        let Some(len) = NonZeroUsize::new(self.containers().len()) else {
+            return vec![];
+        };
 
+        self.layout.as_boxed_arrangement().calculate(
+            &available_area,
+            len,
+            None,
+            self.layout_flip,
+            &self.resize_dimensions,
+            self.focused_container_idx(),
+            self.effective_layout_options(),
+            &self.latest_layout,
+        )
+    }
+
+    /// Recalculate the logical slots, store them by container ID, and report any tiling violation.
+    ///
+    /// Returns the slots in container order so the caller can render them.
+    pub fn record_logical_slots(&mut self, available_area: Rect) -> Vec<Rect> {
+        let logical_layouts = self.calculate_logical_slots(available_area);
+        let area = LogicalRect::from(available_area);
+
+        let slots = self
+            .containers()
+            .iter()
+            .zip(logical_layouts.iter())
+            .map(|(container, slot)| (container.id.clone(), LogicalRect::from(*slot)))
+            .collect::<Vec<_>>();
+
+        self.logical_work_area = Some(area);
+        self.logical_slots.replace_all(slots);
+
+        if let Err(violations) = self.logical_slots.validate_coverage(area) {
+            for violation in violations {
+                tracing::warn!(
+                    "workspace '{}' logical slots do not tile the work area: {violation}",
+                    self.name.as_deref().unwrap_or("unnamed")
+                );
+            }
+        }
+
+        logical_layouts
+    }
+
+    /// The gap-free slot the container at `idx` currently occupies.
+    #[must_use]
+    pub fn logical_slot_at(&self, idx: usize) -> Option<LogicalRect> {
+        self.logical_slots.get(&self.containers().get(idx)?.id)
+    }
+
+    /// The index of the container whose logical slot contains `point`.
+    ///
+    /// Slots are gap-free, so unlike the rendered rectangles they cannot leave a point in the
+    /// gutter between two containers unattributed.
+    #[must_use]
+    pub fn container_idx_from_logical_point(&self, point: (i32, i32)) -> Option<usize> {
+        self.containers().iter().position(|container| {
+            self.logical_slots
+                .get(&container.id)
+                .is_some_and(|slot| slot.contains_point(point))
+        })
+    }
+
+    pub fn container_idx_from_current_point(&self) -> Option<usize> {
         let point = WindowsApi::cursor_pos().ok()?;
+
+        if let Some(idx) = self.container_idx_from_logical_point((point.x, point.y)) {
+            return Some(idx);
+        }
+
+        let mut idx = None;
 
         for (i, _container) in self.containers().iter().enumerate() {
             if let Some(rect) = self.latest_layout.get(i)
@@ -1092,6 +1184,7 @@ impl Workspace {
     /// only this workspace's references are dropped.
     fn forget_container(&mut self, container: &Container) {
         self.container_focus_history.remove(&container.id);
+        self.logical_slots.remove(&container.id);
 
         for window in container.windows() {
             self.minimize_history.remove(&window.hwnd);
@@ -2245,6 +2338,7 @@ mod tests {
     use super::*;
     use crate::Window;
     use crate::container::Container;
+    use crate::geometry::SlotOrder;
     use std::collections::HashMap;
 
     #[test]
@@ -2274,6 +2368,206 @@ mod tests {
         let roundtrip: Workspace =
             serde_json::from_str(&serde_json::to_string(&workspaces[1]).unwrap()).unwrap();
         assert_eq!(roundtrip.id, first_id);
+    }
+
+    fn work_area(width: i32, height: i32) -> Rect {
+        Rect {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        }
+    }
+
+    fn legacy_render_layout(
+        workspace: &Workspace,
+        area: Rect,
+        container_padding: i32,
+    ) -> Vec<Rect> {
+        // How the arrangement was called before logical slots existed: the container gap was an
+        // input to the layout calculation itself.
+        workspace.layout.as_boxed_arrangement().calculate(
+            &area,
+            NonZeroUsize::new(workspace.containers().len()).unwrap(),
+            Some(container_padding),
+            workspace.layout_flip,
+            &workspace.resize_dimensions,
+            workspace.focused_container_idx(),
+            workspace.effective_layout_options(),
+            &workspace.latest_layout,
+        )
+    }
+
+    #[test]
+    fn logical_slots_tile_the_available_area_exactly() {
+        for count in 1..=5 {
+            for area in [work_area(1920, 1080), work_area(1001, 777)] {
+                let mut workspace = workspace_with_containers(&vec![1; count]);
+                workspace.record_logical_slots(area);
+
+                assert_eq!(workspace.logical_slots.len(), count);
+                assert_eq!(
+                    workspace
+                        .logical_slots
+                        .validate_coverage(LogicalRect::from(area)),
+                    Ok(()),
+                    "{count} containers did not tile {area:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_container_gap_does_not_change_the_logical_slots() {
+        let mut workspace = workspace_with_containers(&[1, 1, 1]);
+        let area = work_area(1920, 1080);
+
+        workspace.record_logical_slots(area);
+        let slots = workspace.logical_slots.clone();
+
+        // The gap is not an input to slot calculation at all, so no matter which gap the renderer
+        // is about to apply, the slots - and therefore adjacency and coverage - are identical.
+        for container_padding in [0, 5, 40] {
+            let rendered = workspace
+                .logical_slot_at(0)
+                .unwrap()
+                .to_render_rect(RenderInsets {
+                    container_padding,
+                    ..RenderInsets::default()
+                });
+
+            workspace.record_logical_slots(area);
+
+            // The generation advances on every recalculation, but the geometry does not.
+            assert_eq!(
+                workspace.logical_slots.ordered(SlotOrder::TopToBottom),
+                slots.ordered(SlotOrder::TopToBottom)
+            );
+            assert_eq!(
+                rendered.right,
+                slots.get(&workspace.containers()[0].id).unwrap().width - container_padding * 2
+            );
+        }
+    }
+
+    #[test]
+    fn rendering_a_logical_slot_reproduces_the_previous_layout_geometry() {
+        for count in 1..=4 {
+            for container_padding in [0, 10] {
+                let workspace = workspace_with_containers(&vec![1; count]);
+                let area = work_area(1920, 1080);
+
+                let expected = legacy_render_layout(&workspace, area, container_padding);
+                let logical = workspace.calculate_logical_slots(area);
+
+                assert_eq!(logical.len(), expected.len());
+
+                for (slot, expected) in logical.iter().zip(expected.iter()) {
+                    let rendered = LogicalRect::from(*slot).to_render_rect(RenderInsets {
+                        container_padding,
+                        ..RenderInsets::default()
+                    });
+
+                    assert_eq!(rendered, *expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn logical_slots_are_keyed_by_identity_not_by_index() {
+        let mut workspace = workspace_with_containers(&[1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        let first_id = workspace.containers()[0].id.clone();
+        let second_id = workspace.containers()[1].id.clone();
+        let first_slot = workspace.logical_slots.get(&first_id).unwrap();
+        let second_slot = workspace.logical_slots.get(&second_id).unwrap();
+        assert_ne!(first_slot, second_slot);
+
+        workspace.containers_mut().swap(0, 1);
+        workspace.record_logical_slots(area);
+
+        // Both containers still have a slot under their own ID, and the geometry followed the
+        // new ordering rather than staying attached to a stale index.
+        assert_eq!(workspace.logical_slots.get(&second_id), Some(first_slot));
+        assert_eq!(workspace.logical_slots.get(&first_id), Some(second_slot));
+    }
+
+    #[test]
+    fn removing_a_container_drops_its_logical_slot() {
+        let mut workspace = workspace_with_containers(&[1, 1]);
+        workspace.record_logical_slots(work_area(1920, 1080));
+
+        let removed_id = workspace.containers()[1].id.clone();
+        let kept_id = workspace.containers()[0].id.clone();
+
+        workspace.remove_container_by_idx(1);
+
+        assert!(!workspace.logical_slots.contains(&removed_id));
+        assert!(workspace.logical_slots.contains(&kept_id));
+    }
+
+    #[test]
+    fn a_point_in_the_rendered_gutter_still_belongs_to_a_container() {
+        let mut workspace = workspace_with_containers(&[1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        let mut boundary = None;
+        for idx in 0..2 {
+            let slot = workspace.logical_slot_at(idx).unwrap();
+            if slot.left > 0 {
+                boundary = Some(slot.left);
+            }
+        }
+
+        let boundary = boundary.expect("two containers should share a vertical edge");
+
+        // The renderer insets both neighbours by the gap, so this column is inside no rendered
+        // rectangle at all; the gap-free slots still attribute it to exactly one container.
+        let gutter = (boundary - 1, area.bottom / 2);
+        let owner = workspace.container_idx_from_logical_point(gutter);
+
+        let owner = owner.expect("a gap-free slot must own every point of the work area");
+        assert!(
+            workspace
+                .logical_slot_at(owner)
+                .unwrap()
+                .contains_point(gutter)
+        );
+    }
+
+    #[test]
+    fn recalculating_slots_advances_the_geometry_generation() {
+        let mut workspace = workspace_with_containers(&[1, 1]);
+        let area = work_area(1920, 1080);
+
+        workspace.record_logical_slots(area);
+        let generation = workspace.logical_slots.generation();
+
+        workspace.record_logical_slots(work_area(1280, 1024));
+
+        assert!(workspace.logical_slots.generation() > generation);
+        assert_eq!(
+            workspace.logical_work_area,
+            Some(LogicalRect::from(work_area(1280, 1024)))
+        );
+    }
+
+    #[test]
+    fn workspace_json_without_logical_slots_still_deserializes() {
+        let workspace = Workspace::default();
+        let mut json = serde_json::to_value(&workspace).unwrap();
+        let object = json.as_object_mut().unwrap();
+        object.remove("logical_slots");
+        object.remove("logical_work_area");
+
+        let migrated: Workspace = serde_json::from_value(json).unwrap();
+
+        assert_eq!(migrated.logical_slots, LogicalSlots::default());
+        assert_eq!(migrated.logical_work_area, None);
     }
 
     fn workspace_with_containers(counts: &[usize]) -> Workspace {
