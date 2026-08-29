@@ -350,20 +350,128 @@ pre-existing environment limitation rather than a Phase 4 regression. `StaticCon
 touched, so `schema.json` needs no update; schema regeneration is deferred to the release-built
 verification in Phases 12 and 14.
 
-### Phase 5 - Derived Active/Hidden container state
+### Phase 5A - Derived Active/Hidden container state
 
-- [ ] Add derived `ContainerState` and active-container selectors.
-- [ ] Make only containers with a visible stored window occupy a logical slot.
-- [ ] Migrate floating windows from the workspace list into their owning containers.
-- [ ] Remove alternate ownership through maximized/monocle storage; presentation becomes window state.
-- [ ] Route minimize/restore, maximize/fullscreen, and stored/floating operations through the
-  multidimensional transition methods once windows no longer leave their owning container.
-- [ ] Make state transitions idempotent and extend invariant validation.
-- [ ] Add all basic Hidden classification and ownership tests.
-- [ ] Commit as `feat: derive active and hidden container state`.
+Split from the original Phase 5 before coding. A call-site census showed 309 references to the
+three alternate ownership paths, so removing them together with the state derivation would be
+several times the per-phase review limit. 5A owns the derived state and the slot authority, 5B
+owns floating ownership, 5C owns minimize ownership, and 5D owns the maximized/monocle paths.
 
-Expected handwritten change: 350-500 lines. Likely files: `managed_window.rs`, `container.rs`,
-`workspace.rs`, `window_manager.rs`, `process_event.rs`, `state.rs`.
+- [x] Add derived `ContainerState` and active-container selectors.
+- [x] Make only containers with a visible stored window occupy a logical slot.
+- [x] Add the geometry start-container rule for a focus which sits in a hidden container.
+- [x] Extend invariant validation with the stale-safe slot rules.
+- [x] Add Hidden classification, selector, and slot-release tests.
+- [x] Commit as `feat: derive active and hidden container state`.
+
+Expected handwritten change: 300-450 lines. Likely files: `container.rs`, `workspace.rs`,
+`invariants.rs`.
+
+Actual files: `container.rs`, `workspace.rs`, `invariants.rs`. Actual change: 491 added, 49
+removed, roughly half of it tests.
+
+`Container::state()` is derived on every read rather than stored, so it cannot drift from the
+windows it describes. A preselect marker reports Active because it is a reserved place in the
+arrangement rather than a container of the model. `calculate_logical_slots` now arranges the
+active containers alone and projects the focused index and the resize dimensions onto that
+subset, which is what makes the remaining containers cover a hidden container's area. The render
+loop looks its rectangle up by `ContainerId`, and `latest_layout` is documented as the rendered
+rectangles of the containers which own a slot rather than a per-container index.
+
+The monocle and maximize paths take a container out of the ring without going through
+`remove_container_by_idx`, so both now drop that container's slot explicitly; without that they
+leave an orphan slot behind.
+
+Only the stale-safe slot rules are validated at every point of rest: a slot belongs to a
+container the workspace still owns, and recorded slots do not overlap. Exact coverage and "a
+hidden container owns no slot" are properties of a freshly recorded arrangement - a background
+workspace which has not been retiled since its last structural change would report them
+spuriously - so they are checked where the arrangement is recorded and by the phase's tests, and
+they become model invariants in Phase 6, which introduces the transition point that keeps them
+true continuously.
+
+Verification: `cargo test --workspace -- --test-threads=1` passed with komorebi 204 passed/1
+ignored (up from 190), layouts 128, bar 3. `cargo fmt --check` clean; `cargo clippy --workspace
+--all-targets` reported only the pre-existing upstream warning; `cargo check -p komorebi
+--features schemars` passed. Commits: `1d034348` (test race fix, below), `7c723fe4` (this phase).
+
+A pre-existing race had to be fixed first, in its own commit. `test_listen_for_notifications`
+starts a listener thread which lives for the rest of the test binary and consumes the global
+notification channel, so `test_send_notification` could lose its message to that thread; the
+outcome depended on how long the earlier tests took, and this phase's new tests changed that
+timing. The clean tree passed five serial runs and the changed tree failed three of four. The
+test now sends until one of its own notifications comes back, which restores five clean serial
+runs without weakening what it asserts.
+
+### Phase 5B - Container-owned floating windows
+
+- [x] Remove `Workspace::floating_windows` and derive the floating window list from containers.
+- [x] Make float and unfloat placement changes which keep container membership, stack order and
+  both histories.
+- [x] Make container visibility placement-aware so a floating window is not hidden by its stack
+  position and is not positioned into its container's slot.
+- [x] Carry the complete managed state across workspace and monitor moves.
+- [x] Stop reporting floating windows as alternate ownership in the invariant validator.
+- [x] Add ownership, hide/restore, listing order, transfer, and atomic-failure tests.
+- [x] Commit as `feat: own floating windows through their containers`.
+
+Expected handwritten change: 400-600 lines across ten files; the storage swap cannot be split
+further because every call site must compile in the same commit.
+
+Actual files: `workspace.rs`, `container.rs`, `window_manager.rs`, `process_command.rs`,
+`process_event.rs`, `monitor.rs`, `monitor_reconciliator/mod.rs`, `invariants.rs`, `state.rs`,
+and `komorebi-bar/src/widgets/komorebi.rs`. Actual change: 591 added, 278 removed, roughly half
+of it tests.
+
+`floating_windows()` returns an owned `Vec<Window>` derived in container order and then stack
+order. It is a listing, not storage, so a floating window cannot be lost when its container
+changes and cannot be held twice. `float_window`, `unfloat_window` and `set_floating_rect` are
+the whole mutation surface; `take_window`/`adopt_managed_window` are the transfer pair, and they
+carry placement, visibility, presentation and the floating rectangle with the window.
+
+Two upstream behaviours changed as a direct consequence, and both are what the model requires.
+Floating no longer removes a window from its container, so it no longer destroys an emptied
+container or shifts the indices of locked containers - `test_locked_containers_toggle_float`
+asserts the new contract. Unfloating no longer creates a container; the window returns to the
+control of the one which owned it all along.
+
+`Container::restore` and `Container::load_focused_window` became placement-aware: only one stored
+window of a stack is on screen at a time, but a floating window keeps its own rectangle and stays
+visible next to it, and a minimized window is never restored by either. `Workspace::update`
+positions only `visible_stored_windows`, so a floating window in an active container is not
+dragged into the container's slot.
+
+Old runtime-state JSON which still carries a workspace-level `floating_windows` array
+deserializes, but that array is ignored rather than migrated. `StaticConfig` is unaffected.
+
+Verification: `cargo test --workspace -- --test-threads=1` passed with komorebi 213 passed/1
+ignored (up from 204), layouts 128, bar 3. `cargo fmt --check` clean; `cargo clippy --workspace
+--all-targets` reported only the pre-existing upstream warning; `cargo check -p komorebi
+--features schemars` passed. Commit: `f478d47d`.
+
+### Phase 5C - Container-owned minimized windows
+
+- [ ] Make minimize a visibility change which keeps container membership instead of a removal.
+- [ ] Record and prune the workspace minimize history around that transition.
+- [ ] Restore the last minimized window through the transition methods and both MRUs.
+- [ ] Keep duplicate and out-of-order minimize/restore events idempotent.
+- [ ] Add minimize-hides-container, restore-reactivates, and history tests.
+- [ ] Commit as `feat: keep minimized windows in their containers`.
+
+Expected handwritten change: 300-450 lines. Likely files: `workspace.rs`, `container.rs`,
+`window_manager.rs`, `process_event.rs`, `process_command.rs`.
+
+### Phase 5D - Presentation replaces maximized and monocle ownership
+
+- [ ] Remove alternate ownership through `maximized_window` and `monocle_container`; presentation
+  becomes window state.
+- [ ] Route maximize, fullscreen and monocle through the multidimensional transition methods.
+- [ ] Make the transitions idempotent and remove the transitional debt clause from the validator.
+- [ ] Add maximize/fullscreen/monocle ownership and restore-rectangle tests.
+- [ ] Commit as `feat: make presentation a window state`.
+
+Expected handwritten change: 400-600 lines. Likely files: `workspace.rs`, `window_manager.rs`,
+`process_event.rs`, `process_command.rs`, `monitor.rs`, `state.rs`.
 
 ### Phase 6 - Hidden slot absorption and restoration
 
@@ -556,6 +664,23 @@ This list is updated from actual diffs, not treated as permission to change ever
   machine, on the pre-change commit as well. Schema regeneration therefore needs a release build
   and is deferred to Phases 12 and 14.
 
+- 2026-08-30: `Container::state()` is derived on every read instead of being stored. A stored
+  flag would need updating at every place a window's placement or visibility changes, and one
+  missed site would leave a container claiming a slot it must not have.
+- 2026-08-30: Only stale-safe slot rules are model invariants in Phase 5A. `assert_invariants`
+  runs wherever a command or event leaves the model at rest, and a background workspace is not
+  retiled at that point, so coverage would report violations which are staleness rather than
+  defects.
+- 2026-08-30: `Workspace::floating_windows()` returns an owned listing derived from containers
+  rather than a reference into storage. That is what makes two sources of truth impossible; the
+  cost is an allocation on a path which is not hot.
+- 2026-08-30: Floating a window no longer removes it from its container, so it no longer
+  destroys an emptied container or shifts locked container indices, and unfloating no longer
+  creates a container. This is an intended behaviour change from upstream komorebi.
+- 2026-08-30: Old runtime state carrying a workspace-level `floating_windows` array is accepted
+  and ignored rather than migrated. Static configuration does not contain the field, so
+  configuration compatibility is untouched.
+
 ## Progress log
 
 - 2026-08-29: Phase 0 baseline captured. No source changes existed at start. Full workspace tests
@@ -605,6 +730,17 @@ This list is updated from actual diffs, not treated as permission to change ever
   fmt and Clippy clean apart from the pre-existing upstream warning. Next phase: derived
   Active/Hidden container state, which is what makes the coverage invariant apply to active
   containers only.
+- 2026-08-30: Phase 5 turn. The plan was re-read and the worktree confirmed clean at `12c58fa9`
+  before editing, and `cargo check --workspace` was re-run as the turn's baseline. A census of the
+  three alternate ownership paths returned 309 references, so Phase 5 was split into 5A derived
+  state, 5B floating ownership, 5C minimize ownership and 5D presentation before coding. 5A made
+  container state derived and made the arrangement cover only active containers. A pre-existing
+  test race that 5A's timing exposed was fixed first, in its own commit. 5B removed the
+  workspace-level floating window list, which is the single largest ownership change in the task:
+  a floating window is now an ordinary member of a container which the container does not
+  position. Full serial workspace suite passed at every step (komorebi 190 -> 204 -> 213
+  passing); fmt and Clippy clean apart from the pre-existing upstream warning. Next phase:
+  container-owned minimized windows.
 - 2026-08-29: Phase 3 was split into 3A identity and 3B histories/invariants after call-site review
   showed that doing both together would exceed the phase review-size limit. Phase 3A added
   transparent typed workspace/container IDs, migrated managed ownership and UI integration
