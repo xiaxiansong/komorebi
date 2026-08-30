@@ -2171,7 +2171,7 @@ only from `komorebi.json`, so a monitor the configuration does not name is born 
   the arrangement invalidated. Unit tests in `workspace.rs`.
 - [x] 16B: apply it to initial adoption, behind a `window_adoption_behaviour` configuration field
   with a serde default, so the upstream one-container-per-window adoption stays reachable.
-- [ ] 16C: `default_workspace_count`, a configuration field with a serde default of four, applied
+- [x] 16C: `default_workspace_count`, a configuration field with a serde default of four, applied
   to every monitor as it is loaded and as it is connected, so the count does not depend on a
   monitor being named in the configuration. Configuration which asks for more still gets more.
 - [ ] 16D: regenerate `schema.json`, document both fields, update this plan, rebuild, install and
@@ -2213,6 +2213,20 @@ which does not mention it leaves the global alone, so a reload cannot silently r
 existing `komorebi.json` deserializes unchanged.
 
 Verification: komorebi 534 -> 537 passing, full serial suite green; `cargo fmt --check` clean;
+Clippy clean apart from the pre-existing warning.
+
+16C actual files: `komorebi/src/lib.rs`, `komorebi/src/static_config.rs`,
+`komorebi/src/windows_api.rs`, `komorebi/src/monitor.rs`.
+
+`monitor::new` was left building a monitor with one workspace and the count applied in
+`WindowsApi::load_monitor_information` instead, because that is the one place a display becomes a
+monitor komorebi holds - it is called both from `WindowManager::init` and from the reconciliator
+when a monitor is plugged in - while `monitor::new` is also the constructor a dozen tests use to
+build a monitor value. `ensure_workspace_count` only grows a list, so configuration naming more
+workspaces still gets them and a monitor restored from the cache keeps what it had. A configured
+count of zero is stored as one: a monitor with no workspace has nowhere to put a window.
+
+Verification: komorebi 537 -> 539 passing, full serial suite green; `cargo fmt --check` clean;
 Clippy clean apart from the pre-existing warning.
 
 ## Provisional affected-file inventory

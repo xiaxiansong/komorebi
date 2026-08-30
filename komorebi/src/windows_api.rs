@@ -160,6 +160,7 @@ use windows_core::HSTRING;
 
 use crate::core::Rect;
 
+use crate::DEFAULT_WORKSPACE_COUNT;
 use crate::DISPLAY_INDEX_PREFERENCES;
 use crate::DUPLICATE_MONITOR_SERIAL_IDS;
 use crate::MONITOR_INDEX_PREFERENCES;
@@ -332,7 +333,7 @@ impl WindowsApi {
                 }
             }
 
-            let m = monitor::new(
+            let mut m = monitor::new(
                 display.hmonitor,
                 display.size.into(),
                 display.work_area_size.into(),
@@ -340,6 +341,14 @@ impl WindowsApi {
                 device,
                 device_id,
                 display.serial_number_id,
+            );
+
+            // Every monitor komorebi learns about comes through here, at startup and when one is
+            // plugged in, so this is where the workspace count stops depending on the monitor
+            // being named in the configuration. Configuration asking for more is applied later and
+            // only grows the list further.
+            m.ensure_workspace_count(
+                DEFAULT_WORKSPACE_COUNT.load(std::sync::atomic::Ordering::SeqCst),
             );
 
             let mut index_preference = None;

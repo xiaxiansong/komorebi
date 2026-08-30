@@ -7,6 +7,7 @@ use crate::DEFAULT_FLOATING_MOVE_DELTA;
 use crate::DEFAULT_FLOATING_RESIZE_DELTA;
 use crate::DEFAULT_MOUSE_FOLLOWS_FOCUS;
 use crate::DEFAULT_RESIZE_DELTA;
+use crate::DEFAULT_WORKSPACE_COUNT;
 use crate::DEFAULT_WORKSPACE_PADDING;
 use crate::DISPLAY_INDEX_PREFERENCES;
 use crate::FLOATING_APPLICATIONS;
@@ -522,6 +523,11 @@ pub struct StaticConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schemars", schemars(extend("default" = WindowAdoptionBehaviour::SingleContainer)))]
     pub window_adoption_behaviour: Option<WindowAdoptionBehaviour>,
+    /// Number of workspaces to create on every monitor, including monitors which this
+    /// configuration does not name (default: 4)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(extend("default" = 4)))]
+    pub default_workspace_count: Option<usize>,
     /// Enable or disable float override, which makes it so every new window opens in floating mode
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schemars", schemars(extend("default" = false)))]
@@ -900,6 +906,7 @@ impl From<&WindowManager> for StaticConfig {
                 value.window_management_behaviour.current_behaviour,
             ),
             window_adoption_behaviour: Option::from(WINDOW_ADOPTION_BEHAVIOUR.load()),
+            default_workspace_count: Option::from(DEFAULT_WORKSPACE_COUNT.load(Ordering::SeqCst)),
             float_override: Option::from(value.window_management_behaviour.float_override),
             floating_layer_behaviour: Option::from(
                 value.window_management_behaviour.floating_layer_behaviour,
@@ -1021,6 +1028,12 @@ impl StaticConfig {
         // this one: the desktop has already been adopted.
         if let Some(behaviour) = self.window_adoption_behaviour {
             WINDOW_ADOPTION_BEHAVIOUR.store(behaviour);
+        }
+
+        // Applied as each monitor is loaded, so a monitor which arrives later gets the same count
+        // as the ones which were there at startup.
+        if let Some(count) = self.default_workspace_count {
+            DEFAULT_WORKSPACE_COUNT.store(count.max(1), Ordering::SeqCst);
         }
 
         if let Some(height) = self.minimum_window_height {
@@ -2030,7 +2043,9 @@ fn handle_asc_file(
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
 
+    use crate::DEFAULT_WORKSPACE_COUNT;
     use crate::StaticConfig;
     use crate::WINDOW_ADOPTION_BEHAVIOUR;
     use crate::WindowAdoptionBehaviour;
@@ -2155,5 +2170,27 @@ mod tests {
         );
 
         WINDOW_ADOPTION_BEHAVIOUR.store(restore);
+    }
+
+    #[test]
+    fn a_workspace_count_reaches_the_global_every_monitor_is_given() {
+        let restore = DEFAULT_WORKSPACE_COUNT.load(Ordering::SeqCst);
+
+        let config = serde_json::from_str::<StaticConfig>("{}").unwrap();
+        assert_eq!(config.default_workspace_count, None);
+
+        let mut config =
+            serde_json::from_str::<StaticConfig>(r#"{ "default_workspace_count": 7 }"#).unwrap();
+        config.apply_globals().unwrap();
+        assert_eq!(DEFAULT_WORKSPACE_COUNT.load(Ordering::SeqCst), 7);
+
+        // A monitor with no workspace has nowhere to put a window, so zero is not a count this
+        // can be set to.
+        let mut config =
+            serde_json::from_str::<StaticConfig>(r#"{ "default_workspace_count": 0 }"#).unwrap();
+        config.apply_globals().unwrap();
+        assert_eq!(DEFAULT_WORKSPACE_COUNT.load(Ordering::SeqCst), 1);
+
+        DEFAULT_WORKSPACE_COUNT.store(restore, Ordering::SeqCst);
     }
 }

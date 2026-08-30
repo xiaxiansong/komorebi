@@ -56,6 +56,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 pub use command_outcome::*;
@@ -256,6 +257,13 @@ lazy_static! {
         Arc::new(Mutex::new(HashMap::new()));
 }
 
+/// The number of workspaces a monitor is given when komorebi learns about it.
+///
+/// A monitor the configuration does not name - one plugged in later, or one whose device ID has
+/// changed - would otherwise arrive with the single workspace `monitor::new` builds, so the count
+/// belongs here rather than only in `komorebi.json`. Configuration which asks for more still gets
+/// more: `ensure_workspace_count` only ever grows a monitor's list.
+pub static DEFAULT_WORKSPACE_COUNT: AtomicUsize = AtomicUsize::new(4);
 pub static DEFAULT_WORKSPACE_PADDING: AtomicI32 = AtomicI32::new(10);
 pub static DEFAULT_CONTAINER_PADDING: AtomicI32 = AtomicI32::new(10);
 pub static DEFAULT_RESIZE_DELTA: i32 = 50;

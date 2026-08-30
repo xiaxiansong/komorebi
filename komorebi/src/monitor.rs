@@ -1792,4 +1792,28 @@ mod tests {
         m.ensure_workspace_count(3);
         assert_eq!(m.workspaces().len(), 5, "Monitor should have 5 workspaces");
     }
+
+    #[test]
+    fn a_monitor_opens_with_the_default_number_of_empty_workspaces() {
+        let mut m = Monitor::new(
+            0,
+            Rect::default(),
+            Rect::default(),
+            "TestMonitor".to_string(),
+            "TestDevice".to_string(),
+            "TestDeviceID".to_string(),
+            None,
+        );
+
+        // What every monitor gets as komorebi learns about it, in
+        // `WindowsApi::load_monitor_information`.
+        m.ensure_workspace_count(crate::DEFAULT_WORKSPACE_COUNT.load(Ordering::SeqCst));
+
+        assert_eq!(m.workspaces().len(), 4);
+        assert_eq!(m.focused_workspace_idx(), 0);
+
+        for workspace in m.workspaces() {
+            assert!(workspace.containers().is_empty());
+        }
+    }
 }
