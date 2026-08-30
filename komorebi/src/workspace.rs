@@ -2673,6 +2673,37 @@ impl Workspace {
         Ok(changed)
     }
 
+    /// Bring an owned window's recorded presentation into agreement with what Win32 reports.
+    ///
+    /// A user can restore a maximized window without asking komorebi - the title bar, the system
+    /// menu, a keyboard shortcut the application handles itself - and the record has to follow, or
+    /// the next retile maximizes the window again over a user who just asked for the opposite.
+    ///
+    /// Only the presentation changes. The window keeps its container, its stack position, its
+    /// placement, its visibility and both histories, so this cannot move a container between
+    /// Active and Hidden and does not disturb the arrangement; the caller retiles because the
+    /// window now needs to be drawn differently, not because the slots moved.
+    pub fn reconcile_window_presentation(
+        &mut self,
+        hwnd: isize,
+        observed: Presentation,
+        observed_rect: Option<Rect>,
+    ) -> bool {
+        let Some(container_idx) = self.container_idx_for_window(hwnd) else {
+            return false;
+        };
+
+        let Some(container) = self.containers_mut().get_mut(container_idx) else {
+            return false;
+        };
+
+        let Some(window_idx) = container.idx_for_window(hwnd) else {
+            return false;
+        };
+
+        container.windows_mut()[window_idx].adopt_presentation(observed, observed_rect)
+    }
+
     /// Raise the window under the top of the focused container's stack and focus it.
     ///
     /// This is the operator's way through a stack which does not disturb its order: the raised
@@ -7298,6 +7329,56 @@ mod tests {
         // A maximized window is still a visible stored window, so its container keeps its slot.
         assert!(workspace.containers()[0].is_active());
         assert_eq!(workspace.active_container_count(), 1);
+    }
+
+    #[test]
+    fn a_window_restored_outside_komorebi_stops_being_recorded_as_maximized() {
+        let mut workspace = workspace_with_stack(&[1, 2]);
+        let container_id = workspace.containers()[0].id.clone();
+        workspace.maximize_window(1).unwrap();
+
+        assert!(workspace.reconcile_window_presentation(1, Presentation::Normal, None));
+
+        let container = &workspace.containers()[0];
+        assert_eq!(container.windows()[0].presentation, Presentation::Normal);
+        // Only the presentation moved: the window is where it was, in the container it was in.
+        assert_eq!(container.id, container_id);
+        assert_eq!(
+            container
+                .windows()
+                .iter()
+                .map(|w| w.hwnd)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(container.is_active());
+    }
+
+    #[test]
+    fn reconciling_the_same_observation_twice_only_changes_the_record_once() {
+        let mut workspace = workspace_with_stack(&[1]);
+        workspace.maximize_window(1).unwrap();
+
+        assert!(workspace.reconcile_window_presentation(1, Presentation::Normal, None));
+        assert!(!workspace.reconcile_window_presentation(1, Presentation::Normal, None));
+    }
+
+    #[test]
+    fn an_observation_does_not_maximize_a_window_komorebi_is_tiling() {
+        let mut workspace = workspace_with_stack(&[1]);
+
+        assert!(!workspace.reconcile_window_presentation(1, Presentation::Maximized, None));
+        assert_eq!(
+            workspace.containers()[0].windows()[0].presentation,
+            Presentation::Normal
+        );
+    }
+
+    #[test]
+    fn reconciling_a_window_this_workspace_does_not_own_changes_nothing() {
+        let mut workspace = workspace_with_stack(&[1]);
+
+        assert!(!workspace.reconcile_window_presentation(99, Presentation::Normal, None));
     }
 
     #[test]

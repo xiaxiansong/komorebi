@@ -493,6 +493,11 @@ impl WindowManager {
         ) && !event.window().is_miminized()
         {
             self.unminimize_managed_window(event.window().hwnd)?;
+
+            // The same reconciliation for the other dimension of a window's state. A user can
+            // restore a maximized window without asking komorebi, and a record which does not
+            // follow makes the next retile maximize the window again over them.
+            self.reconcile_managed_window_presentation(event.window().hwnd)?;
         }
 
         self.enforce_workspace_rules()?;
@@ -565,6 +570,11 @@ impl WindowManager {
                         }
                     }
 
+                    // A minimize is trusted as reported rather than confirmed against
+                    // `IsIconic` here. The confirmation is not reliably true yet at
+                    // `EVENT_SYSTEM_MINIMIZESTART`, and a minimize which the user undid before the
+                    // event was processed already converges: restoring the window produces a show
+                    // or focus event, and the reconciliation above marks it visible again.
                     if user_minimized {
                         // Minimizing is a visibility change, not a removal: the window keeps its
                         // container, its stack position and its histories, and the container it

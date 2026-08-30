@@ -37,6 +37,56 @@ pub enum Presentation {
     Fullscreen,
 }
 
+impl Presentation {
+    /// Fold a Win32 observation into a presentation.
+    ///
+    /// The precedence is the one [`ManagedWindow::from_observed`] uses when a window is first
+    /// managed, and it is not arbitrary: `WindowsApi::is_fullscreen` refuses a maximized window,
+    /// so the two observations cannot both be true for the same window.
+    #[must_use]
+    pub const fn observed(maximized: bool, fullscreen: bool) -> Self {
+        if fullscreen {
+            Self::Fullscreen
+        } else if maximized {
+            Self::Maximized
+        } else {
+            Self::Normal
+        }
+    }
+
+    /// The presentation this record should become given an observation of the live window, or
+    /// `None` when the observation changes nothing.
+    ///
+    /// Only one of the two observations is ever believed, and only in one direction.
+    ///
+    /// `is_zoomed` is a window state which Windows sets synchronously, so an observation that a
+    /// window komorebi recorded as maximized is no longer maximized is a fact about the user or
+    /// the application, not a race with komorebi's own call. Not believing it is what made
+    /// komorebi re-maximize, at the next retile, a window the user had just restored by hand.
+    ///
+    /// Fullscreen is a rectangle rather than a window state, and it is the rectangle komorebi
+    /// itself writes when it puts a window fullscreen. An observation which disagrees with a
+    /// fullscreen record therefore cannot tell "the application left fullscreen" apart from "the
+    /// rectangle has not landed yet", so it is never acted on; and an observation which agrees
+    /// with no record cannot tell an application's own fullscreen apart from a window which simply
+    /// fills its monitor. Both are left to the commands which own the presentation.
+    ///
+    /// Entering `Maximized` from `Normal` is not believed either. A tiled window is not maximized
+    /// by hand in a tiling window manager, the retile already restores one which is, and believing
+    /// it here would undo a command: an application which still reports itself maximized shortly
+    /// after komorebi unmaximized it would drag the record straight back.
+    #[must_use]
+    pub const fn reconcile(self, observed: Self) -> Option<Self> {
+        match (self, observed) {
+            // A window which komorebi recorded as maximized is not maximized any more.
+            (Self::Maximized, Self::Normal | Self::Fullscreen) => Some(Self::Normal),
+            // A window which komorebi put fullscreen has been maximized out of it.
+            (Self::Fullscreen, Self::Maximized) => Some(Self::Maximized),
+            _ => None,
+        }
+    }
+}
+
 /// Why a floating geometry command did not act on a window.
 ///
 /// These are refusals rather than failures: the command found a window and decided it was the
@@ -337,6 +387,42 @@ impl ManagedWindow {
         true
     }
 
+    /// Bring the recorded presentation into agreement with what Win32 reports, changing nothing
+    /// else about the window.
+    ///
+    /// This is not a command: the window is already where the observation says it is, so no Win32
+    /// call is made and no rectangle is applied. Ownership, placement, visibility and stack
+    /// position are untouched, which is what makes running it again for the same observation a
+    /// no-op rather than a toggle.
+    ///
+    /// A floating window's rectangle follows the observation, because the record is where the last
+    /// commanded geometry was stored and a window which left a presentation by itself has just
+    /// chosen a new one.
+    pub fn adopt_presentation(
+        &mut self,
+        observed: Presentation,
+        observed_rect: Option<Rect>,
+    ) -> bool {
+        let Some(target) = self.presentation.reconcile(observed) else {
+            return false;
+        };
+
+        self.presentation = target;
+
+        if target == Presentation::Normal {
+            self.restore_rect = None;
+        }
+
+        if self.placement == ManagedPlacement::Floating
+            && target == Presentation::Normal
+            && let Some(rect) = observed_rect
+        {
+            self.floating_rect = Some(rect);
+        }
+
+        true
+    }
+
     /// Return the rectangle to apply after leaving maximized or fullscreen presentation.
     pub fn set_normal(&mut self, stored_rect: Rect) -> Option<Rect> {
         if self.presentation == Presentation::Normal {
@@ -405,6 +491,103 @@ mod tests {
         assert_eq!(window.floating_rect, Some(rect(2)));
         assert_eq!(window.visibility, Visibility::Minimized);
         assert_eq!(window.presentation, Presentation::Maximized);
+    }
+
+    #[test]
+    fn an_observation_folds_into_a_presentation_with_fullscreen_winning() {
+        assert_eq!(Presentation::observed(false, false), Presentation::Normal);
+        assert_eq!(Presentation::observed(true, false), Presentation::Maximized);
+        assert_eq!(
+            Presentation::observed(false, true),
+            Presentation::Fullscreen
+        );
+        assert_eq!(Presentation::observed(true, true), Presentation::Fullscreen);
+    }
+
+    #[test]
+    fn an_agreeing_observation_changes_nothing() {
+        for presentation in [
+            Presentation::Normal,
+            Presentation::Maximized,
+            Presentation::Fullscreen,
+        ] {
+            assert_eq!(presentation.reconcile(presentation), None);
+        }
+    }
+
+    #[test]
+    fn a_window_which_stopped_being_maximized_returns_to_normal() {
+        assert_eq!(
+            Presentation::Maximized.reconcile(Presentation::Normal),
+            Some(Presentation::Normal)
+        );
+        assert_eq!(
+            Presentation::Maximized.reconcile(Presentation::Fullscreen),
+            Some(Presentation::Normal)
+        );
+    }
+
+    #[test]
+    fn a_fullscreen_window_which_was_maximized_out_of_it_follows() {
+        assert_eq!(
+            Presentation::Fullscreen.reconcile(Presentation::Maximized),
+            Some(Presentation::Maximized)
+        );
+    }
+
+    #[test]
+    fn an_observation_never_starts_a_presentation_komorebi_did_not_command() {
+        // The retile restores a tiled window which was maximized by hand, and a fullscreen
+        // rectangle cannot be told apart from one komorebi wrote itself.
+        assert_eq!(
+            Presentation::Normal.reconcile(Presentation::Maximized),
+            None
+        );
+        assert_eq!(
+            Presentation::Normal.reconcile(Presentation::Fullscreen),
+            None
+        );
+        assert_eq!(
+            Presentation::Fullscreen.reconcile(Presentation::Normal),
+            None
+        );
+    }
+
+    #[test]
+    fn adopting_an_observation_keeps_everything_but_the_presentation() {
+        let mut window = managed();
+        window.set_maximized(rect(1));
+
+        assert!(window.adopt_presentation(Presentation::Normal, Some(rect(5))));
+
+        assert_eq!(window.presentation, Presentation::Normal);
+        assert_eq!(window.container_id, "container-1");
+        assert_eq!(window.placement, ManagedPlacement::Stored);
+        assert_eq!(window.visibility, Visibility::Visible);
+        assert_eq!(window.restore_rect, None);
+        // A stored window returns to its container's slot, so nothing here records a rectangle.
+        assert_eq!(window.floating_rect, None);
+    }
+
+    #[test]
+    fn adopting_the_same_observation_twice_changes_nothing_the_second_time() {
+        let mut window = managed();
+        window.set_maximized(rect(1));
+
+        assert!(window.adopt_presentation(Presentation::Normal, None));
+        assert!(!window.adopt_presentation(Presentation::Normal, None));
+    }
+
+    #[test]
+    fn a_floating_window_which_left_a_presentation_keeps_the_rectangle_it_landed_on() {
+        let mut window = managed();
+        window.set_floating(rect(2));
+        window.set_maximized(rect(2));
+
+        assert!(window.adopt_presentation(Presentation::Normal, Some(rect(7))));
+
+        assert_eq!(window.placement, ManagedPlacement::Floating);
+        assert_eq!(window.floating_rect, Some(rect(7)));
     }
 
     #[test]

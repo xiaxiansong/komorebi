@@ -24,7 +24,10 @@ use uds_windows::UnixStream;
 
 use crate::animation::ANIMATION_ENABLED_GLOBAL;
 use crate::animation::ANIMATION_ENABLED_PER_ANIMATION;
+use crate::animation::ANIMATION_MANAGER;
 use crate::animation::AnimationEngine;
+use crate::animation::prefix::AnimationPrefix;
+use crate::animation::prefix::new_animation_key;
 use crate::core::Arrangement;
 use crate::core::Axis;
 use crate::core::BorderImplementation;
@@ -892,6 +895,62 @@ impl WindowManager {
         }
 
         Ok(true)
+    }
+
+    /// Bring a managed window's recorded presentation into agreement with Win32, wherever it is
+    /// owned.
+    ///
+    /// Called from the event path for the events which mean "this window is in a settled visible
+    /// state", so a user who restored a maximized window by hand is followed rather than fought.
+    /// Returns whether the record changed, so a repeated observation does not cause a repeated
+    /// retile.
+    ///
+    /// A window which is being animated is left alone: its rectangle is somewhere between where it
+    /// was and where komorebi is putting it, and no observation taken there says anything about
+    /// what the user wants.
+    pub fn reconcile_managed_window_presentation(&mut self, hwnd: isize) -> eyre::Result<bool> {
+        let Some((monitor_idx, workspace_idx)) = self.managed_window_location(hwnd) else {
+            return Ok(false);
+        };
+
+        if Self::window_is_animating(hwnd) {
+            return Ok(false);
+        }
+
+        let window = Window::from(hwnd);
+        let observed =
+            Presentation::observed(window.is_maximized(), WindowsApi::is_fullscreen(hwnd));
+        let observed_rect = WindowsApi::window_rect(hwnd).ok();
+
+        let workspace = self
+            .monitors_mut()
+            .get_mut(monitor_idx)
+            .and_then(|monitor| monitor.workspaces_mut().get_mut(workspace_idx))
+            .ok_or_eyre("there is no workspace")?;
+
+        if !workspace.reconcile_window_presentation(hwnd, observed, observed_rect) {
+            return Ok(false);
+        }
+
+        tracing::info!("window {hwnd} left the presentation komorebi had recorded for it");
+
+        if self
+            .monitors()
+            .get(monitor_idx)
+            .is_some_and(|monitor| monitor.focused_workspace_idx() == workspace_idx)
+        {
+            self.update_focused_workspace_by_monitor_idx(monitor_idx)?;
+        }
+
+        Ok(true)
+    }
+
+    /// Whether komorebi is currently moving this window itself.
+    fn window_is_animating(hwnd: isize) -> bool {
+        ANIMATION_MANAGER.lock().in_progress(&new_animation_key(
+            AnimationPrefix::Movement,
+            hwnd.to_string(),
+        ))
     }
 
     /// Restore the window most recently minimized on the focused workspace.
@@ -6030,6 +6089,34 @@ mod tests {
         }
 
         (wm, context)
+    }
+
+    #[test]
+    fn reconciling_presentation_follows_a_window_which_left_maximized() {
+        let (mut wm, _test_context) = window_manager_with_container(&[42, 43]);
+        let workspace = wm.focused_workspace_mut().unwrap();
+        workspace.maximize_window(42).unwrap();
+        let container_id = workspace.containers()[0].id.clone();
+
+        // These handles name no real window, so Win32 reports neither maximized nor fullscreen:
+        // exactly what a user who has restored the window by hand leaves behind.
+        assert!(wm.reconcile_managed_window_presentation(42).unwrap());
+
+        let workspace = wm.focused_workspace().unwrap();
+        let container = &workspace.containers()[0];
+        assert_eq!(container.windows()[0].presentation, Presentation::Normal);
+        assert_eq!(container.id, container_id);
+        assert_eq!(wm.managed_window_location(42), Some((0, 0)));
+
+        // The record now agrees with the observation, so nothing happens the second time.
+        assert!(!wm.reconcile_managed_window_presentation(42).unwrap());
+    }
+
+    #[test]
+    fn reconciling_presentation_ignores_a_window_komorebi_does_not_own() {
+        let (mut wm, _test_context) = window_manager_with_container(&[42]);
+
+        assert!(!wm.reconcile_managed_window_presentation(9999).unwrap());
     }
 
     #[test]

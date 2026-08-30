@@ -1806,7 +1806,7 @@ question.
 
 - [x] 14A: reclaim a suspended handle Windows has reused, and clear every per-window runtime table
   when a window is reaped rather than destroyed.
-- [ ] 14B: converge the model's presentation with a maximize or restore the user performed outside
+- [x] 14B: converge the model's presentation with a maximize or restore the user performed outside
   komorebi, idempotently and without changing placement or ownership.
 - [ ] 14C: complete the state output with the derived fields a consumer cannot compute, and version
   it so an older state document is recognised rather than silently misread.
@@ -1878,8 +1878,50 @@ Verification: `komorebi` lib tests 491 -> 503 passing, full workspace suite seri
 
 #### Phase 14B - External presentation convergence
 
-Expected handwritten change: 200-300 lines. Likely files: `process_event.rs`, `workspace.rs`,
-`window_manager.rs`, `window_manager_event.rs`.
+Since Phase 5D the model has owned a window's presentation, and the retile reapplies it. Nothing
+reads it back. A user who restores a maximized window the way every Windows user does - the title
+bar, the system menu, the application's own shortcut - was therefore fighting komorebi, which
+maximized the window again at the next retile and reported it as maximized until a command said
+otherwise.
+
+- [x] Add `Presentation::observed` and `Presentation::reconcile`: a pure rule from a Win32
+  observation and a record to the presentation the record should become.
+- [x] Add `ManagedWindow::adopt_presentation`, which applies that rule to the model alone and
+  touches nothing else about the window.
+- [x] Reconcile from the event path, next to the existing restore-from-minimize reconciliation, for
+  the events which mean the window is in a settled visible state.
+- [x] Leave a window alone while komorebi is animating it.
+- [x] Add rule-table, idempotence, ownership-preservation and unowned-window tests.
+- [x] Commit as `feat: follow a window out of a presentation komorebi recorded`.
+
+Actual files: `komorebi/src/managed_window.rs`, `komorebi/src/workspace.rs`,
+`komorebi/src/window_manager.rs`, `komorebi/src/process_event.rs`.
+
+Which observation to believe is the whole phase. Only the maximized state bit is ever acted on, and
+only in the direction of leaving what komorebi recorded.
+
+`is_zoomed` is a window state which Windows sets synchronously, so "komorebi recorded maximized and
+the window is not maximized" is a fact about the user rather than a race with komorebi's own call.
+Fullscreen is a *rectangle*, and it is the rectangle komorebi itself writes: an observation which
+disagrees with a fullscreen record cannot tell "the application left fullscreen" apart from "the
+rectangle has not landed yet", and one which agrees with no record cannot tell an application's own
+fullscreen apart from a window which simply fills its monitor. Acting on either would make
+komorebi's own fullscreen command flap, so neither is acted on. Entering maximized from normal is
+not believed either: the retile already restores a tiled window which was maximized by hand, and
+believing it here would let an application which is slow to drop its maximized state undo an
+unmaximize command.
+
+A window komorebi is animating is skipped, because its rectangle is somewhere between where it was
+and where komorebi is putting it and no observation taken there means anything.
+
+The minimize event was left trusting its own report rather than confirming it against `IsIconic`.
+The confirmation is not reliably true yet at `EVENT_SYSTEM_MINIMIZESTART`, and the case it would
+have caught already converges without it: restoring a window produces a show or focus event, and
+the reconciliation which runs there marks the window visible again.
+
+Verification: `komorebi` lib tests 503 -> 517 passing, full workspace suite serial and green.
+`cargo fmt --check` and `cargo clippy --workspace --all-targets` clean apart from the pre-existing
+`items after a test module` warning.
 
 #### Phase 14C - State output completeness and versioning
 
