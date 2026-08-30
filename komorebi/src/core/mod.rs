@@ -102,6 +102,14 @@ pub enum SocketMessage {
     SendContainerToMonitorWorkspaceNumber(usize, usize),
     MoveContainerToMonitorWorkspaceNumber(usize, usize),
     SendContainerToNamedWorkspace(String),
+    /// Send the focused window to the workspace with this stable ID, and follow it if asked.
+    ///
+    /// The window goes to the top of the stack of the target's most recently focused active
+    /// container, or into a container of its own when the target has no active container.
+    MoveWindowToWorkspaceId(String, bool),
+    /// Send the focused window to the top of the stack of the container with this stable ID, and
+    /// follow it if asked.
+    MoveWindowToContainerId(String, bool),
     CycleMoveWorkspaceToMonitor(CycleDirection),
     MoveWorkspaceToMonitorNumber(usize),
     SwapWorkspacesToMonitorNumber(usize),

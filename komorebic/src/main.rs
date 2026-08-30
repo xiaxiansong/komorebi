@@ -387,6 +387,24 @@ struct Resize {
 }
 
 #[derive(Parser)]
+struct MoveToWorkspaceId {
+    /// Stable ID of the target workspace, as reported by komorebic state
+    id: String,
+    /// Follow the window to its new workspace
+    #[clap(long)]
+    follow: bool,
+}
+
+#[derive(Parser)]
+struct MoveToContainerId {
+    /// Stable ID of the target container, as reported by komorebic state
+    id: String,
+    /// Follow the window to its new container
+    #[clap(long)]
+    follow: bool,
+}
+
+#[derive(Parser)]
 struct CreateContainer {
     /// Dividing line for the split [default: the donor's longer edge]
     #[clap(value_enum)]
@@ -1469,6 +1487,12 @@ enum SubCommand {
     ToggleLock,
     /// Restore all hidden windows (debugging command)
     RestoreWindows,
+    /// Send the focused window to the workspace with the specified stable ID
+    #[clap(arg_required_else_help = true)]
+    MoveToWorkspaceId(MoveToWorkspaceId),
+    /// Send the focused window to the container with the specified stable ID
+    #[clap(arg_required_else_help = true)]
+    MoveToContainerId(MoveToContainerId),
     /// Split a new container off the most recently focused container with windows to spare
     CreateContainer(CreateContainer),
     /// Destroy the focused container, sharing its windows out among the containers which remain
@@ -3298,6 +3322,18 @@ if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
         }
         SubCommand::MergeWorkspace => {
             send_command(&SocketMessage::MergeFocusedWorkspace)?;
+        }
+        SubCommand::MoveToWorkspaceId(args) => {
+            send_command(&SocketMessage::MoveWindowToWorkspaceId(
+                args.id,
+                args.follow,
+            ))?;
+        }
+        SubCommand::MoveToContainerId(args) => {
+            send_command(&SocketMessage::MoveWindowToContainerId(
+                args.id,
+                args.follow,
+            ))?;
         }
         SubCommand::CreateContainer(args) => {
             send_command(&SocketMessage::CreateContainer(args.axis))?;

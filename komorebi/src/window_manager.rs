@@ -68,6 +68,8 @@ use crate::invariants::ValidateInvariants;
 use crate::load_configuration;
 use crate::managed_window::FloatingRejection;
 use crate::managed_window::Presentation;
+use crate::model::ContainerId;
+use crate::model::WorkspaceId;
 use crate::monitor::Monitor;
 use crate::monitor::WorkspaceReorder;
 use crate::ring::Ring;
@@ -912,6 +914,212 @@ impl WindowManager {
         window.focus(self.mouse_follows_focus)?;
 
         Ok(Some(hwnd))
+    }
+
+    /// Where the workspace with this stable ID lives, as (monitor, workspace) indices.
+    ///
+    /// An index is a position in a list which reordering, merging and monitor moves all change; an
+    /// ID is what a caller can hold on to between two commands.
+    pub fn workspace_location_by_id(&self, id: &WorkspaceId) -> Option<(usize, usize)> {
+        self.monitors().iter().enumerate().find_map(|(m, monitor)| {
+            monitor
+                .workspaces()
+                .iter()
+                .position(|workspace| workspace.id == *id)
+                .map(|w| (m, w))
+        })
+    }
+
+    /// Where the container with this stable ID lives, as (monitor, workspace, container) indices.
+    pub fn container_location_by_id(&self, id: &ContainerId) -> Option<(usize, usize, usize)> {
+        self.monitors().iter().enumerate().find_map(|(m, monitor)| {
+            monitor
+                .workspaces()
+                .iter()
+                .enumerate()
+                .find_map(|(w, workspace)| workspace.container_idx_for_id(id).map(|c| (m, w, c)))
+        })
+    }
+
+    /// Send the focused window to the workspace with this stable ID.
+    ///
+    /// With no container named, the window goes to the workspace's most recently focused active
+    /// container, and to a container of its own when the workspace has no active container to
+    /// receive it - including when the workspace is empty.
+    pub fn send_focused_window_to_workspace_id(
+        &mut self,
+        id: &WorkspaceId,
+        follow: bool,
+    ) -> eyre::Result<CommandResponse> {
+        let Some(target) = self.workspace_location_by_id(id) else {
+            return Ok(CommandResponse::new(
+                CommandOutcome::NoTarget,
+                format!("there is no workspace {id}"),
+            ));
+        };
+
+        self.transfer_focused_window(target, None, follow)
+    }
+
+    /// Send the focused window to the top of the stack of the container with this stable ID.
+    pub fn send_focused_window_to_container_id(
+        &mut self,
+        id: &ContainerId,
+        follow: bool,
+    ) -> eyre::Result<CommandResponse> {
+        let Some((monitor_idx, workspace_idx, _)) = self.container_location_by_id(id) else {
+            return Ok(CommandResponse::new(
+                CommandOutcome::NoTarget,
+                format!("there is no container {id}"),
+            ));
+        };
+
+        self.transfer_focused_window((monitor_idx, workspace_idx), Some(id.clone()), follow)
+    }
+
+    /// Move the focused window to another workspace, and optionally into a named container there.
+    ///
+    /// The move is planned on copies of the two workspaces and validated before either is written
+    /// back, so a transfer which would strand a window or leave an empty container behind changes
+    /// nothing at all. Only once the model has been accepted is the desktop told about it, and
+    /// focus moves with the window only when the caller asked for it: a move made by a rule in the
+    /// background must not take focus away from what the user is doing.
+    fn transfer_focused_window(
+        &mut self,
+        target: (usize, usize),
+        container: Option<ContainerId>,
+        follow: bool,
+    ) -> eyre::Result<CommandResponse> {
+        let source = (self.focused_monitor_idx(), self.focused_workspace_idx()?);
+
+        let Some(hwnd) = self
+            .focused_workspace()?
+            .focused_container()
+            .and_then(|container| container.focused_window().map(|window| window.hwnd))
+        else {
+            return Ok(CommandResponse::new(
+                CommandOutcome::NoTarget,
+                "there is no focused window to send",
+            ));
+        };
+
+        if source == target && container.is_none() {
+            return Ok(CommandResponse::new(
+                CommandOutcome::NoOp,
+                "the window is already on this workspace",
+            ));
+        }
+
+        if let Some(id) = &container
+            && self
+                .focused_workspace()?
+                .container_for_window(hwnd)
+                .is_some_and(|owner| owner.id == *id)
+        {
+            return Ok(CommandResponse::new(
+                CommandOutcome::NoOp,
+                format!("the window is already in container {id}"),
+            ));
+        }
+
+        let mut source_workspace = self.workspace_at(source)?.clone();
+        let mut target_workspace = if source == target {
+            None
+        } else {
+            Some(self.workspace_at(target)?.clone())
+        };
+
+        let window = match source_workspace.take_window(hwnd) {
+            Ok(window) => window,
+            Err(error) => {
+                return Ok(CommandResponse::new(
+                    CommandOutcome::NoTarget,
+                    error.to_string(),
+                ));
+            }
+        };
+
+        {
+            let receiving = target_workspace.as_mut().unwrap_or(&mut source_workspace);
+
+            let receiving_idx = match &container {
+                Some(id) => receiving.container_idx_for_id(id),
+                None => receiving.active_container_idx_for_geometry(),
+            };
+
+            match receiving_idx {
+                Some(idx) => {
+                    receiving
+                        .containers_mut()
+                        .get_mut(idx)
+                        .ok_or_eyre("the receiving container disappeared")?
+                        .add_managed_window(window);
+                    receiving.focus_container(idx);
+                }
+                // A workspace with no active container to receive the window - an empty one, or
+                // one whose containers are all hidden - is given a container of its own for it.
+                None => receiving.adopt_managed_window(window),
+            }
+        }
+
+        let mut violations = source_workspace.validate_invariants();
+        if let Some(workspace) = &target_workspace {
+            violations.extend(workspace.validate_invariants());
+        }
+
+        if !violations.is_empty() {
+            return Ok(CommandResponse::from_violations(&violations));
+        }
+
+        *self.workspace_at_mut(source)? = source_workspace;
+        if let Some(workspace) = target_workspace {
+            *self.workspace_at_mut(target)? = workspace;
+        }
+
+        self.known_hwnds.insert(hwnd, target);
+
+        let mouse_follows_focus = self.mouse_follows_focus;
+
+        if follow {
+            self.focus_monitor(target.0)?;
+            self.focus_workspace(target.1)?;
+        }
+
+        for monitor_idx in [source.0, target.0] {
+            if !follow || monitor_idx != target.0 {
+                self.monitors_mut()
+                    .get_mut(monitor_idx)
+                    .ok_or_eyre("there is no monitor")?
+                    .load_focused_workspace(mouse_follows_focus)?;
+                self.update_focused_workspace_by_monitor_idx(monitor_idx)?;
+            }
+        }
+
+        if follow {
+            Window::from(hwnd).focus(mouse_follows_focus)?;
+        }
+
+        Ok(CommandResponse::new(
+            CommandOutcome::Success,
+            format!(
+                "sent hwnd {hwnd} to monitor {} workspace {}",
+                target.0, target.1
+            ),
+        ))
+    }
+
+    fn workspace_at(&self, location: (usize, usize)) -> eyre::Result<&Workspace> {
+        self.monitors()
+            .get(location.0)
+            .and_then(|monitor| monitor.workspaces().get(location.1))
+            .ok_or_eyre("there is no workspace at that location")
+    }
+
+    fn workspace_at_mut(&mut self, location: (usize, usize)) -> eyre::Result<&mut Workspace> {
+        self.monitors_mut()
+            .get_mut(location.0)
+            .and_then(|monitor| monitor.workspaces_mut().get_mut(location.1))
+            .ok_or_eyre("there is no workspace at that location")
     }
 
     /// Apply a change to a copy of the focused workspace, validate it, and commit it only if the
@@ -4684,7 +4892,6 @@ mod tests {
     use crate::WorkspaceMatchingRule;
     use crate::geometry::LogicalRect;
     use crate::managed_window::Visibility;
-    use crate::model::ContainerId;
     use crate::monitor;
     use crossbeam_channel::Sender;
     use crossbeam_channel::bounded;
@@ -5152,6 +5359,146 @@ mod tests {
 
         assert!(!wm.suspend_managed_window(42).unwrap());
         assert!(wm.temporarily_unmanaged_hwnds.contains(&42));
+    }
+
+    /// A monitor with two workspaces, the first holding one container with these windows.
+    fn window_manager_with_two_workspaces(hwnds: &[isize]) -> (WindowManager, TestContext) {
+        let (mut wm, context) = setup_window_manager();
+        let mut monitor = monitor_with_workspaces(0, 2);
+
+        let mut container = Container::default();
+        for hwnd in hwnds {
+            container.windows_mut().push_back(Window::from(*hwnd));
+        }
+
+        monitor
+            .workspaces_mut()
+            .get_mut(0)
+            .unwrap()
+            .add_container_to_back(container);
+
+        monitor.focus_workspace(0).unwrap();
+        wm.monitors_mut().push_back(monitor);
+
+        for hwnd in hwnds {
+            wm.known_hwnds.insert(*hwnd, (0, 0));
+        }
+
+        (wm, context)
+    }
+
+    #[test]
+    fn sending_a_window_to_a_workspace_which_does_not_exist_refuses() {
+        let (mut wm, _test_context) = window_manager_with_two_workspaces(&[42]);
+
+        let response = wm
+            .send_focused_window_to_workspace_id(&WorkspaceId::from("nowhere"), false)
+            .unwrap();
+
+        assert_eq!(response.outcome, CommandOutcome::NoTarget);
+        assert!(wm.monitors()[0].workspaces()[0].contains_window(42));
+    }
+
+    #[test]
+    fn sending_a_window_to_the_workspace_it_is_already_on_is_a_no_op() {
+        let (mut wm, _test_context) = window_manager_with_two_workspaces(&[42]);
+        let here = wm.monitors()[0].workspaces()[0].id.clone();
+
+        let response = wm
+            .send_focused_window_to_workspace_id(&here, false)
+            .unwrap();
+
+        assert_eq!(response.outcome, CommandOutcome::NoOp);
+        assert!(wm.monitors()[0].workspaces()[0].contains_window(42));
+    }
+
+    #[test]
+    fn a_window_sent_to_an_empty_workspace_gets_a_container_of_its_own() {
+        let (mut wm, _test_context) = window_manager_with_two_workspaces(&[42, 43]);
+        let target = wm.monitors()[0].workspaces()[1].id.clone();
+
+        // The desktop work can fail without a session; the model change is what is asserted.
+        wm.send_focused_window_to_workspace_id(&target, false).ok();
+
+        // The container focuses the first window it was given, so 42 is the one that travels.
+        let monitor = &wm.monitors()[0];
+        assert!(!monitor.workspaces()[0].contains_window(42));
+        assert_eq!(monitor.workspaces()[1].containers().len(), 1);
+        assert!(monitor.workspaces()[1].contains_window(42));
+        assert_eq!(wm.known_hwnds.get(&42), Some(&(0, 1)));
+
+        // The window komorebi was not asked to move stays exactly where it was.
+        assert!(monitor.workspaces()[0].contains_window(43));
+    }
+
+    #[test]
+    fn a_window_sent_without_follow_leaves_the_focus_where_it_was() {
+        let (mut wm, _test_context) = window_manager_with_two_workspaces(&[42, 43]);
+        let target = wm.monitors()[0].workspaces()[1].id.clone();
+
+        wm.send_focused_window_to_workspace_id(&target, false).ok();
+
+        assert_eq!(wm.monitors()[0].focused_workspace_idx(), 0);
+    }
+
+    #[test]
+    fn a_window_sent_to_a_container_joins_the_top_of_its_stack() {
+        let (mut wm, _test_context) = window_manager_with_two_workspaces(&[42, 43]);
+
+        let target = {
+            let mut container = Container::default();
+            container.windows_mut().push_back(Window::from(50));
+            let id = container.id.clone();
+            wm.monitors_mut()[0]
+                .workspaces_mut()
+                .get_mut(1)
+                .unwrap()
+                .add_container_to_back(container);
+            id
+        };
+
+        wm.send_focused_window_to_container_id(&target, false).ok();
+
+        let receiving = &wm.monitors()[0].workspaces()[1].containers()[0];
+        assert_eq!(
+            receiving
+                .windows()
+                .iter()
+                .map(|window| window.hwnd)
+                .collect::<Vec<_>>(),
+            vec![50, 42],
+            "the arriving window should be on top of the stack"
+        );
+        assert_eq!(receiving.focused_window().unwrap().hwnd, 42);
+    }
+
+    #[test]
+    fn sending_a_window_to_the_container_which_already_owns_it_is_a_no_op() {
+        let (mut wm, _test_context) = window_manager_with_two_workspaces(&[42, 43]);
+        let owner = wm.monitors()[0].workspaces()[0].containers()[0].id.clone();
+
+        let response = wm
+            .send_focused_window_to_container_id(&owner, false)
+            .unwrap();
+
+        assert_eq!(response.outcome, CommandOutcome::NoOp);
+        assert_eq!(
+            wm.monitors()[0].workspaces()[0].containers()[0]
+                .windows()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn an_emptied_source_container_does_not_survive_the_transfer() {
+        let (mut wm, _test_context) = window_manager_with_two_workspaces(&[42]);
+        let target = wm.monitors()[0].workspaces()[1].id.clone();
+
+        wm.send_focused_window_to_workspace_id(&target, false).ok();
+
+        assert!(wm.monitors()[0].workspaces()[0].containers().is_empty());
+        assert!(wm.monitors()[0].workspaces()[1].contains_window(42));
     }
 
     #[test]

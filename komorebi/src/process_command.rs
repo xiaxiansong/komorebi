@@ -77,6 +77,8 @@ use crate::core::config_generation::IdWithIdentifier;
 use crate::core::config_generation::MatchingRule;
 use crate::core::config_generation::MatchingStrategy;
 use crate::current_virtual_desktop;
+use crate::model::ContainerId;
+use crate::model::WorkspaceId;
 use crate::monitor::MonitorInformation;
 use crate::notify_subscribers;
 use crate::stackbar_manager;
@@ -1930,6 +1932,16 @@ if (!(Get-Process komorebi-bar -ErrorAction SilentlyContinue))
             }
             SocketMessage::MergeFocusedWorkspace => {
                 let response = self.merge_focused_workspace_command()?;
+                Self::respond(&mut reply, &response);
+            }
+            SocketMessage::MoveWindowToWorkspaceId(ref id, follow) => {
+                let response = self
+                    .send_focused_window_to_workspace_id(&WorkspaceId::from(id.clone()), follow)?;
+                Self::respond(&mut reply, &response);
+            }
+            SocketMessage::MoveWindowToContainerId(ref id, follow) => {
+                let response = self
+                    .send_focused_window_to_container_id(&ContainerId::from(id.clone()), follow)?;
                 Self::respond(&mut reply, &response);
             }
             SocketMessage::CreateContainer(axis) => {
