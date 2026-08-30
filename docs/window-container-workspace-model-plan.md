@@ -1390,15 +1390,56 @@ Verification: `komorebi` lib tests 400 -> 406 passing, full workspace suite seri
 
 ### Phase 11 - Cross-monitor container/workspace migration
 
-- [ ] Move/swap complete containers while recomputing target slots and DPI render geometry.
-- [ ] Translate and clamp floating rectangles between monitor work areas.
-- [ ] Move workspaces without leaving a monitor empty; retain workspace ID/name.
-- [ ] Preserve Hidden state without creating active slots and implement explicit focus-follow rules.
-- [ ] Add mixed-DPI, empty/occupied target, Hidden, atomic-failure, and focus tests.
-- [ ] Commit as `feat: preserve model across monitor migrations`.
+Split into 11A, 11B and 11C on 2026-08-30, before coding, for the same review-size reason as the
+earlier phases. The three concerns are what happens to a rectangle which no slot describes, what
+happens to a container which arrives from somewhere else, and the window manager wiring which has
+to take one side apart and put the other together without a step in between that could fail.
 
-Expected handwritten change: 300-500 lines. Likely files: `monitor.rs`, `workspace.rs`,
-`window_manager.rs`, `monitor_reconciliator/mod.rs`, `windows_api.rs`.
+The phase's hazard is that a monitor transfer crosses a coordinate system. Every stored rectangle
+in the model is in physical pixels on one monitor's work area: a logical slot, a floating
+rectangle, a manual resize dimension. A slot is recalculated on arrival and a manual resize is
+discarded, so the only rectangle which has to be carried across is the floating one - and it is
+the only rectangle the arrangement will never correct, because nothing else ever writes it.
+
+#### Phase 11A - Floating rectangles across work areas
+
+- [ ] Add a pure work-area transfer to `floating_geometry`: position and size scale with the ratio
+  between the areas, then the result is clamped into the target with the existing rule.
+- [ ] Apply it across a container and across a whole workspace, touching only stored floating
+  rectangles and nothing else about a window.
+- [ ] Add identity, mixed-DPI, clamping, and untouched-stored-window tests.
+- [ ] Commit as `feat: carry floating rectangles between work areas`.
+
+Expected handwritten change: 150-250 lines. Likely files: `floating_geometry.rs`, `container.rs`,
+`workspace.rs`.
+
+#### Phase 11B - Container adoption by a foreign workspace
+
+- [ ] Add adoption on `Workspace`: an arriving container fills an empty workspace, halves the
+  geometry-focused active container's slot when the workspace is occupied, and takes no slot at all
+  when it arrives Hidden.
+- [ ] Keep the container's ID, stack, window states and window focus history, and carry its
+  floating rectangles into the target work area.
+- [ ] Add the `Monitor` transfer which removes with absorption on one side and adopts on the other,
+  atomically.
+- [ ] Add empty-target, occupied-target 50:50, Hidden, preservation, absorption and refusal tests.
+- [ ] Commit as `feat: adopt containers into a foreign workspace`.
+
+Expected handwritten change: 250-400 lines. Likely files: `workspace.rs`, `monitor.rs`.
+
+#### Phase 11C - Workspace migration and window manager wiring
+
+- [ ] Refuse to move a monitor's last workspace, and move the index-keyed name/last-focused tables
+  and the global application rules with the workspace, as the ordering phase does.
+- [ ] Rewire `move_container_to_monitor` onto the adoption path so a whole container moves rather
+  than the foreground window the desktop happened to report.
+- [ ] Rewire `move_workspace_to_monitor` and the monitor workspace swap onto the transfer, keeping
+  workspace IDs and names and translating floating rectangles into the target work area.
+- [ ] Add end-to-end transfer, last-workspace refusal, rule-remap, Hidden and focus-follow tests.
+- [ ] Commit as `feat: preserve the model across monitor migrations`.
+
+Expected handwritten change: 300-450 lines. Likely files: `monitor.rs`, `window_manager.rs`,
+`process_command.rs`.
 
 ### Phase 12 - Socket protocol and komorebic CLI
 

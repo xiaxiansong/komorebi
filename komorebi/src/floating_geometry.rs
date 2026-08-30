@@ -216,6 +216,49 @@ pub fn plan_edge_resize(
     resized
 }
 
+/// Carry a floating rectangle from one work area to another.
+///
+/// A floating rectangle is the only rectangle in the model which no arrangement will ever correct,
+/// so it is the only one which has to survive a monitor transfer by being rewritten. Slots are
+/// recalculated on arrival and manual resize dimensions are discarded, but a floating window keeps
+/// exactly the rectangle it is given.
+///
+/// Position and size are both scaled by the ratio between the areas, so a window occupying the
+/// middle third of a 1920-wide work area occupies the middle third of a 2560-wide one, and it does
+/// not shrink to a quarter of the screen when it lands on a display with twice the pixels. The
+/// result is then clamped into the target, which is what makes the window reachable on arrival
+/// even when the target is smaller than the source.
+///
+/// A transfer between identical areas is the identity, and a degenerate source area - one with no
+/// width or no height, which a disconnected monitor can briefly report - leaves the size alone and
+/// only clamps, because there is no meaningful ratio to scale by.
+#[must_use]
+pub fn transfer_between_areas(rect: Rect, from: Rect, to: Rect) -> Rect {
+    if from == to {
+        return rect;
+    }
+
+    let scale = |value: i32, numerator: i32, denominator: i32| -> i32 {
+        if denominator == 0 {
+            return value;
+        }
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+        {
+            ((value as f32) * (numerator as f32) / (denominator as f32)).round() as i32
+        }
+    };
+
+    let transferred = Rect {
+        left: to.left + scale(rect.left - from.left, to.right, from.right),
+        top: to.top + scale(rect.top - from.top, to.bottom, from.bottom),
+        right: scale(rect.right, to.right, from.right).max(1),
+        bottom: scale(rect.bottom, to.bottom, from.bottom).max(1),
+    };
+
+    clamp_position(transferred, FloatingBounds::new(to))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,5 +593,98 @@ mod tests {
 
         assert_eq!(unscaled.left - start.left, 50);
         assert_eq!(scaled.left - start.left, 75);
+    }
+
+    const SECOND_AREA: Rect = Rect {
+        left: 1920,
+        top: 0,
+        right: 2560,
+        bottom: 1400,
+    };
+
+    #[test]
+    fn a_transfer_between_identical_areas_changes_nothing() {
+        let start = rect(400, 300, 800, 600);
+
+        assert_eq!(transfer_between_areas(start, AREA, AREA), start);
+    }
+
+    #[test]
+    fn a_transfer_keeps_the_window_in_the_same_relative_place() {
+        // The window occupies the middle third of the source area horizontally.
+        let start = rect(640, 0, 640, 520);
+
+        let transferred = transfer_between_areas(start, AREA, SECOND_AREA);
+
+        // And the middle third of the target, in the target's own coordinates.
+        assert_eq!(transferred.left, SECOND_AREA.left + 853);
+        assert_eq!(transferred.right, 853);
+        // Half the height of the source becomes half the height of the target.
+        assert_eq!(transferred.top, SECOND_AREA.top);
+        assert_eq!(transferred.bottom, 700);
+    }
+
+    #[test]
+    fn a_transfer_onto_a_smaller_area_keeps_the_window_reachable() {
+        let small = rect(0, 0, 800, 600);
+        let start = rect(1600, 900, 300, 200);
+
+        let transferred = transfer_between_areas(start, AREA, small);
+
+        assert!(transferred.left >= small.left);
+        assert!(transferred.top >= small.top);
+        assert!(transferred.left + transferred.right <= small.left + small.right);
+        assert!(transferred.top + transferred.bottom <= small.top + small.bottom);
+    }
+
+    #[test]
+    fn a_transfer_clamps_a_window_which_cannot_fit_the_target() {
+        let narrow = Rect {
+            left: 0,
+            top: 0,
+            right: 200,
+            bottom: 200,
+        };
+
+        // A window wider than the target after scaling still leaves a grabbable strip inside it.
+        let start = rect(0, 0, 1920, 1040);
+        let transferred = transfer_between_areas(start, AREA, narrow);
+
+        assert!(transferred.left <= narrow.left + narrow.right - MIN_VISIBLE_EXTENT);
+        assert!(transferred.left + transferred.right >= narrow.left + MIN_VISIBLE_EXTENT);
+        // The top edge may never rise above the work area, because the title bar is there.
+        assert!(transferred.top >= narrow.top);
+    }
+
+    #[test]
+    fn a_transfer_from_a_degenerate_area_only_clamps() {
+        let degenerate = Rect {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+
+        let start = rect(100, 100, 400, 300);
+        let transferred = transfer_between_areas(start, degenerate, AREA);
+
+        assert_eq!(transferred.right, start.right);
+        assert_eq!(transferred.bottom, start.bottom);
+    }
+
+    #[test]
+    fn a_transferred_window_never_collapses_to_nothing() {
+        let tiny = Rect {
+            left: 0,
+            top: 0,
+            right: 4,
+            bottom: 4,
+        };
+
+        let start = rect(0, 0, 100, 100);
+        let transferred = transfer_between_areas(start, AREA, tiny);
+
+        assert!(transferred.right >= 1);
+        assert!(transferred.bottom >= 1);
     }
 }

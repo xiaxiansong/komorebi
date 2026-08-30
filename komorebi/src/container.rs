@@ -9,6 +9,8 @@ use serde::Deserializer;
 use serde::Serialize;
 
 use crate::Lockable;
+use crate::core::Rect;
+use crate::floating_geometry;
 use crate::focus_history::Mru;
 use crate::managed_window::ManagedPlacement;
 use crate::managed_window::ManagedWindow;
@@ -394,6 +396,27 @@ impl Container {
             .elements_mut()
             .iter_mut()
             .filter(|window| window.placement == ManagedPlacement::Floating)
+    }
+
+    /// Carry every floating rectangle this container holds from one work area to another.
+    ///
+    /// Only stored floating rectangles change. A window's placement, visibility, presentation and
+    /// position in the stack are untouched, and a window which has never floated has no rectangle
+    /// to carry: it will be given one by the work area it is in when it first floats.
+    ///
+    /// A stored window needs nothing done to it, because its rectangle comes from a slot which the
+    /// receiving workspace is about to recalculate in its own coordinates.
+    pub fn transfer_floating_rects(&mut self, from: Rect, to: Rect) {
+        if from == to {
+            return;
+        }
+
+        for window in self.floating_windows_mut() {
+            if let Some(rect) = window.floating_rect {
+                window.floating_rect =
+                    Some(floating_geometry::transfer_between_areas(rect, from, to));
+            }
+        }
     }
 
     pub fn hwnd_from_exe(&self, exe: &str) -> Option<isize> {

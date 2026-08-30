@@ -2652,6 +2652,23 @@ impl Workspace {
         }
     }
 
+    /// Carry every floating rectangle in this workspace from one work area to another.
+    ///
+    /// A workspace which changes monitor changes coordinate system, and a floating rectangle is
+    /// the only rectangle it holds which nothing else will correct: slots are recalculated for the
+    /// new work area and manual resize dimensions are discarded, but a floating window is shown
+    /// exactly where its own rectangle says. Carrying them is therefore what stops a floating
+    /// window being left behind on the monitor its workspace came from.
+    pub fn transfer_floating_rects(&mut self, from: Rect, to: Rect) {
+        if from == to {
+            return;
+        }
+
+        for container in self.containers_mut() {
+            container.transfer_floating_rects(from, to);
+        }
+    }
+
     /// The window a floating geometry command acts on.
     ///
     /// This is the focused window, and only the focused window. It is deliberately not
@@ -3871,6 +3888,7 @@ mod tests {
     use super::*;
     use crate::Window;
     use crate::container::Container;
+    use crate::floating_geometry;
     use crate::geometry::SlotOrder;
     use crate::managed_window::Presentation;
     use std::collections::HashMap;
@@ -4069,6 +4087,84 @@ mod tests {
         workspace.focus_container(0);
 
         workspace
+    }
+
+    #[test]
+    fn transferring_a_workspace_carries_its_floating_rectangles_into_the_new_area() {
+        let mut workspace = workspace_with_a_focused_floating_window();
+        let from = work_area(1920, 1080);
+        let to = Rect {
+            left: 1920,
+            top: 0,
+            right: 2560,
+            bottom: 1440,
+        };
+
+        workspace.transfer_floating_rects(from, to);
+
+        let carried = workspace.containers()[0].windows()[0]
+            .floating_rect
+            .unwrap();
+
+        // The rectangle is expressed in the target's coordinates and stays inside it.
+        assert!(carried.left >= to.left);
+        assert!(carried.left + carried.right <= to.left + to.right);
+        assert_eq!(
+            carried,
+            floating_geometry::transfer_between_areas(floating_rect(100), from, to)
+        );
+    }
+
+    #[test]
+    fn transferring_a_workspace_leaves_its_stored_windows_alone() {
+        let mut workspace = workspace_with_a_focused_floating_window();
+        let stored_before = workspace.containers()[1].windows()[0].clone();
+
+        workspace.transfer_floating_rects(
+            work_area(1920, 1080),
+            Rect {
+                left: 0,
+                top: 0,
+                right: 2560,
+                bottom: 1440,
+            },
+        );
+
+        // A stored window is placed by a slot the receiving workspace recalculates, so nothing
+        // about it is rewritten here.
+        assert_eq!(workspace.containers()[1].windows()[0], stored_before);
+    }
+
+    #[test]
+    fn transferring_a_workspace_into_the_same_area_changes_nothing() {
+        let mut workspace = workspace_with_a_focused_floating_window();
+        let area = work_area(1920, 1080);
+        let before = workspace.clone();
+
+        workspace.transfer_floating_rects(area, area);
+
+        assert_eq!(workspace, before);
+    }
+
+    #[test]
+    fn a_window_which_has_never_floated_gets_no_rectangle_from_a_transfer() {
+        let mut workspace = workspace_with_containers(&[1]);
+
+        workspace.transfer_floating_rects(
+            work_area(1920, 1080),
+            Rect {
+                left: 0,
+                top: 0,
+                right: 2560,
+                bottom: 1440,
+            },
+        );
+
+        assert!(
+            workspace.containers()[0].windows()[0]
+                .floating_rect
+                .is_none()
+        );
     }
 
     #[test]
