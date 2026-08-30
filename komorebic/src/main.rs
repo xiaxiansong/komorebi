@@ -405,6 +405,15 @@ struct MoveToContainerId {
 }
 
 #[derive(Parser)]
+struct MoveWindowToMonitor {
+    /// Target monitor index (zero-indexed)
+    target: usize,
+    /// Follow the window to its new monitor
+    #[clap(long)]
+    follow: bool,
+}
+
+#[derive(Parser)]
 struct CreateContainer {
     /// Dividing line for the split [default: the donor's longer edge]
     #[clap(value_enum)]
@@ -1496,6 +1505,9 @@ enum SubCommand {
     /// Send the focused window to the container with the specified stable ID
     #[clap(arg_required_else_help = true)]
     MoveToContainerId(MoveToContainerId),
+    /// Send the focused window to the focused workspace of another monitor
+    #[clap(arg_required_else_help = true)]
+    MoveWindowToMonitor(MoveWindowToMonitor),
     /// Split a new container off the most recently focused container with windows to spare
     CreateContainer(CreateContainer),
     /// Destroy the focused container, sharing its windows out among the containers which remain
@@ -3332,6 +3344,12 @@ if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
         SubCommand::MoveToWorkspaceId(args) => {
             send_command(&SocketMessage::MoveWindowToWorkspaceId(
                 args.id,
+                args.follow,
+            ))?;
+        }
+        SubCommand::MoveWindowToMonitor(args) => {
+            send_command(&SocketMessage::MoveWindowToMonitorNumber(
+                args.target,
                 args.follow,
             ))?;
         }

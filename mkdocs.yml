@@ -142,6 +142,7 @@ nav:
       - cli/move-to-named-workspace.md
       - cli/move-to-workspace-id.md
       - cli/move-to-container-id.md
+      - cli/move-window-to-monitor.md
       - cli/cycle-move-to-workspace.md
       - cli/send-to-monitor.md
       - cli/cycle-send-to-monitor.md

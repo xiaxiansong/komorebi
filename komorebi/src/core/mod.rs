@@ -115,6 +115,11 @@ pub enum SocketMessage {
     /// Send the focused window to the top of the stack of the container with this stable ID, and
     /// follow it if asked.
     MoveWindowToContainerId(String, bool),
+    /// Send the focused window to the focused workspace of the monitor at this index.
+    ///
+    /// Deliberately distinct from `MoveContainerToMonitorNumber`, which takes a whole container
+    /// across. The boolean is whether focus follows the window.
+    MoveWindowToMonitorNumber(usize, bool),
     CycleMoveWorkspaceToMonitor(CycleDirection),
     MoveWorkspaceToMonitorNumber(usize),
     SwapWorkspacesToMonitorNumber(usize),
@@ -941,6 +946,10 @@ mod tests {
             (
                 SocketMessage::RaiseNextStackWindow,
                 r#"{"type":"RaiseNextStackWindow"}"#,
+            ),
+            (
+                SocketMessage::MoveWindowToMonitorNumber(1, true),
+                r#"{"type":"MoveWindowToMonitorNumber","content":[1,true]}"#,
             ),
         ];
 

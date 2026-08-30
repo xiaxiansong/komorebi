@@ -1725,6 +1725,42 @@ Verification: `komorebi` lib tests 478 -> 487 passing, full workspace suite seri
 `cargo fmt --check` and `cargo clippy --workspace --all-targets` clean apart from the pre-existing
 `items after a test module` warning.
 
+#### Phase 12G - Window-level monitor transfer
+
+Added on 2026-08-30 by the same Phase 13 audit. Task section 12 requires crossing a monitor
+boundary to be an explicit "send this window to that monitor" command rather than something a
+repeated move falls into, and section 20 asks for a shortcut which does it, but every existing
+monitor command - `move-to-monitor`, `send-to-monitor` and their cycling forms - moves a whole
+container. A window sharing a stack had no way to travel alone.
+
+- [x] Add `WindowManager::send_focused_window_to_monitor`, reusing the validated two-workspace
+  transfer Phase 12E built.
+- [x] Rewrite a travelling floating rectangle into the receiving work area when the transfer
+  crosses a monitor boundary.
+- [x] Add `SocketMessage::MoveWindowToMonitorNumber(usize, bool)` and the
+  `komorebic move-window-to-monitor <TARGET> [--follow]` subcommand.
+- [x] Add refusal, no-op, arrival, focus-follow and floating-rectangle tests.
+- [x] Commit as `feat: send a single window to another monitor`.
+
+Actual files: `komorebi/src/window_manager.rs`, `komorebi/src/core/mod.rs`,
+`komorebi/src/process_command.rs`, `komorebic/src/main.rs`, new
+`docs/cli/move-window-to-monitor.md`, `mkdocs.yml`.
+
+The floating rectangle fix is the phase's substance rather than the command. `transfer_focused_window`
+has been able to cross monitors since Phase 12E, because a workspace ID names a workspace on any
+monitor, but it carried the floating rectangle across unchanged - the one rectangle in the model
+which no arrangement on the receiving side will ever correct. Phase 11A settled what to do about
+that for containers and workspaces; this applies the same rule to a single window, so the
+window-level command and the older ID-addressed one now agree.
+
+The target is the destination monitor's *focused* workspace, which is what a shortcut means by
+"the other monitor", and `--follow` separates an operator's move from a rule's move as it does
+everywhere else.
+
+Verification: `komorebi` lib tests 487 -> 491 passing, full workspace suite serial and green.
+`cargo fmt --check` and `cargo clippy --workspace --all-targets` clean apart from the pre-existing
+`items after a test module` warning.
+
 ### Phase 13 - AutoHotkey v2 workflow
 
 - [ ] Add a directly runnable AHK v2 example using top-level executable/config/delta variables and

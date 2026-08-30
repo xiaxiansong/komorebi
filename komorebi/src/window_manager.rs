@@ -63,6 +63,7 @@ use crate::current_virtual_desktop;
 use crate::floating_geometry::FloatingBounds;
 use crate::floating_geometry::FloatingLimits;
 use crate::floating_geometry::scale_delta;
+use crate::floating_geometry::transfer_between_areas;
 use crate::geometry::SplitAxis;
 use crate::invariants::ValidateInvariants;
 use crate::load_configuration;
@@ -1002,6 +1003,29 @@ impl WindowManager {
         self.transfer_focused_window((monitor_idx, workspace_idx), Some(id.clone()), follow)
     }
 
+    /// Send the focused window to the focused workspace of another monitor.
+    ///
+    /// This is deliberately a different command from `move-to-monitor`, which takes a whole
+    /// container across: a window which shares a stack with others has no way to travel alone
+    /// otherwise, and the task requires crossing a monitor boundary to be an explicit command
+    /// rather than something a repeated move falls into.
+    pub fn send_focused_window_to_monitor(
+        &mut self,
+        monitor_idx: usize,
+        follow: bool,
+    ) -> eyre::Result<CommandResponse> {
+        let Some(monitor) = self.monitors().get(monitor_idx) else {
+            return Ok(CommandResponse::new(
+                CommandOutcome::NoTarget,
+                format!("there is no monitor {monitor_idx}"),
+            ));
+        };
+
+        let workspace_idx = monitor.focused_workspace_idx();
+
+        self.transfer_focused_window((monitor_idx, workspace_idx), None, follow)
+    }
+
     /// Move the focused window to another workspace, and optionally into a named container there.
     ///
     /// The move is planned on copies of the two workspaces and validated before either is written
@@ -1054,7 +1078,7 @@ impl WindowManager {
             Some(self.workspace_at(target)?.clone())
         };
 
-        let window = match source_workspace.take_window(hwnd) {
+        let mut window = match source_workspace.take_window(hwnd) {
             Ok(window) => window,
             Err(error) => {
                 return Ok(CommandResponse::new(
@@ -1063,6 +1087,27 @@ impl WindowManager {
                 ));
             }
         };
+
+        // A floating rectangle is the only rectangle travelling with the window which no
+        // arrangement will correct on the other side, so a transfer across a monitor boundary has
+        // to rewrite it into the receiving work area. Everything else the window carries is
+        // independent of where it is.
+        if source.0 != target.0
+            && let Some(rect) = window.floating_rect
+        {
+            let from = self
+                .monitors()
+                .get(source.0)
+                .ok_or_eyre("there is no monitor")?
+                .work_area_size;
+            let to = self
+                .monitors()
+                .get(target.0)
+                .ok_or_eyre("there is no monitor")?
+                .work_area_size;
+
+            window.floating_rect = Some(transfer_between_areas(rect, from, to));
+        }
 
         {
             let receiving = target_workspace.as_mut().unwrap_or(&mut source_workspace);
@@ -5524,6 +5569,99 @@ mod tests {
 
         assert!(wm.monitors()[0].workspaces()[0].containers().is_empty());
         assert!(wm.monitors()[0].workspaces()[1].contains_window(42));
+    }
+
+    /// Two monitors with distinct work areas, the focused one holding these windows.
+    fn window_manager_with_two_monitors(hwnds: &[isize]) -> (WindowManager, TestContext) {
+        let (mut wm, context) = setup_window_manager();
+
+        let mut first = monitor_with_area(0, 1, transfer_area(0, 1000, 1000));
+        let mut container = Container::default();
+        for hwnd in hwnds {
+            container.windows_mut().push_back(Window::from(*hwnd));
+        }
+        first.workspaces_mut()[0].add_container_to_back(container);
+
+        wm.monitors_mut().push_back(first);
+        wm.monitors_mut()
+            .push_back(monitor_with_area(1, 1, transfer_area(1000, 2000, 2000)));
+        wm.monitors.focus(0);
+
+        for hwnd in hwnds {
+            wm.known_hwnds.insert(*hwnd, (0, 0));
+        }
+
+        (wm, context)
+    }
+
+    #[test]
+    fn sending_a_window_to_a_monitor_which_does_not_exist_refuses() {
+        let (mut wm, _test_context) = window_manager_with_two_monitors(&[42]);
+
+        let response = wm.send_focused_window_to_monitor(9, false).unwrap();
+
+        assert_eq!(response.outcome, CommandOutcome::NoTarget);
+        assert!(wm.monitors()[0].workspaces()[0].contains_window(42));
+    }
+
+    #[test]
+    fn sending_a_window_to_the_monitor_it_is_already_on_is_a_no_op() {
+        let (mut wm, _test_context) = window_manager_with_two_monitors(&[42]);
+
+        let response = wm.send_focused_window_to_monitor(0, false).unwrap();
+
+        assert_eq!(response.outcome, CommandOutcome::NoOp);
+        assert!(wm.monitors()[0].workspaces()[0].contains_window(42));
+    }
+
+    #[test]
+    fn a_window_sent_to_another_monitor_lands_on_its_focused_workspace() {
+        let (mut wm, _test_context) = window_manager_with_two_monitors(&[42, 43]);
+
+        // The desktop work can fail without a session; the model change is what is asserted.
+        wm.send_focused_window_to_monitor(1, false).ok();
+
+        // The container focuses the first window it was given, so 42 is the one that travels.
+        assert!(!wm.monitors()[0].workspaces()[0].contains_window(42));
+        assert!(wm.monitors()[1].workspaces()[0].contains_window(42));
+        assert_eq!(wm.known_hwnds.get(&42), Some(&(1, 0)));
+        assert_eq!(
+            wm.focused_monitor_idx(),
+            0,
+            "a send without follow leaves the operator where they were"
+        );
+        assert!(wm.monitors()[0].workspaces()[0].contains_window(43));
+    }
+
+    #[test]
+    fn a_floating_window_sent_to_another_monitor_is_rewritten_into_its_work_area() {
+        let (mut wm, _test_context) = window_manager_with_two_monitors(&[42]);
+
+        let floating = Rect {
+            left: 100,
+            top: 100,
+            right: 200,
+            bottom: 200,
+        };
+
+        wm.monitors_mut()[0].workspaces_mut()[0].containers_mut()[0].windows_mut()[0]
+            .set_floating(floating);
+
+        wm.send_focused_window_to_monitor(1, false).ok();
+
+        let arrived = wm.monitors()[1].workspaces()[0].containers()[0].windows()[0]
+            .floating_rect
+            .expect("the window should still be floating");
+
+        assert_eq!(
+            arrived,
+            transfer_between_areas(
+                floating,
+                transfer_area(0, 1000, 1000),
+                transfer_area(1000, 2000, 2000)
+            ),
+            "the rectangle nothing else will correct is the one a monitor transfer rewrites"
+        );
     }
 
     #[test]

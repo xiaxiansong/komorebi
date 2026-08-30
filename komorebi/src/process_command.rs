@@ -1943,6 +1943,10 @@ if (!(Get-Process komorebi-bar -ErrorAction SilentlyContinue))
                     .send_focused_window_to_workspace_id(&WorkspaceId::from(id.clone()), follow)?;
                 Self::respond(&mut reply, &response);
             }
+            SocketMessage::MoveWindowToMonitorNumber(monitor_idx, follow) => {
+                let response = self.send_focused_window_to_monitor(monitor_idx, follow)?;
+                Self::respond(&mut reply, &response);
+            }
             SocketMessage::MoveWindowToContainerId(ref id, follow) => {
                 let response = self
                     .send_focused_window_to_container_id(&ContainerId::from(id.clone()), follow)?;
