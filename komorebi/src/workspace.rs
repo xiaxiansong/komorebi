@@ -2428,6 +2428,93 @@ impl Workspace {
         NewWindowPlacement::Joined(target)
     }
 
+    /// The container a manual split takes its window from.
+    ///
+    /// Container MRU order, most recent first, and only active containers holding more than one
+    /// window qualify: a hidden container has no slot to divide, and taking the only window from a
+    /// container would destroy it rather than split it. Container order is the tie-break for
+    /// containers the history has never seen, so an empty history cannot refuse an operation the
+    /// workspace can clearly perform.
+    #[must_use]
+    fn donor_container_idx(&self) -> Option<usize> {
+        let eligible = |idx: usize| {
+            self.containers()
+                .get(idx)
+                .is_some_and(|container| container.is_active() && container.windows().len() > 1)
+        };
+
+        self.container_focus_history
+            .iter()
+            .filter_map(|id| self.container_idx_for_id(id))
+            .find(|idx| eligible(*idx))
+            .or_else(|| (0..self.containers().len()).find(|idx| eligible(*idx)))
+    }
+
+    /// Split a new container off an eligible donor, moving one of the donor's windows into it.
+    ///
+    /// `axis` forces the dividing line; `None` divides the donor's longer edge. The moved window
+    /// keeps its placement, visibility, presentation and floating rectangle, so a container which
+    /// receives a floating or minimized window is created hidden and gives its half straight back
+    /// on the next reconciliation, and a donor left without a visible stored window becomes hidden
+    /// the same way. Neither is a special case here: both are the ordinary hidden transition.
+    ///
+    /// Everything which can refuse the operation is decided before anything is written, so a
+    /// refusal leaves the workspace exactly as it was.
+    pub fn create_container_from_donor(
+        &mut self,
+        axis: Option<SplitAxis>,
+    ) -> eyre::Result<ContainerId> {
+        let donor_idx = self
+            .donor_container_idx()
+            .ok_or_eyre("no active container has more than one window to give away")?;
+
+        let donor = self.containers()[donor_idx].id.clone();
+        let window_idx = self.containers()[donor_idx]
+            .donor_window_idx()
+            .ok_or_eyre("the donor container has no window to give away")?;
+
+        let mut container = Container::default();
+        let created = container.id.clone();
+
+        // The scrolling layout arranges from the focused container, so a local edit to its slots
+        // would not survive its next recalculation; it gets the rearrangement instead.
+        let split = if self.layout_follows_focus() {
+            None
+        } else {
+            self.logical_slots.plan_split(&donor, &created, axis)
+        };
+
+        if split.is_none() {
+            tracing::warn!(
+                "the slot of {donor} cannot be divided as asked; the workspace will be rearranged instead"
+            );
+        }
+
+        let window = self
+            .containers_mut()
+            .get_mut(donor_idx)
+            .and_then(|donor| donor.remove_window_by_idx(window_idx))
+            .ok_or_eyre("the donor window disappeared while it was being moved")?;
+
+        container.add_managed_window(window);
+
+        // The created container is inserted where its half actually is, and after the donor when
+        // there is no half because the arrangement is about to be recalculated.
+        let insertion_idx = match split.as_ref().map(|split| split.axis) {
+            Some(SplitAxis::LeftRight) => donor_idx,
+            Some(SplitAxis::TopBottom) | None => donor_idx + 1,
+        };
+
+        self.insert_container_at_idx(insertion_idx, container);
+
+        if let Some(split) = split {
+            self.logical_slots.apply_split(&split);
+            self.adopt_slot_geometry();
+        }
+
+        Ok(created)
+    }
+
     /// Adopt the slots as they are now as the arrangement this workspace is in.
     ///
     /// A local edit changes the slots deliberately. Without this the next reconciliation would see
@@ -5935,5 +6022,226 @@ mod tests {
 
         assert!(matches!(placement, NewWindowPlacement::NewContainer(_)));
         assert_eq!(workspace.containers().len(), 2);
+    }
+    #[test]
+    fn a_manual_split_takes_the_most_recent_window_of_the_most_recent_eligible_container() {
+        let area = work_area(1920, 1080);
+        let mut workspace = arranged_workspace(&[1, 2], area);
+        let donor_id = workspace.containers()[1].id.clone();
+
+        // The single-window container is the most recent, but it cannot give a window away.
+        workspace.focus_container(1);
+        workspace.focus_container(0);
+        workspace.containers_mut()[1].focus_window_by_hwnd(1);
+
+        let created = workspace.create_container_from_donor(None).unwrap();
+        let created_idx = workspace.container_idx_for_id(&created).unwrap();
+
+        assert_eq!(workspace.containers().len(), 3);
+        assert_eq!(workspace.containers()[created_idx].windows().len(), 1);
+        assert_eq!(
+            workspace.containers()[created_idx]
+                .windows()
+                .front()
+                .unwrap()
+                .hwnd,
+            1
+        );
+
+        let donor_idx = workspace.container_idx_for_id(&donor_id).unwrap();
+        assert_eq!(workspace.containers()[donor_idx].windows().len(), 1);
+        assert_eq!(
+            workspace.containers()[donor_idx]
+                .windows()
+                .front()
+                .unwrap()
+                .hwnd,
+            2
+        );
+        // The donor's history no longer names a window it does not own.
+        assert!(
+            !workspace.containers()[donor_idx]
+                .focus_history()
+                .contains(&1)
+        );
+    }
+
+    #[test]
+    fn a_manual_split_halves_the_donor_slot_and_focuses_the_new_container() {
+        let area = work_area(1920, 1080);
+        let mut workspace = arranged_workspace(&[2], area);
+        let donor_id = workspace.containers()[0].id.clone();
+
+        let created = workspace.create_container_from_donor(None).unwrap();
+
+        assert_eq!(
+            slot_of(&workspace, &created),
+            LogicalRect::new(0, 0, 960, 1080)
+        );
+        assert_eq!(
+            slot_of(&workspace, &donor_id),
+            LogicalRect::new(960, 0, 960, 1080)
+        );
+        assert_eq!(
+            workspace
+                .logical_slots
+                .validate_coverage(LogicalRect::from(area)),
+            Ok(())
+        );
+        assert_eq!(workspace.focused_container().unwrap().id, created);
+        assert_eq!(
+            workspace.container_focus_history.most_recent(),
+            Some(&created)
+        );
+    }
+
+    #[test]
+    fn a_forced_axis_divides_the_donor_the_other_way() {
+        let area = work_area(1920, 1080);
+        let mut workspace = arranged_workspace(&[2], area);
+        let donor_id = workspace.containers()[0].id.clone();
+
+        let created = workspace
+            .create_container_from_donor(Some(SplitAxis::TopBottom))
+            .unwrap();
+
+        // A top/bottom split keeps the donor on top and puts the new container after it.
+        assert_eq!(
+            slot_of(&workspace, &donor_id),
+            LogicalRect::new(0, 0, 1920, 540)
+        );
+        assert_eq!(
+            slot_of(&workspace, &created),
+            LogicalRect::new(0, 540, 1920, 540)
+        );
+        assert_eq!(workspace.containers()[1].id, created);
+    }
+
+    #[test]
+    fn a_manual_split_is_refused_atomically_without_an_eligible_donor() {
+        let area = work_area(1920, 1080);
+        let mut workspace = arranged_workspace(&[1, 1], area);
+        let before = workspace.clone();
+
+        assert!(workspace.create_container_from_donor(None).is_err());
+
+        assert_eq!(workspace.containers(), before.containers());
+        assert_eq!(
+            workspace.logical_slots.ordered(SlotOrder::TopToBottom),
+            before.logical_slots.ordered(SlotOrder::TopToBottom)
+        );
+        assert_eq!(
+            workspace.container_focus_history,
+            before.container_focus_history
+        );
+    }
+
+    #[test]
+    fn a_hidden_container_is_never_the_donor() {
+        let area = work_area(1920, 1080);
+        let mut workspace = arranged_workspace(&[2, 2], area);
+
+        hide_container(&mut workspace, 0);
+        workspace.record_logical_slots(area);
+        let hidden_id = workspace.containers()[0].id.clone();
+        let active_id = workspace.containers()[1].id.clone();
+
+        // The hidden container is the most recent one, and it has two windows, but it holds no slot.
+        workspace.focus_container(0);
+
+        let created = workspace.create_container_from_donor(None).unwrap();
+        let hidden_idx = workspace.container_idx_for_id(&hidden_id).unwrap();
+
+        assert_eq!(workspace.containers()[hidden_idx].windows().len(), 2);
+        assert_eq!(
+            workspace
+                .container_idx_for_id(&active_id)
+                .map(|idx| workspace.containers()[idx].windows().len()),
+            Some(1)
+        );
+        // The half came off the active container, and the hidden one still holds no slot.
+        assert_eq!(slot_of(&workspace, &created).width, 960);
+        assert!(!workspace.logical_slots.contains(&hidden_id));
+    }
+
+    #[test]
+    fn a_split_off_floating_window_keeps_its_state_and_starts_the_container_hidden() {
+        let area = work_area(1920, 1080);
+        let mut workspace = arranged_workspace(&[2], area);
+        let donor_id = workspace.containers()[0].id.clone();
+        let floating_rect = Rect {
+            left: 10,
+            top: 20,
+            right: 300,
+            bottom: 400,
+        };
+
+        workspace.float_window(1, floating_rect).unwrap();
+        workspace.containers_mut()[0].focus_window_by_hwnd(1);
+
+        let created = workspace.create_container_from_donor(None).unwrap();
+        let created_idx = workspace.container_idx_for_id(&created).unwrap();
+        let moved = workspace.containers()[created_idx].windows()[0].clone();
+
+        // Only the window's container changed.
+        assert_eq!(moved.hwnd, 1);
+        assert_eq!(moved.placement, ManagedPlacement::Floating);
+        assert_eq!(moved.floating_rect, Some(floating_rect));
+        assert_eq!(moved.container_id, created);
+
+        // The container it landed in has no visible stored window, so it is hidden, and the next
+        // reconciliation hands its half back to the donor through the ordinary absorption.
+        assert!(workspace.containers()[created_idx].is_hidden());
+        workspace.record_logical_slots(area);
+
+        assert!(!workspace.logical_slots.contains(&created));
+        assert_eq!(slot_of(&workspace, &donor_id), LogicalRect::from(area));
+        assert!(workspace.hidden_slot_restores.contains_key(&created));
+    }
+
+    #[test]
+    fn a_donor_left_without_a_visible_stored_window_becomes_hidden() {
+        let area = work_area(1920, 1080);
+        let mut workspace = arranged_workspace(&[2], area);
+        let donor_id = workspace.containers()[0].id.clone();
+
+        // The window which stays behind is minimized, so the donor keeps a window but no slot.
+        workspace.containers_mut()[0]
+            .windows_mut()
+            .iter_mut()
+            .next()
+            .unwrap()
+            .set_minimized();
+        workspace.containers_mut()[0].focus_window_by_hwnd(1);
+
+        let created = workspace.create_container_from_donor(None).unwrap();
+        workspace.record_logical_slots(area);
+
+        let donor_idx = workspace.container_idx_for_id(&donor_id).unwrap();
+        assert!(workspace.containers()[donor_idx].is_hidden());
+        assert_eq!(workspace.containers()[donor_idx].windows().len(), 1);
+        assert!(!workspace.logical_slots.contains(&donor_id));
+        assert_eq!(slot_of(&workspace, &created), LogicalRect::from(area));
+    }
+
+    #[test]
+    fn a_manual_split_gives_away_the_window_the_donor_names() {
+        let area = work_area(1920, 1080);
+        let mut workspace = arranged_workspace(&[3], area);
+
+        let expected = workspace.containers()[0].donor_window_idx().unwrap();
+        let expected_hwnd = workspace.containers()[0].windows()[expected].hwnd;
+
+        let created = workspace.create_container_from_donor(None).unwrap();
+        let created_idx = workspace.container_idx_for_id(&created).unwrap();
+
+        assert_eq!(
+            workspace.containers()[created_idx]
+                .windows()
+                .front()
+                .unwrap()
+                .hwnd,
+            expected_hwnd
+        );
     }
 }

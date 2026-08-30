@@ -883,16 +883,50 @@ surface for either, which is Phase 12.
 
 #### Phase 7C - Manual container creation from an eligible donor
 
-- [ ] Select the donor by container MRU among active containers holding at least two windows.
-- [ ] Select the window by the donor's window MRU, falling back to the top of the stack.
-- [ ] Preserve placement, visibility, presentation and floating rectangle across the move.
-- [ ] Recompute donor and new container state and route both through the Hidden transition engine.
-- [ ] Refuse atomically when no eligible donor exists, changing nothing.
-- [ ] Add auto/horizontal/vertical, MRU-selection, state-preservation, hidden-outcome and
+- [x] Select the donor by container MRU among active containers holding at least two windows.
+- [x] Select the window by the donor's window MRU, falling back to the top of the stack.
+- [x] Preserve placement, visibility, presentation and floating rectangle across the move.
+- [x] Recompute donor and new container state and route both through the Hidden transition engine.
+- [x] Refuse atomically when no eligible donor exists, changing nothing.
+- [x] Add auto/horizontal/vertical, MRU-selection, state-preservation, hidden-outcome and
   atomic-failure tests.
-- [ ] Commit as `feat: split a container from an eligible donor`.
+- [x] Commit as `feat: split a container from an eligible donor`.
 
 Expected handwritten change: 250-400 lines. Likely files: `workspace.rs`, `window_manager.rs`.
+
+Actual files: `workspace.rs` and `container.rs`. `window_manager.rs` did not need to change; the
+command surface is Phase 12. Actual Rust change: 373 added, 0 removed, about two thirds of it tests.
+
+Donor window selection is `Container::donor_window_idx`, deliberately beside
+`first_focusable_window` rather than reusing it. They answer different questions: focus selection
+must skip a minimized window because focusing one would be wrong, while a manual split may take a
+floating or a minimized window, because a container is perfectly entitled to start out hidden. Two
+functions which differ by one condition are clearer than one with a flag, and the difference is
+exactly the one this phase had to get right.
+
+Atomicity is by construction rather than by rollback. Everything which can refuse - no eligible
+donor, no window to take, a slot which cannot be divided as asked - is decided while nothing has
+been written, and the first mutation is the window's removal, after which no step can fail. This is
+the same discipline as `plan_absorption` and `plan_split`, applied to an operation which touches
+containers as well as geometry.
+
+Neither hidden outcome is a special case in the code. A new container which received a floating or
+minimized window has no visible stored window, so it is hidden by the ordinary derivation and hands
+its half straight back through the ordinary absorption on the next reconciliation, with a restore
+record which will give it back if the window is ever unfloated or restored. A donor left without a
+visible stored window becomes hidden the same way. What makes this work is that only one of the two
+can happen per split, so the reconciliation never sees an arrival and a departure at once: the
+created container's slot is written here, not discovered there.
+
+Verification: `cargo test --workspace -- --test-threads=1` passed with komorebi 312 passed/1 ignored
+(up from 300), layouts 128, bar 3. `cargo fmt --all --check` clean; `cargo clippy --workspace
+--all-targets` reported only the two pre-existing warnings; `cargo check -p komorebi --features
+schemars` passed.
+
+Phase 7 is complete: a new window is placed by the active-count threshold, and an operator can split
+a container off a donor along either axis or the longer edge. Next phase: 8, container deletion,
+window distribution and multi-neighbour resize, which reuses `plan_absorption` for the deletion
+expansion the same way this phase reused `plan_split`.
 
 ### Phase 8 - Container deletion, distribution, and multi-neighbor resize
 
@@ -1189,6 +1223,21 @@ This list is updated from actual diffs, not treated as permission to change ever
   workspace suite passed at every step (komorebi 257 -> 268 -> 278 passing); fmt and Clippy clean
   apart from the pre-existing upstream warning. Next phase: 7, new-window threshold placement and
   manual container splitting.
+- 2026-08-30: Phase 7 turn. The plan was re-read and the worktree confirmed clean at `67b8b1dd`
+  before editing, and `cargo check --workspace --all-targets` was re-run as the turn's baseline.
+  Phase 7 was split into 7A primitives, 7B automatic allocation and 7C the operator-driven split
+  before coding. 7A added the split plan and neighbour selection, and separated adjacency from the
+  complete-edge requirement: absorption needs a complete edge because area changes hands, while
+  choosing a container to receive a window does not. 7B made the active container count the
+  allocation rule and, more importantly, made a split a third kind of local slot edit - applied at
+  insertion and adopted, so the arrangement fingerprint does not read a new container as a reason to
+  recalculate and discard it. 7C added the manual split, whose whole difficulty is atomicity and the
+  two hidden outcomes, both of which fall out of the existing derivation rather than being handled
+  separately. Full serial workspace suite passed at every step (komorebi 278 -> 290 -> 300 -> 312
+  passing); fmt and Clippy clean apart from the two pre-existing warnings. One environment note:
+  commits are signed through 1Password, which cannot be reached from the sandboxed shell, so commits
+  are made from the unsandboxed one and may need an approval prompt answered. Next phase: 8,
+  container deletion, distribution and multi-neighbour resize.
 - 2026-08-29: Phase 3 was split into 3A identity and 3B histories/invariants after call-site review
   showed that doing both together would exceed the phase review-size limit. Phase 3A added
   transparent typed workspace/container IDs, migrated managed ownership and UI integration

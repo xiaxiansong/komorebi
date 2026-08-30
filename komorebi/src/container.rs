@@ -497,6 +497,24 @@ impl Container {
         }
     }
 
+    /// The index of the window a manual split takes from this container.
+    ///
+    /// The most recently focused window this container still owns, or the top of its stack when
+    /// its history names nothing it still holds. Visibility is deliberately not a condition here,
+    /// unlike [`Container::first_focusable_window`]: a floating or minimized window can perfectly
+    /// well be split off into a container of its own, which simply starts out hidden.
+    #[must_use]
+    pub fn donor_window_idx(&self) -> Option<usize> {
+        if self.windows().is_empty() {
+            return None;
+        }
+
+        self.focus_history
+            .iter()
+            .find_map(|hwnd| self.idx_for_window(*hwnd))
+            .or_else(|| Some(self.focused_window_idx()))
+    }
+
     pub const fn focus_history(&self) -> &Mru<isize> {
         &self.focus_history
     }
@@ -1021,5 +1039,52 @@ mod tests {
 
         assert!(deserialized.locked);
         assert_eq!(deserialized, container);
+    }
+    #[test]
+    fn a_donor_window_is_the_most_recent_one_the_container_still_owns() {
+        let mut container = container_with_windows(3);
+        container.focus_window_by_hwnd(0);
+
+        assert_eq!(container.donor_window_idx(), Some(0));
+
+        // A window the container no longer owns is skipped, however recent it is.
+        container.remove_window_by_idx(0);
+        container.focus_window_by_hwnd(2);
+        container.focus_window_by_hwnd(1);
+
+        assert_eq!(container.donor_window_idx(), Some(0));
+        assert_eq!(container.windows()[0].hwnd, 1);
+    }
+
+    #[test]
+    fn a_donor_without_a_usable_history_gives_away_the_top_of_its_stack() {
+        let mut container = container_with_windows(3);
+        container.focus_history.clear();
+
+        assert_eq!(
+            container.donor_window_idx(),
+            Some(container.focused_window_idx())
+        );
+    }
+
+    #[test]
+    fn a_minimized_or_floating_window_can_still_be_split_off() {
+        let mut container = container_with_windows(2);
+        container
+            .windows_mut()
+            .iter_mut()
+            .next()
+            .unwrap()
+            .set_minimized();
+        container.focus_history.clear();
+        container.focus_history.record(0);
+
+        // Unlike focus selection, donor selection does not require a visible window.
+        assert_eq!(container.donor_window_idx(), Some(0));
+    }
+
+    #[test]
+    fn an_empty_container_has_no_donor_window() {
+        assert_eq!(Container::default().donor_window_idx(), None);
     }
 }
