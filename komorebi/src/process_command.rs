@@ -10,6 +10,7 @@ use std::fs::OpenOptions;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Read;
+use std::io::Write;
 use std::net::TcpListener;
 use std::net::TcpStream;
 use std::num::NonZeroUsize;
@@ -53,6 +54,7 @@ use crate::border_manager;
 use crate::border_manager::IMPLEMENTATION;
 use crate::border_manager::STYLE;
 use crate::build;
+use crate::command_outcome::CommandOutcome;
 use crate::command_outcome::CommandResponse;
 use crate::config_generation::WorkspaceMatchingRule;
 use crate::core::ApplicationIdentifier;
@@ -403,6 +405,20 @@ impl WindowManager {
             }
             SocketMessage::Minimize => {
                 Window::from(WindowsApi::foreground_window()?).minimize();
+            }
+            SocketMessage::RestoreLastMinimizedWindow => {
+                let response = match self.restore_last_minimized_window()? {
+                    Some(hwnd) => CommandResponse::new(
+                        CommandOutcome::Success,
+                        format!("restored hwnd {hwnd}"),
+                    ),
+                    None => CommandResponse::new(
+                        CommandOutcome::NoOp,
+                        "this workspace has no minimized window left to restore",
+                    ),
+                };
+
+                Self::respond(&mut reply, &response);
             }
             SocketMessage::LockMonitorWorkspaceContainer(
                 monitor_idx,
@@ -910,14 +926,16 @@ impl WindowManager {
                 self.move_workspace_to_monitor(monitor_idx)?;
             }
             SocketMessage::TogglePause => {
-                if self.is_paused {
-                    tracing::info!("resuming");
-                } else {
-                    tracing::info!("pausing");
-                }
-
-                self.is_paused = !self.is_paused;
-                self.retile_all(true)?;
+                let response = self.set_paused(!self.is_paused)?;
+                Self::respond(&mut reply, &response);
+            }
+            SocketMessage::Pause => {
+                let response = self.set_paused(true)?;
+                Self::respond(&mut reply, &response);
+            }
+            SocketMessage::Unpause => {
+                let response = self.set_paused(false)?;
+                Self::respond(&mut reply, &response);
             }
             SocketMessage::ToggleTiling => {
                 self.toggle_tiling()?;
@@ -1904,6 +1922,14 @@ if (!(Get-Process komorebi-bar -ErrorAction SilentlyContinue))
             SocketMessage::UnmanageFocusedWindow => {
                 self.unmanage_focused_window()?;
             }
+            SocketMessage::SuspendWindow(hwnd) => {
+                let response = self.suspend_window(hwnd)?;
+                Self::respond(&mut reply, &response);
+            }
+            SocketMessage::ResumeWindow(hwnd) => {
+                let response = self.resume_suspended_window(hwnd)?;
+                Self::respond(&mut reply, &response);
+            }
             SocketMessage::InvisibleBorders(_rect) => {}
             SocketMessage::WorkAreaOffset(rect) => {
                 self.work_area_offset = Option::from(rect);
@@ -2353,6 +2379,14 @@ if (!(Get-Process komorebi-bar -ErrorAction SilentlyContinue))
     }
 }
 
+/// The answer to every command a paused komorebi will not act on.
+///
+/// A paused komorebi used to drop these silently, which a caller could not tell apart from a
+/// command that ran and changed nothing.
+fn paused_response() -> CommandResponse {
+    CommandResponse::new(CommandOutcome::NoOp, "komorebi is paused")
+}
+
 pub fn read_commands_uds(
     wm: &Arc<Mutex<WindowManager>>,
     mut stream: UnixStream,
@@ -2375,11 +2409,14 @@ pub fn read_commands_uds(
                 if wm.is_paused {
                     return match message {
                         SocketMessage::TogglePause
+                        | SocketMessage::Pause
+                        | SocketMessage::Unpause
                         | SocketMessage::State
                         | SocketMessage::GlobalState
                         | SocketMessage::Stop => Ok(wm.process_command(message, &mut stream)?),
                         _ => {
                             tracing::trace!("ignoring while paused");
+                            let _ = stream.write_all(paused_response().as_line().as_bytes());
                             Ok(())
                         }
                     };
@@ -2423,11 +2460,14 @@ pub fn read_commands_tcp(
                 if wm.is_paused {
                     return match message {
                         SocketMessage::TogglePause
+                        | SocketMessage::Pause
+                        | SocketMessage::Unpause
                         | SocketMessage::State
                         | SocketMessage::GlobalState
                         | SocketMessage::Stop => Ok(wm.process_command(message, stream)?),
                         _ => {
                             tracing::trace!("ignoring while paused");
+                            let _ = stream.write_all(paused_response().as_line().as_bytes());
                             Ok(())
                         }
                     };

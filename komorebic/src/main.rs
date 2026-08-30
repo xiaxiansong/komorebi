@@ -383,6 +383,21 @@ struct Resize {
 }
 
 #[derive(Parser)]
+struct SuspendWindow {
+    /// Handle of the window to suspend [default: the foreground window]
+    #[clap(long)]
+    hwnd: Option<isize>,
+}
+
+#[derive(Parser)]
+struct ResumeWindow {
+    /// Handle of the window to resume [default: the foreground window if it is suspended,
+    /// otherwise the only suspended window]
+    #[clap(long)]
+    hwnd: Option<isize>,
+}
+
+#[derive(Parser)]
 struct MoveFloatingWindow {
     #[clap(value_enum)]
     direction: OperationDirection,
@@ -1413,6 +1428,11 @@ enum SubCommand {
     ToggleWorkspaceLayer,
     /// Toggle the paused state for all window tiling
     TogglePause,
+    /// Pause all window tiling without stopping komorebi
+    Pause,
+    /// Resume window tiling after a pause
+    #[clap(alias = "unpause")]
+    Resume,
     /// Toggle window tiling on the focused workspace
     ToggleTiling,
     /// Toggle floating mode for the focused window
@@ -1431,6 +1451,13 @@ enum SubCommand {
     Manage,
     /// Unmanage a window that was forcibly managed
     Unmanage,
+    /// Temporarily remove a window from management, leaving it where it is
+    SuspendWindow(SuspendWindow),
+    /// Hand a temporarily unmanaged window back to management as if it had just opened
+    ResumeWindow(ResumeWindow),
+    /// Restore the window most recently minimized on the focused workspace
+    #[clap(alias = "restore-minimized")]
+    RestoreLastMinimizedWindow,
     /// Replace the configuration of a running instance of komorebi from a static configuration file
     #[clap(arg_required_else_help = true)]
     ReplaceConfiguration(ReplaceConfiguration),
@@ -2146,7 +2173,13 @@ fn main() -> eyre::Result<()> {
             send_message(&SocketMessage::PromoteWindow(args.operation_direction))?;
         }
         SubCommand::TogglePause => {
-            send_message(&SocketMessage::TogglePause)?;
+            send_command(&SocketMessage::TogglePause)?;
+        }
+        SubCommand::Pause => {
+            send_command(&SocketMessage::Pause)?;
+        }
+        SubCommand::Resume => {
+            send_command(&SocketMessage::Unpause)?;
         }
         SubCommand::Retile => {
             send_message(&SocketMessage::Retile)?;
@@ -3233,6 +3266,15 @@ if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
         }
         SubCommand::Unmanage => {
             send_message(&SocketMessage::UnmanageFocusedWindow)?;
+        }
+        SubCommand::SuspendWindow(args) => {
+            send_command(&SocketMessage::SuspendWindow(args.hwnd))?;
+        }
+        SubCommand::ResumeWindow(args) => {
+            send_command(&SocketMessage::ResumeWindow(args.hwnd))?;
+        }
+        SubCommand::RestoreLastMinimizedWindow => {
+            send_command(&SocketMessage::RestoreLastMinimizedWindow)?;
         }
         SubCommand::QuickSaveResize => {
             send_message(&SocketMessage::QuickSave)?;

@@ -132,6 +132,7 @@ nav:
       - cli/resize-axis.md
       - cli/move-floating-window.md
       - cli/resize-floating-window.md
+      - cli/restore-last-minimized-window.md
       - cli/move-to-monitor.md
       - cli/cycle-move-to-monitor.md
       - cli/move-to-workspace.md
@@ -203,6 +204,8 @@ nav:
       - cli/toggle-workspace-float-override.md
       - cli/toggle-workspace-layer.md
       - cli/toggle-pause.md
+      - cli/pause.md
+      - cli/resume.md
       - cli/toggle-tiling.md
       - cli/toggle-float.md
       - cli/toggle-monocle.md
@@ -212,6 +215,8 @@ nav:
       - cli/restore-windows.md
       - cli/manage.md
       - cli/unmanage.md
+      - cli/suspend-window.md
+      - cli/resume-window.md
       - cli/replace-configuration.md
       - cli/reload-configuration.md
       - cli/watch-configuration.md

@@ -107,6 +107,11 @@ pub enum SocketMessage {
     ForceFocus,
     Close,
     Minimize,
+    /// Restore the window most recently minimized on the focused workspace.
+    ///
+    /// The window returns to the container it was minimized in, with the placement and
+    /// presentation it was minimized with.
+    RestoreLastMinimizedWindow,
     Promote,
     PromoteSwap,
     PromoteFocus,
@@ -130,6 +135,17 @@ pub enum SocketMessage {
     // Current Workspace Commands
     ManageFocusedWindow,
     UnmanageFocusedWindow,
+    /// Temporarily remove a window from management, or the foreground window when no handle is
+    /// given.
+    ///
+    /// The window keeps no container, workspace, stack position or history: komorebi stops
+    /// positioning it and ordinary Win32 events will not take it back.
+    SuspendWindow(Option<isize>),
+    /// Hand a temporarily unmanaged window back to management, or the foreground window when no
+    /// handle is given.
+    ///
+    /// The window is processed as a newly opened one rather than returned to where it used to be.
+    ResumeWindow(Option<isize>),
     AdjustContainerPadding(Sizing, i32),
     AdjustWorkspacePadding(Sizing, i32),
     ChangeLayout(DefaultLayout),
@@ -150,6 +166,10 @@ pub enum SocketMessage {
     Stop,
     StopIgnoreRestore,
     TogglePause,
+    /// Pause all tiling without stopping komorebi. Pausing an already paused komorebi is a no-op.
+    Pause,
+    /// Resume tiling after a pause. Resuming a komorebi which is not paused is a no-op.
+    Unpause,
     Retile,
     RetileWithResizeDimensions,
     QuickSave,

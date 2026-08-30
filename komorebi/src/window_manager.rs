@@ -56,6 +56,8 @@ use crate::WORKSPACE_MATCHING_RULES;
 use crate::border_manager;
 use crate::border_manager::BORDER_OFFSET;
 use crate::border_manager::BORDER_WIDTH;
+use crate::command_outcome::CommandOutcome;
+use crate::command_outcome::CommandResponse;
 use crate::container::Container;
 use crate::current_virtual_desktop;
 use crate::floating_geometry::FloatingBounds;
@@ -73,6 +75,7 @@ use crate::should_act_individual;
 use crate::state::State;
 use crate::static_config::StaticConfig;
 use crate::transparency_manager;
+use crate::window::RuleDebug;
 use crate::window::Window;
 use crate::window_manager_event::WindowManagerEvent;
 use crate::windows_api::WindowsApi;
@@ -908,6 +911,152 @@ impl WindowManager {
         window.focus(self.mouse_follows_focus)?;
 
         Ok(Some(hwnd))
+    }
+
+    /// Set the global pause state, reporting whether it changed.
+    ///
+    /// Pausing is idempotent so that a hotkey bound to "pause" and a hotkey bound to "resume"
+    /// always leave komorebi in the state they name, whichever was pressed last.
+    pub fn set_paused(&mut self, paused: bool) -> eyre::Result<CommandResponse> {
+        if self.is_paused == paused {
+            return Ok(CommandResponse::new(
+                CommandOutcome::NoOp,
+                if paused {
+                    "komorebi is already paused"
+                } else {
+                    "komorebi is not paused"
+                },
+            ));
+        }
+
+        self.is_paused = paused;
+        self.retile_all(true)?;
+
+        Ok(CommandResponse::new(
+            CommandOutcome::Success,
+            if paused {
+                "komorebi is paused"
+            } else {
+                "komorebi has resumed"
+            },
+        ))
+    }
+
+    /// Temporarily remove a window from management, or the foreground window when no handle is
+    /// given.
+    ///
+    /// The model change is applied here rather than queued as an event, because the caller is
+    /// asking what happened to a specific window and the answer is already known: whether the
+    /// window was managed at all, and whether detaching it left the model consistent.
+    pub fn suspend_window(&mut self, hwnd: Option<isize>) -> eyre::Result<CommandResponse> {
+        let Some(hwnd) = hwnd.or_else(|| WindowsApi::foreground_window().ok()) else {
+            return Ok(CommandResponse::new(
+                CommandOutcome::NoTarget,
+                "there is no focused window to suspend",
+            ));
+        };
+
+        if self.temporarily_unmanaged_hwnds.contains(&hwnd) {
+            return Ok(CommandResponse::new(
+                CommandOutcome::Suspended,
+                format!("hwnd {hwnd} is already temporarily unmanaged"),
+            ));
+        }
+
+        if self.suspend_managed_window(hwnd)? {
+            Ok(CommandResponse::new(
+                CommandOutcome::Success,
+                format!("hwnd {hwnd} is no longer managed"),
+            ))
+        } else {
+            Ok(Self::unowned_window_response(hwnd))
+        }
+    }
+
+    /// Hand a temporarily unmanaged window back to management.
+    ///
+    /// The window goes back through the event pipeline instead of being reinserted here, because a
+    /// resumed window is processed as a newly opened one: the current monitor, the current
+    /// workspace, the new-window threshold and the routing rules decide where it lands, and none
+    /// of those are the command's decision to make.
+    pub fn resume_suspended_window(
+        &mut self,
+        hwnd: Option<isize>,
+    ) -> eyre::Result<CommandResponse> {
+        let Some(hwnd) = self.resume_subject(hwnd) else {
+            return Ok(CommandResponse::new(
+                CommandOutcome::NoTarget,
+                "there is no unambiguous temporarily unmanaged window; pass a handle",
+            ));
+        };
+
+        if !self.temporarily_unmanaged_hwnds.contains(&hwnd) {
+            return Ok(CommandResponse::new(
+                CommandOutcome::NoOp,
+                format!("hwnd {hwnd} is not temporarily unmanaged"),
+            ));
+        }
+
+        // The event pipeline refuses to resume an ignored window as well. Refusing here too is
+        // what makes the caller hear the reason instead of a success it will not see happen.
+        if Self::window_is_explicitly_ignored(hwnd) {
+            return Ok(CommandResponse::new(
+                CommandOutcome::Ignored,
+                format!("hwnd {hwnd} matches an ignore rule"),
+            ));
+        }
+
+        self.resume_window(hwnd)?;
+
+        Ok(CommandResponse::new(
+            CommandOutcome::Success,
+            format!("hwnd {hwnd} was handed back to management"),
+        ))
+    }
+
+    /// The window a resume acts on when the caller named none: the foreground window if it is
+    /// suspended, otherwise the only suspended window there is. More than one candidate is
+    /// ambiguous and is refused rather than guessed at.
+    fn resume_subject(&self, hwnd: Option<isize>) -> Option<isize> {
+        if hwnd.is_some() {
+            return hwnd;
+        }
+
+        if let Ok(foreground) = WindowsApi::foreground_window()
+            && self.temporarily_unmanaged_hwnds.contains(&foreground)
+        {
+            return Some(foreground);
+        }
+
+        if self.temporarily_unmanaged_hwnds.len() == 1 {
+            return self.temporarily_unmanaged_hwnds.iter().copied().next();
+        }
+
+        None
+    }
+
+    /// Why nothing happened to a window komorebi does not own: it was told to ignore the window,
+    /// or it has simply never managed it. The two are different answers and different fixes.
+    fn unowned_window_response(hwnd: isize) -> CommandResponse {
+        if Self::window_is_explicitly_ignored(hwnd) {
+            CommandResponse::new(
+                CommandOutcome::Ignored,
+                format!("hwnd {hwnd} matches an ignore rule"),
+            )
+        } else {
+            CommandResponse::new(
+                CommandOutcome::NoTarget,
+                format!("hwnd {hwnd} is not a managed window"),
+            )
+        }
+    }
+
+    /// Whether static configuration or an ignore rule permanently excludes this window. A manage
+    /// override does not count: an ignored window stays ignored for these commands.
+    fn window_is_explicitly_ignored(hwnd: isize) -> bool {
+        let mut rule_debug = RuleDebug::default();
+        let _ = Window::from(hwnd).should_manage(None, &mut rule_debug);
+        rule_debug.is_explicitly_ignored()
     }
 
     /// Remove a managed window from every ownership/index path and add it to the runtime
@@ -4819,6 +4968,96 @@ mod tests {
         assert!(wm.focused_workspace().unwrap().containers().is_empty());
 
         assert!(!wm.suspend_managed_window(42).unwrap());
+        assert!(wm.temporarily_unmanaged_hwnds.contains(&42));
+    }
+
+    #[test]
+    fn pausing_and_resuming_are_idempotent() {
+        let (mut wm, _test_context) = setup_window_manager();
+
+        assert_eq!(
+            wm.set_paused(true).unwrap().outcome,
+            CommandOutcome::Success
+        );
+        assert!(wm.is_paused);
+        assert_eq!(wm.set_paused(true).unwrap().outcome, CommandOutcome::NoOp);
+        assert!(wm.is_paused);
+
+        assert_eq!(
+            wm.set_paused(false).unwrap().outcome,
+            CommandOutcome::Success
+        );
+        assert!(!wm.is_paused);
+        assert_eq!(wm.set_paused(false).unwrap().outcome, CommandOutcome::NoOp);
+        assert!(!wm.is_paused);
+    }
+
+    #[test]
+    fn suspending_a_managed_window_reports_what_it_did() {
+        let (mut wm, _test_context) = window_manager_with_container(&[42, 43]);
+
+        let response = wm.suspend_window(Some(42)).unwrap();
+
+        assert_eq!(response.outcome, CommandOutcome::Success);
+        assert!(wm.temporarily_unmanaged_hwnds.contains(&42));
+        assert!(wm.managed_window_location(42).is_none());
+        assert!(wm.managed_window_location(43).is_some());
+    }
+
+    #[test]
+    fn suspending_an_already_suspended_window_says_so_and_changes_nothing() {
+        let (mut wm, _test_context) = window_manager_with_container(&[42]);
+        wm.suspend_window(Some(42)).unwrap();
+
+        let response = wm.suspend_window(Some(42)).unwrap();
+
+        assert_eq!(response.outcome, CommandOutcome::Suspended);
+        assert_eq!(wm.temporarily_unmanaged_hwnds.len(), 1);
+    }
+
+    #[test]
+    fn suspending_a_window_komorebi_does_not_own_reports_no_target() {
+        let (mut wm, _test_context) = window_manager_with_container(&[42]);
+
+        let response = wm.suspend_window(Some(9999)).unwrap();
+
+        assert_eq!(response.outcome, CommandOutcome::NoTarget);
+        assert!(wm.temporarily_unmanaged_hwnds.is_empty());
+        assert!(wm.managed_window_location(42).is_some());
+    }
+
+    #[test]
+    fn resuming_a_window_which_was_never_suspended_is_a_no_op() {
+        let (mut wm, _test_context) = window_manager_with_container(&[42]);
+
+        let response = wm.resume_suspended_window(Some(42)).unwrap();
+
+        assert_eq!(response.outcome, CommandOutcome::NoOp);
+        assert!(wm.managed_window_location(42).is_some());
+    }
+
+    #[test]
+    fn resuming_without_a_handle_refuses_an_ambiguous_choice() {
+        let (mut wm, _test_context) = setup_window_manager();
+        wm.temporarily_unmanaged_hwnds.insert(42);
+        wm.temporarily_unmanaged_hwnds.insert(43);
+
+        let response = wm.resume_suspended_window(None).unwrap();
+
+        assert_eq!(response.outcome, CommandOutcome::NoTarget);
+        assert_eq!(wm.temporarily_unmanaged_hwnds.len(), 2);
+    }
+
+    #[test]
+    fn resuming_the_only_suspended_window_hands_it_back() {
+        let (mut wm, _test_context) = window_manager_with_container(&[42]);
+        wm.suspend_window(Some(42)).unwrap();
+
+        let response = wm.resume_suspended_window(None).unwrap();
+
+        assert_eq!(response.outcome, CommandOutcome::Success);
+        // The window leaves the suspension set on its way through the event pipeline, not here:
+        // this command hands it back to be processed as a newly opened window.
         assert!(wm.temporarily_unmanaged_hwnds.contains(&42));
     }
 
