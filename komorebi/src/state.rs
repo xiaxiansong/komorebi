@@ -51,10 +51,50 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
+/// The shape of a state document.
+///
+/// A dumped state is a model, not a configuration: it names containers, slots, histories and
+/// per-window placement which only mean anything to the model which wrote them. This version is
+/// raised whenever a document written by an older komorebi can no longer be applied to the current
+/// model, and `apply_state` refuses anything which does not carry the current value rather than
+/// reading a document whose fields have moved.
+///
+/// A missing version is [`StateVersion::UNVERSIONED`], which is every document written before the
+/// managed-window model existed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(transparent)]
+pub struct StateVersion(pub u32);
+
+impl StateVersion {
+    /// A document written before state documents carried a version.
+    pub const UNVERSIONED: Self = Self(0);
+    /// The managed-window model: containers own every window, including floating and minimized
+    /// ones, and carry stable identities, logical slots and hidden-slot restoration records.
+    pub const MANAGED_WINDOW_MODEL: Self = Self(1);
+    /// What this build writes and the only version it will apply.
+    pub const CURRENT: Self = Self::MANAGED_WINDOW_MODEL;
+}
+
+impl Default for StateVersion {
+    fn default() -> Self {
+        Self::UNVERSIONED
+    }
+}
+
+impl std::fmt::Display for StateVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct State {
+    /// The shape of this document. Absent in anything written before versions existed.
+    #[serde(default)]
+    pub version: StateVersion,
     pub monitors: Ring<Monitor>,
     pub monitor_usr_idx_map: HashMap<usize, usize>,
     pub is_paused: bool,
@@ -74,6 +114,16 @@ pub struct State {
 }
 
 impl State {
+    /// Whether this document describes the model this build has.
+    ///
+    /// A document from any other version is refused rather than partially read: serde fills in
+    /// defaults for fields which did not exist when it was written, and the result would be a
+    /// model which never held.
+    #[must_use]
+    pub fn is_current_version(&self) -> bool {
+        self.version == StateVersion::CURRENT
+    }
+
     pub fn has_been_modified(&self, wm: &WindowManager) -> bool {
         let new = Self::from(wm);
 
@@ -308,6 +358,7 @@ impl From<&WindowManager> for State {
         stripped_monitors.focus(wm.monitors.focused_idx());
 
         Self {
+            version: StateVersion::CURRENT,
             monitors: stripped_monitors,
             monitor_usr_idx_map: wm.monitor_usr_idx_map.clone(),
             is_paused: wm.is_paused,
@@ -325,5 +376,27 @@ impl From<&WindowManager> for State {
             unmanaged_window_operation_behaviour: wm.unmanaged_window_operation_behaviour,
             virtual_desktop_id: wm.virtual_desktop_id.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_document_without_a_version_is_the_unversioned_one() {
+        let version: StateVersion = serde_json::from_str("0").unwrap();
+
+        assert_eq!(version, StateVersion::UNVERSIONED);
+        assert_eq!(StateVersion::default(), StateVersion::UNVERSIONED);
+        assert_ne!(StateVersion::CURRENT, StateVersion::UNVERSIONED);
+    }
+
+    #[test]
+    fn a_version_is_a_bare_number_in_the_document() {
+        assert_eq!(
+            serde_json::to_string(&StateVersion::CURRENT).unwrap(),
+            StateVersion::CURRENT.0.to_string()
+        );
     }
 }

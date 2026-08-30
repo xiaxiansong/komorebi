@@ -45,11 +45,12 @@ impl Display for ContainerState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+/// Serialization and the schema go through [`ContainerRepr`] and [`ContainerView`] rather than a
+/// derive, because the serialized shape carries one field this type deliberately does not store:
+/// the container's derived [`ContainerState`].
+#[derive(Debug, Clone, PartialEq)]
 pub struct Container {
     pub id: ContainerId,
-    #[serde(default)]
     pub locked: bool,
     windows: Ring<ManagedWindow>,
     /// Most-recently-used order of this container's window handles.
@@ -57,11 +58,18 @@ pub struct Container {
     /// The ring focus index is a position in the stack, so it cannot answer which window should
     /// be focused after the current one goes away. This history can, and it is the only source
     /// used for that decision.
-    #[serde(default)]
     focus_history: Mru<isize>,
 }
 
-#[derive(Deserialize)]
+/// The serialized shape of a container.
+///
+/// This is what the schema describes and what a state document is read back through, and it holds
+/// one field the container itself does not: its [`ContainerState`]. That state is derived from the
+/// container's windows on every read, so it is written for consumers of the state output - a bar,
+/// a script, `komorebic state` - and ignored on the way back in, where the windows decide it
+/// again.
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 struct ContainerRepr {
     id: ContainerId,
     #[serde(default)]
@@ -69,6 +77,46 @@ struct ContainerRepr {
     windows: Ring<ManagedWindow>,
     #[serde(default)]
     focus_history: Mru<isize>,
+    /// Derived from the windows below it; never stored on the container.
+    #[serde(default)]
+    state: ContainerState,
+}
+
+/// The borrowed twin of [`ContainerRepr`], so serializing a container copies nothing.
+#[derive(Serialize)]
+struct ContainerView<'a> {
+    id: &'a ContainerId,
+    locked: bool,
+    windows: &'a Ring<ManagedWindow>,
+    focus_history: &'a Mru<isize>,
+    state: ContainerState,
+}
+
+impl Serialize for Container {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        ContainerView {
+            id: &self.id,
+            locked: self.locked,
+            windows: &self.windows,
+            focus_history: &self.focus_history,
+            state: self.state(),
+        }
+        .serialize(serializer)
+    }
+}
+
+#[cfg(feature = "schemars")]
+impl schemars::JsonSchema for Container {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Container".into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        ContainerRepr::json_schema(generator)
+    }
 }
 
 pub trait IntoManagedWindow {

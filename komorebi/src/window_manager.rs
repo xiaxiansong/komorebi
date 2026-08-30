@@ -80,6 +80,7 @@ use crate::ring::Ring;
 use crate::should_act;
 use crate::should_act_individual;
 use crate::state::State;
+use crate::state::StateVersion;
 use crate::static_config::StaticConfig;
 use crate::suspension::SuspensionSet;
 use crate::transparency_manager;
@@ -226,8 +227,27 @@ impl WindowManager {
         WindowsApi::load_workspace_information(&mut self.monitors)
     }
 
+    /// Take on a state document written by a previous run of komorebi.
+    ///
+    /// A document from a different model is refused rather than partially read. Serde will happily
+    /// fill in defaults for fields which did not exist when the document was written - an absent
+    /// container identity, absent logical slots, absent placement - and the result is a model
+    /// which never held: containers with no slots, windows whose placement is a guess, histories
+    /// pointing at objects which were represented differently. The version says which model wrote
+    /// the document, and only the current one is applied.
     #[tracing::instrument(skip(self, state))]
     pub fn apply_state(&mut self, state: State) {
+        if !state.is_current_version() {
+            tracing::warn!(
+                "cannot apply state from {}; it was written by state version {} and this komorebi reads version {}",
+                temp_dir().join("komorebi.state.json").to_string_lossy(),
+                state.version,
+                StateVersion::CURRENT
+            );
+
+            return;
+        }
+
         let mut can_apply = true;
 
         let state_monitors_len = state.monitors.elements().len();
@@ -6110,6 +6130,107 @@ mod tests {
 
         // The record now agrees with the observation, so nothing happens the second time.
         assert!(!wm.reconcile_managed_window_presentation(42).unwrap());
+    }
+
+    #[test]
+    fn the_state_output_names_every_field_the_model_is_described_by() {
+        let (mut wm, _test_context) = window_manager_with_container(&[42, 43]);
+        let area = Rect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+
+        let workspace = wm.focused_workspace_mut().unwrap();
+        workspace.maximize_window(42).unwrap();
+        workspace
+            .float_window(
+                43,
+                Rect {
+                    left: 10,
+                    top: 20,
+                    right: 300,
+                    bottom: 400,
+                },
+            )
+            .unwrap();
+        workspace.recalculate_logical_slots(area);
+
+        let state = serde_json::to_value(State::from(&wm)).unwrap();
+
+        assert_eq!(state["version"], serde_json::json!(StateVersion::CURRENT.0));
+
+        let workspace = &state["monitors"]["elements"][0]["workspaces"]["elements"][0];
+
+        for field in [
+            "id",
+            "layout",
+            "container_focus_history",
+            "minimize_history",
+            "logical_slots",
+            "logical_work_area",
+            "hidden_slot_restores",
+        ] {
+            assert!(!workspace[field].is_null(), "workspace has no {field}");
+        }
+
+        // The geometry generation lives with the slots it describes, because it is a fact about
+        // them rather than about the workspace.
+        assert!(!workspace["logical_slots"]["generation"].is_null());
+
+        let container = &workspace["containers"]["elements"][0];
+
+        for field in ["id", "state", "focus_history"] {
+            assert!(!container[field].is_null(), "container has no {field}");
+        }
+
+        let window = &container["windows"]["elements"][0];
+
+        for field in ["container_id", "placement", "visibility", "presentation"] {
+            assert!(!window[field].is_null(), "window has no {field}");
+        }
+
+        // Floating keeps the window in the container it was already in, so this is the same
+        // container's second window rather than a container of its own.
+        let floating = &container["windows"]["elements"][1];
+
+        assert_eq!(floating["placement"], serde_json::json!("Floating"));
+        assert!(!floating["floating_rect"].is_null());
+    }
+
+    #[test]
+    fn a_container_reports_the_state_it_derives_rather_than_one_it_stores() {
+        let (mut wm, _test_context) = window_manager_with_container(&[42]);
+
+        let active = serde_json::to_value(State::from(&wm)).unwrap();
+        assert_eq!(
+            active["monitors"]["elements"][0]["workspaces"]["elements"][0]["containers"]["elements"]
+                [0]["state"],
+            serde_json::json!("Active")
+        );
+
+        // Minimizing the container's only window is what makes it Hidden; nothing writes that.
+        wm.minimize_managed_window(42).unwrap();
+
+        let hidden = serde_json::to_value(State::from(&wm)).unwrap();
+        assert_eq!(
+            hidden["monitors"]["elements"][0]["workspaces"]["elements"][0]["containers"]["elements"]
+                [0]["state"],
+            serde_json::json!("Hidden")
+        );
+    }
+
+    #[test]
+    fn a_state_document_from_another_model_is_not_applied() {
+        let (wm, _test_context) = window_manager_with_container(&[42]);
+        let mut state = State::from(&wm);
+
+        assert!(state.is_current_version());
+
+        state.version = StateVersion::UNVERSIONED;
+
+        assert!(!state.is_current_version());
     }
 
     #[test]

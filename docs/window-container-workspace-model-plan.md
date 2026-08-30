@@ -1808,7 +1808,7 @@ question.
   when a window is reaped rather than destroyed.
 - [x] 14B: converge the model's presentation with a maximize or restore the user performed outside
   komorebi, idempotently and without changing placement or ownership.
-- [ ] 14C: complete the state output with the derived fields a consumer cannot compute, and version
+- [x] 14C: complete the state output with the derived fields a consumer cannot compute, and version
   it so an older state document is recognised rather than silently misread.
 - [ ] 14D: add a deterministic seeded operation harness which drives long random operation
   sequences against the invariants.
@@ -1925,8 +1925,44 @@ Verification: `komorebi` lib tests 503 -> 517 passing, full workspace suite seri
 
 #### Phase 14C - State output completeness and versioning
 
-Expected handwritten change: 200-300 lines plus generated schema. Likely files: `state.rs`,
-`container.rs`, `workspace.rs`, `schema.json`.
+An audit of the state output against task section 22 found it complete but for one field, and
+missing any way to tell which model wrote it.
+
+- [x] Serialize a container's derived `ContainerState`, without storing it on the container.
+- [x] Keep the schema honest by describing the serialized shape rather than the stored one.
+- [x] Add a state document version, defaulting to the unversioned document every older komorebi
+  wrote.
+- [x] Refuse to apply a document from another version instead of letting serde fill in defaults.
+- [x] Add version, derived-state and output-completeness tests.
+- [x] Commit as `feat: version and complete the state document`.
+
+Actual files: `komorebi/src/container.rs`, `komorebi/src/state.rs`,
+`komorebi/src/window_manager.rs`.
+
+Everything else section 22 asks for was already there: stable workspace and container IDs, the
+active logical rectangles with their geometry generation, the hidden restore records with their
+`old_rect` and `exact_restore_valid`, per-window placement, visibility, presentation and floating
+rectangle, both focus histories, the minimize history and the layout. A single test now asserts
+that list against a serialized `State`, so a field cannot quietly stop being published.
+
+`ContainerState` was the exception, and it is exactly the field a consumer cannot compute: deciding
+whether a container is Active means knowing that a window is both visible and stored, which is the
+model's rule rather than a fact in the document. It is derived on every read and never stored, so
+publishing it needed a serialized shape which differs from the stored one. `ContainerRepr` already
+existed for reading containers back; it now also describes the schema, a borrowed `ContainerView`
+writes them, and `Container` gets a hand-written `Serialize` and `JsonSchema` which delegate to
+those. Reading a document which carries the field ignores it, because the windows decide it again.
+
+The version exists because a state document is a model, not a configuration. Serde will happily
+default an absent container identity, absent logical slots or an absent placement, and the result
+is a model which never held rather than an older one. `apply_state` now refuses any document which
+does not carry the current version, and `StateVersion::MANAGED_WINDOW_MODEL` is the first value:
+every document written before this work is `UNVERSIONED` and is not applied. Configuration
+compatibility is unaffected - that is `StaticConfig`, where every added field has a serde default.
+
+Verification: `komorebi` lib tests 517 -> 522 passing, full workspace suite serial and green.
+`cargo fmt --check` and `cargo clippy --workspace --all-targets` clean apart from the pre-existing
+`items after a test module` warning.
 
 #### Phase 14D - Seeded operation harness
 
