@@ -2684,3 +2684,29 @@ This list is updated from actual diffs, not treated as permission to change ever
   `/validate`. One incident is recorded in the phase: a `/validate` sent through the Bash tool was
   rewritten into a path and left a stray AutoHotkey process holding a dialog on the user's desktop;
   it was identified from its command line and killed, and the check re-run through PowerShell.
+- 2026-08-31: Phase 16 turn. The plan was re-read and the worktree inspected before editing, and
+  the turn opened by reading the runtime rather than the source: komorebi was healthy on commit
+  `57f1ee0d`, the log had carried no `unknown variant` and no direction error since the Phase 15
+  restart, and the five windows on the desktop were in containers and tiled. What Phase 15 fixed
+  has held. The Phase 15 plan entry itself turned out to be sitting in the index uncommitted, and
+  was committed first so the two turns stayed separable. The request was about startup, and the
+  audit which opened the phase found half of it already true: `load_workspace_information`
+  enumerates into the monitor's *first* workspace and prunes what belongs elsewhere, so adoption
+  has always reached workspace one and nothing else, and the cold-start script passes
+  `--clean-state` so no state document overrides it. Two things were not true - the enumeration
+  gave every window its own container, and the workspace count came only from `komorebi.json`, so a
+  monitor the configuration does not name arrived with one. 16A built the fold out of the removal
+  and receiving paths which already exist, which is what makes it keep placement, visibility,
+  presentation, floating rectangles and both histories; the two things it had to add are recorded
+  in the phase, and the more interesting of them is that a container position is not a stable
+  reference across a removal, because the ring re-anchors locked containers. 16C put the workspace
+  count in `load_monitor_information` rather than in `monitor::new`, because that is the one place
+  a display becomes a monitor komorebi holds - startup and hot-plug both - while `monitor::new` is
+  the constructor a dozen tests build values with. Full serial suite passed at every step (komorebi
+  527 -> 534 -> 537 -> 539 passing); fmt and Clippy clean apart from the pre-existing warning. The
+  binaries were built, installed through the existing deployment request, and cold started, and the
+  live desktop came up in exactly the requested shape; a bounded, self-restoring command smoke test
+  is recorded in 16D. One thing found but not changed: a `SetCloak` panic in `com/mod.rs`, upstream
+  code whose `CoCreateInstance(CLSID_ImmersiveShell).unwrap()` aborted the process once on
+  2026-08-30 with `0x80040154`. It is not a regression from this work and hardening it would edit
+  an upstream file for a once-in-five-days event, so it is reported rather than fixed.
