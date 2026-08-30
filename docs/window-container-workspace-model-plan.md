@@ -1099,16 +1099,89 @@ Next phase: 9, independent floating window movement and edge resizing.
 
 ### Phase 9 - Floating move and edge resize
 
-- [ ] Add DPI-aware move and independent edge-resize core operations.
-- [ ] Validate visible + floating + normal state and return typed success/no-op reasons.
-- [ ] Clamp movement to a draggable visible area and sizing to Win32/system minimums.
-- [ ] Read back the accepted Win32 rectangle after a resize and store it.
-- [ ] Add defaulted `floating_move_delta` and `floating_resize_delta` configuration.
-- [ ] Add isolated-geometry, state rejection, clamp, DPI, and Hidden-container tests.
-- [ ] Commit as `feat: add independent floating window geometry commands`.
+Split into 9A, 9B and 9C on 2026-08-30, before coding, for the same review-size reason as Phases 2,
+3, 5, 6, 7 and 8. The concerns separate cleanly: 9A is arithmetic on a rectangle which needs no
+window manager at all, 9B is which window an operation is allowed to act on and what Win32 says
+afterwards, and 9C is the command spelling. 9C is brought forward from Phase 12 for these two
+commands only, because "independent of container movement" is a claim about the command surface and
+cannot be demonstrated while the only way to reach the behaviour is the existing `MoveWindow`.
 
-Expected handwritten change: 300-500 lines. Likely files: `core/mod.rs`, `static_config.rs`,
-`managed_window.rs`, `windows_api.rs`, `window_manager.rs`, `process_command.rs`.
+The existing `move_floating_window_in_direction` is upstream's implementation and is wrong for this
+model in four separate ways: it shares `resize_delta` with container resizing, it finds its subject
+by querying the foreground window rather than by asking the model, it never records the result in
+`floating_rect`, and it validates nothing about visibility or presentation. It is replaced rather
+than extended.
+
+#### Phase 9A - Floating geometry primitives and configuration
+
+- [x] Add pure move planning: only `left`/`top` change, size is preserved exactly.
+- [x] Add pure edge-resize planning with the task's eight edge/sizing meanings, where the named
+  edge moves and the opposite edge does not.
+- [x] Clamp movement so a draggable strip stays inside the work area, and sizing to a minimum size.
+- [x] Scale a configured delta by the monitor's DPI factor, in one place, as an explicit function.
+- [x] Add defaulted `floating_move_delta` and `floating_resize_delta` configuration.
+- [x] Add move, eight-edge resize, clamp, minimum-size and DPI tests.
+- [x] Commit as `feat: add floating window geometry primitives`.
+
+Expected handwritten change: 300-450 lines. Likely files: new `floating_geometry.rs`, `lib.rs`,
+`static_config.rs`, `window_manager.rs`, `state.rs`.
+
+Actual files: `floating_geometry.rs`, `lib.rs`, `static_config.rs`, `window_manager.rs`, `state.rs`,
+as predicted. Actual Rust change: 595 added, 0 removed, which is over the estimate; 335 of those
+lines are the module's tests and 219 are the module itself, so the reviewable weight is inside the
+range and the excess is test coverage of the eight edge meanings and the clamp cases.
+
+The module is separate from `geometry.rs` rather than added to it, because the two answer opposite
+questions. A logical slot may not overlap its neighbours and is meaningless outside a tiling; a
+floating rectangle may overlap anything and means nothing to the tiling at all. Sharing a module
+would have put the one kind of rectangle which must never be written into a slot next to the
+functions which write slots.
+
+The clamp is deliberately asymmetric between the axes, and that is a behaviour decision rather than
+an implementation detail: a window too wide for the work area may hang off either side, because a
+grabbable strip remains either way, but no window may be pushed above the top of the work area,
+because the title bar is the thing being clamped for and it is at the top. Containment wins whenever
+the window fits, which is the ordinary case and the task's stated default.
+
+An edge resize derives the moving edge from the fixed one instead of adjusting both by the delta.
+Adjusting both means a clamped size moves the fixed edge, which is the one thing an edge resize
+promises not to do; deriving it means an over-large delta comes to rest with the opposite edge still
+where the user left it.
+
+The delta is a logical quantity scaled per monitor, so one configured value covers a mixed-DPI
+desktop. `scale_delta` refuses to return zero for a non-zero configured delta: rounding a small
+delta down to nothing on a 50% scale would present as a dead key binding.
+
+Verification: `cargo test --workspace -- --test-threads=1` passed with komorebi 361 passed/1 ignored
+(up from 349), layouts 128, bar 3. `cargo fmt --all --check` clean; `cargo clippy --workspace
+--all-targets` reported only the pre-existing `items after a test module` warning; `cargo check -p
+komorebi --features schemars` passed.
+
+Not in this phase: which window an operation is allowed to act on, Win32 application and read-back,
+which are 9B, and the command spelling, which is 9C.
+
+#### Phase 9B - Validated floating operations and Win32 read-back
+
+- [ ] Resolve the subject from the model's focused window, never from a foreground query.
+- [ ] Reject non-floating, minimized and presented subjects with typed reasons and no state change.
+- [ ] Store the planned rectangle, apply it, then read the accepted rectangle back and store that.
+- [ ] Leave slots, container state, focus and every other window untouched.
+- [ ] Add rejection, isolation, hidden-container, clamp and read-back tests.
+- [ ] Commit as `feat: move and resize floating windows independently`.
+
+Expected handwritten change: 300-450 lines. Likely files: `workspace.rs`, `window_manager.rs`,
+`windows_api.rs`, `managed_window.rs`.
+
+#### Phase 9C - Distinct floating commands
+
+- [ ] Add socket messages for floating move and floating edge resize with an optional delta.
+- [ ] Add the `komorebic` subcommands and client bindings, distinct from the container commands.
+- [ ] Add hand-written CLI documentation pages in the checked-in format.
+- [ ] Add parsing/serialization tests.
+- [ ] Commit as `feat: add distinct floating window commands`.
+
+Expected handwritten change: 150-300 lines. Likely files: `core/mod.rs`, `process_command.rs`,
+`komorebic/src/main.rs`, `komorebi-client/src/lib.rs`, `docs/cli/`.
 
 ### Phase 10 - Workspace ordering, deletion, merge, and minimized restore
 

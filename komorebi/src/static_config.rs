@@ -3,6 +3,8 @@ use crate::Axis;
 use crate::CrossBoundaryBehaviour;
 use crate::DATA_DIR;
 use crate::DEFAULT_CONTAINER_PADDING;
+use crate::DEFAULT_FLOATING_MOVE_DELTA;
+use crate::DEFAULT_FLOATING_RESIZE_DELTA;
 use crate::DEFAULT_MOUSE_FOLLOWS_FOCUS;
 use crate::DEFAULT_RESIZE_DELTA;
 use crate::DEFAULT_WORKSPACE_PADDING;
@@ -501,6 +503,14 @@ pub struct StaticConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schemars", schemars(extend("default" = DEFAULT_RESIZE_DELTA)))]
     pub resize_delta: Option<i32>,
+    /// Delta to move floating windows by, in logical units scaled to each monitor's DPI
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(extend("default" = DEFAULT_FLOATING_MOVE_DELTA)))]
+    pub floating_move_delta: Option<i32>,
+    /// Delta to resize floating windows by, in logical units scaled to each monitor's DPI
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(extend("default" = DEFAULT_FLOATING_RESIZE_DELTA)))]
+    pub floating_resize_delta: Option<i32>,
     /// Determine what happens when a new window is opened
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schemars", schemars(extend("default" = WindowContainerBehaviour::Create)))]
@@ -877,6 +887,8 @@ impl From<&WindowManager> for StaticConfig {
             #[allow(deprecated)]
             invisible_borders: None,
             resize_delta: Option::from(value.resize_delta),
+            floating_move_delta: Option::from(value.floating_move_delta),
+            floating_resize_delta: Option::from(value.floating_resize_delta),
             window_container_behaviour: Option::from(
                 value.window_management_behaviour.current_behaviour,
             ),
@@ -1366,6 +1378,12 @@ impl StaticConfig {
                 .unmanaged_window_operation_behaviour
                 .unwrap_or(OperationBehaviour::Op),
             resize_delta: value.resize_delta.unwrap_or(DEFAULT_RESIZE_DELTA),
+            floating_move_delta: value
+                .floating_move_delta
+                .unwrap_or(DEFAULT_FLOATING_MOVE_DELTA),
+            floating_resize_delta: value
+                .floating_resize_delta
+                .unwrap_or(DEFAULT_FLOATING_RESIZE_DELTA),
             #[allow(deprecated)]
             focus_follows_mouse: value.focus_follows_mouse,
             mouse_follows_focus: value
@@ -1769,6 +1787,12 @@ impl StaticConfig {
             .unmanaged_window_operation_behaviour
             .unwrap_or_default();
         wm.resize_delta = value.resize_delta.unwrap_or(DEFAULT_RESIZE_DELTA);
+        wm.floating_move_delta = value
+            .floating_move_delta
+            .unwrap_or(DEFAULT_FLOATING_MOVE_DELTA);
+        wm.floating_resize_delta = value
+            .floating_resize_delta
+            .unwrap_or(DEFAULT_FLOATING_RESIZE_DELTA);
         wm.mouse_follows_focus = value
             .mouse_follows_focus
             .unwrap_or(DEFAULT_MOUSE_FOLLOWS_FOCUS);

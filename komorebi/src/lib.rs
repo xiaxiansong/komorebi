@@ -7,6 +7,7 @@ pub mod com;
 pub mod ring;
 pub mod container;
 pub mod core;
+pub mod floating_geometry;
 pub mod focus_history;
 pub mod focus_manager;
 pub mod geometry;
@@ -253,6 +254,10 @@ lazy_static! {
 pub static DEFAULT_WORKSPACE_PADDING: AtomicI32 = AtomicI32::new(10);
 pub static DEFAULT_CONTAINER_PADDING: AtomicI32 = AtomicI32::new(10);
 pub static DEFAULT_RESIZE_DELTA: i32 = 50;
+/// Logical-unit step for moving a floating window, separate from the container resize delta.
+pub static DEFAULT_FLOATING_MOVE_DELTA: i32 = 50;
+/// Logical-unit step for resizing a floating window's edge, separate from moving it.
+pub static DEFAULT_FLOATING_RESIZE_DELTA: i32 = 50;
 
 pub static DEFAULT_MOUSE_FOLLOWS_FOCUS: bool = true;
 pub static INITIAL_CONFIGURATION_LOADED: AtomicBool = AtomicBool::new(false);
