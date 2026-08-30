@@ -791,15 +791,71 @@ output beyond what serializing `Workspace` already gives. The full state-output 
 
 ### Phase 7 - New-window threshold placement and manual split
 
-- [ ] Implement active-count N=0, N<=2, and N>2 allocation rules.
-- [ ] Implement deterministic neighbor selection and diagnostic fallback.
-- [ ] Add atomic auto/horizontal/vertical manual container creation from an eligible donor.
-- [ ] Route donor/recipient state changes through the Hidden transition engine.
-- [ ] Add N=0/1/2/3, long-edge split, odd-pixel, neighbor-order, and atomic-failure tests.
+Split into 7A, 7B and 7C on 2026-08-30, before coding, for the same review-size reason as Phases 2,
+3, 5 and 6. 7A owns the two pure-geometry primitives the other two are written against; 7B owns the
+automatic allocation rule the window manager reaches on every new window; 7C owns the operator-driven
+split, which shares 7A's primitive but takes its donor and its window from the focus histories rather
+than from the arrangement.
+
+This is also the phase where a container arrives with a slot of its own. Until now every arrival went
+through `recalculate_logical_slots`, because the only local edits were a hide and its exact reverse.
+From 7B a split is a third local edit, and it is applied at insertion time so that the arrangement
+the caller asked for is already in place by the time `record_logical_slots` reconciles.
+
+#### Phase 7A - Split and neighbour selection primitives
+
+- [x] Add `SlotSplit` as a validated, not-yet-applied 50:50 division of one slot.
+- [x] Add automatic long-edge and forced-axis splitting on the slot map.
+- [x] Add deterministic neighbour selection in left/right/up/down order with per-direction ordering.
+- [x] Add axis, odd-pixel, refusal, generation, neighbour-priority and neighbour-order tests.
+- [x] Commit as `feat: add slot splitting and neighbour selection`.
+
+Expected handwritten change: 150-300 lines. Likely files: `geometry.rs`.
+
+Actual files: `geometry.rs` only, as predicted. Actual Rust change: 307 added, 15 removed, about two
+thirds of it tests.
+
+`SlotSplit` is the same shape of value as `SlotShift`: validated, inert until applied, and refusable
+without having half-changed the geometry. It reuses `SlotMove` for the donor, because a donor in a
+split changes exactly one edge, which is what that type already means.
+
+The one real decision here was that neighbour selection is *not* the absorption group. Absorption
+needs a complete edge because area changes hands and a partial group would leave a hole; choosing a
+container to receive a window moves no area at all, so a neighbour which covers part of an edge is a
+perfectly good recipient. They share `neighbours_on_edge` and the `ABSORPTION_DIRECTIONS` priority,
+so the two answers can never disagree about who is adjacent or in what order, but the completeness
+test belongs only to the one that needs it. `complete_edge_group` was rewritten onto that shared
+helper so there is a single definition of adjacency ordering.
+
+Verification: `cargo test --workspace -- --test-threads=1` passed with komorebi 290 passed/1 ignored
+(up from 278), layouts 128, bar 3. `cargo fmt --all --check` clean; `cargo clippy --workspace
+--all-targets` reported only the two pre-existing warnings (`window.rs` items-after-test-module and
+the upstream `net2` note).
+
+#### Phase 7B - Active-count allocation for new windows
+
+- [ ] Implement the N=0, N<=2 and N>2 rules against the active container count.
+- [ ] Apply the split as a local slot edit at insertion so the arrangement is not recalculated.
+- [ ] Use the geometry-focused container when the focused container is hidden.
+- [ ] Add the no-neighbour diagnostic fallback to the focused active container.
+- [ ] Add N=0/1/2/3, split-position, odd-pixel, neighbour-order and hidden-focus tests.
 - [ ] Commit as `feat: add threshold based container allocation`.
 
-Expected handwritten change: 300-500 lines. Likely files: `geometry.rs`, `workspace.rs`,
-`window_manager.rs`, `process_event.rs`.
+Expected handwritten change: 250-400 lines. Likely files: `workspace.rs`, `window_manager.rs`,
+`process_event.rs`.
+
+#### Phase 7C - Manual container creation from an eligible donor
+
+- [ ] Select the donor by container MRU among active containers holding at least two windows.
+- [ ] Select the window by the donor's window MRU, falling back to the top of the stack.
+- [ ] Preserve placement, visibility, presentation and floating rectangle across the move.
+- [ ] Recompute donor and new container state and route both through the Hidden transition engine.
+- [ ] Refuse atomically when no eligible donor exists, changing nothing.
+- [ ] Add auto/horizontal/vertical, MRU-selection, state-preservation, hidden-outcome and
+  atomic-failure tests.
+- [ ] Commit as `feat: split a container from an eligible donor`.
+
+Expected handwritten change: 250-400 lines. Likely files: `workspace.rs`, `window_manager.rs`.
 
 ### Phase 8 - Container deletion, distribution, and multi-neighbor resize
 

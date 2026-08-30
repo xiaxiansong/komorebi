@@ -428,6 +428,24 @@ impl SlotShift {
     }
 }
 
+/// A validated, not yet applied, division of one container's slot into two.
+///
+/// Like [`SlotShift`], nothing is written until the plan is applied, so a caller which cannot
+/// complete the rest of its operation can drop the plan and leave the arrangement untouched. The
+/// two halves exactly tile the donor's original slot, so applying one can neither open a hole nor
+/// create an overlap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotSplit {
+    /// The container giving up half of its slot, and the half it keeps.
+    pub donor: SlotMove,
+    /// The container being created.
+    pub created: ContainerId,
+    /// The half the created container receives.
+    pub created_slot: LogicalRect,
+    /// The axis the donor's slot was divided along.
+    pub axis: SplitAxis,
+}
+
 /// A way in which a set of slots fails to be a valid tiling of a work area.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlotViolation {
@@ -596,18 +614,11 @@ impl LogicalSlots {
             return None;
         }
 
-        let mut group: Vec<(ContainerId, LogicalRect)> = self
-            .slots
-            .iter()
-            .filter(|(id, candidate)| *id != exclude && slot.is_neighbour(**candidate, direction))
-            .map(|(id, candidate)| (id.clone(), *candidate))
-            .collect();
+        let group = self.neighbours_on_edge(slot, direction, exclude);
 
         if group.is_empty() {
             return None;
         }
-
-        sort_slots(&mut group, SlotOrder::for_direction(direction));
 
         // The edge is one interval. Walking the candidates in order, each must begin exactly where
         // the previous one ended, the first must begin where the edge begins, and the last must end
@@ -731,6 +742,91 @@ impl LogicalSlots {
         }
 
         self.slots.insert(shift.container.clone(), shift.slot);
+        self.bump_generation();
+    }
+
+    /// The neighbours on the `direction` side of `slot`, in the deterministic order for that
+    /// direction and excluding `exclude`.
+    ///
+    /// Adjacency here is the shared-edge relation of [`LogicalRect::is_neighbour`]: a shared corner
+    /// is not adjacency, and a gap is not adjacency, so a caller can rely on every returned slot
+    /// having a positive length of edge in common with `slot`.
+    #[must_use]
+    pub fn neighbours_on_edge(
+        &self,
+        slot: LogicalRect,
+        direction: OperationDirection,
+        exclude: &ContainerId,
+    ) -> Vec<(ContainerId, LogicalRect)> {
+        let mut neighbours: Vec<(ContainerId, LogicalRect)> = self
+            .slots
+            .iter()
+            .filter(|(id, candidate)| *id != exclude && slot.is_neighbour(**candidate, direction))
+            .map(|(id, candidate)| (id.clone(), *candidate))
+            .collect();
+
+        sort_slots(&mut neighbours, SlotOrder::for_direction(direction));
+
+        neighbours
+    }
+
+    /// The neighbour a container hands work to when it is not going to be split.
+    ///
+    /// Directions are tried in [`ABSORPTION_DIRECTIONS`] order and the first neighbour found in the
+    /// deterministic order for that direction wins, so the same topology always chooses the same
+    /// container. Unlike an absorption this does not require the neighbours to cover a whole edge:
+    /// no area changes hands, so a partial neighbour is a perfectly good recipient.
+    #[must_use]
+    pub fn adjacent_neighbour(&self, container: &ContainerId) -> Option<ContainerId> {
+        let slot = self.get(container)?;
+
+        ABSORPTION_DIRECTIONS.into_iter().find_map(|direction| {
+            self.neighbours_on_edge(slot, direction, container)
+                .into_iter()
+                .next()
+                .map(|(id, _)| id)
+        })
+    }
+
+    /// Plan dividing `donor`'s slot 50:50 to make room for `created`.
+    ///
+    /// `axis` forces the dividing line; `None` divides the longer edge, and a square slot divides
+    /// left to right. The odd remainder pixel of an oddly sized slot goes to the donor, and the
+    /// created container takes the left half of a left/right split and the bottom half of a
+    /// top/bottom split. `None` means the slot cannot be halved without falling below
+    /// [`MIN_SLOT_EDGE`], or that the request itself is inconsistent, and it is the caller's signal
+    /// to refuse the whole operation rather than to create a container with no slot.
+    #[must_use]
+    pub fn plan_split(
+        &self,
+        donor: &ContainerId,
+        created: &ContainerId,
+        axis: Option<SplitAxis>,
+    ) -> Option<SlotSplit> {
+        if donor == created || self.contains(created) {
+            return None;
+        }
+
+        let slot = self.get(donor)?;
+        let result = slot.split(axis.unwrap_or_else(|| slot.longer_edge_axis()))?;
+
+        Some(SlotSplit {
+            donor: SlotMove {
+                container: donor.clone(),
+                before: slot,
+                after: result.existing_slot,
+            },
+            created: created.clone(),
+            created_slot: result.new_slot,
+            axis: result.axis,
+        })
+    }
+
+    /// Apply a split: the donor shrinks to its half and the created container takes the other.
+    pub fn apply_split(&mut self, split: &SlotSplit) {
+        self.slots
+            .insert(split.donor.container.clone(), split.donor.after);
+        self.slots.insert(split.created.clone(), split.created_slot);
         self.bump_generation();
     }
 
@@ -1067,6 +1163,201 @@ mod tests {
         slots.apply_release(&release);
 
         assert!(slots.generation() > absorbed);
+    }
+
+    #[test]
+    fn a_split_gives_the_new_container_the_left_half_of_a_wide_slot() {
+        let mut slots = LogicalSlots::default();
+        slots.set(id("donor"), area());
+
+        let split = slots
+            .plan_split(&id("donor"), &id("new"), None)
+            .expect("a full work area can be halved");
+
+        assert_eq!(split.axis, SplitAxis::LeftRight);
+        assert_eq!(split.created_slot, LogicalRect::new(0, 0, 960, 1080));
+        assert_eq!(split.donor.after, LogicalRect::new(960, 0, 960, 1080));
+    }
+
+    #[test]
+    fn a_split_divides_the_longer_edge_of_a_tall_slot() {
+        let mut slots = LogicalSlots::default();
+        slots.set(id("donor"), LogicalRect::new(0, 0, 600, 1080));
+
+        let split = slots
+            .plan_split(&id("donor"), &id("new"), None)
+            .expect("a tall slot can be halved");
+
+        assert_eq!(split.axis, SplitAxis::TopBottom);
+        // A top/bottom split keeps the donor on top.
+        assert_eq!(split.donor.after, LogicalRect::new(0, 0, 600, 540));
+        assert_eq!(split.created_slot, LogicalRect::new(0, 540, 600, 540));
+    }
+
+    #[test]
+    fn a_forced_axis_is_used_instead_of_the_longer_edge() {
+        let mut slots = LogicalSlots::default();
+        slots.set(id("donor"), area());
+
+        let split = slots
+            .plan_split(&id("donor"), &id("new"), Some(SplitAxis::TopBottom))
+            .expect("a full work area can be halved either way");
+
+        assert_eq!(split.axis, SplitAxis::TopBottom);
+        assert_eq!(split.donor.after, LogicalRect::new(0, 0, 1920, 540));
+        assert_eq!(split.created_slot, LogicalRect::new(0, 540, 1920, 540));
+    }
+
+    #[test]
+    fn an_applied_split_still_tiles_the_work_area() {
+        let mut slots = LogicalSlots::default();
+        slots.set(id("donor"), LogicalRect::new(0, 0, 1921, 1080));
+
+        let split = slots
+            .plan_split(&id("donor"), &id("new"), None)
+            .expect("an odd width can still be halved");
+
+        slots.apply_split(&split);
+
+        // The donor keeps the odd remainder pixel, and the halves leave no uncovered column.
+        assert_eq!(
+            slots.get(&id("new")),
+            Some(LogicalRect::new(0, 0, 960, 1080))
+        );
+        assert_eq!(
+            slots.get(&id("donor")),
+            Some(LogicalRect::new(960, 0, 961, 1080))
+        );
+        assert!(
+            slots
+                .validate_coverage(LogicalRect::new(0, 0, 1921, 1080))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn planning_a_split_writes_nothing_until_it_is_applied() {
+        let mut slots = LogicalSlots::default();
+        slots.set(id("donor"), area());
+
+        let generation = slots.generation();
+        let split = slots
+            .plan_split(&id("donor"), &id("new"), None)
+            .expect("a full work area can be halved");
+
+        assert_eq!(slots.get(&id("donor")), Some(area()));
+        assert!(!slots.contains(&id("new")));
+        assert_eq!(slots.generation(), generation);
+
+        slots.apply_split(&split);
+
+        assert_eq!(slots.len(), 2);
+        assert!(slots.generation() > generation);
+    }
+
+    #[test]
+    fn a_slot_too_small_to_halve_refuses_to_split() {
+        let mut slots = LogicalSlots::default();
+        slots.set(id("donor"), LogicalRect::new(0, 0, 3, 3));
+
+        assert!(slots.plan_split(&id("donor"), &id("new"), None).is_none());
+    }
+
+    #[test]
+    fn a_split_is_refused_when_the_donor_or_the_new_container_is_wrong() {
+        let mut slots = LogicalSlots::default();
+        slots.set(id("donor"), LogicalRect::new(0, 0, 960, 1080));
+        slots.set(id("other"), LogicalRect::new(960, 0, 960, 1080));
+
+        // A donor which holds no slot cannot give half of it away.
+        assert!(slots.plan_split(&id("missing"), &id("new"), None).is_none());
+        // A container which already holds a slot is not being created.
+        assert!(slots.plan_split(&id("donor"), &id("other"), None).is_none());
+        assert!(slots.plan_split(&id("donor"), &id("donor"), None).is_none());
+    }
+
+    #[test]
+    fn a_neighbour_is_chosen_left_before_right_before_up_before_down() {
+        let mut slots = LogicalSlots::default();
+        slots.set(id("focused"), LogicalRect::new(960, 540, 960, 540));
+        slots.set(id("left"), LogicalRect::new(0, 540, 960, 540));
+        slots.set(id("up"), LogicalRect::new(960, 0, 960, 540));
+
+        assert_eq!(slots.adjacent_neighbour(&id("focused")), Some(id("left")));
+
+        // With the left neighbour gone the up neighbour is the only remaining candidate.
+        slots.remove(&id("left"));
+        assert_eq!(slots.adjacent_neighbour(&id("focused")), Some(id("up")));
+    }
+
+    #[test]
+    fn several_neighbours_on_a_vertical_edge_are_taken_top_to_bottom() {
+        let mut slots = LogicalSlots::default();
+        slots.set(id("focused"), LogicalRect::new(960, 0, 960, 1080));
+        slots.set(id("bottom_left"), LogicalRect::new(0, 540, 960, 540));
+        slots.set(id("top_left"), LogicalRect::new(0, 0, 960, 540));
+
+        assert_eq!(
+            slots.adjacent_neighbour(&id("focused")),
+            Some(id("top_left"))
+        );
+    }
+
+    #[test]
+    fn several_neighbours_on_a_horizontal_edge_are_taken_left_to_right() {
+        let mut slots = LogicalSlots::default();
+        slots.set(id("focused"), LogicalRect::new(0, 540, 1920, 540));
+        slots.set(id("up_right"), LogicalRect::new(960, 0, 960, 540));
+        slots.set(id("up_left"), LogicalRect::new(0, 0, 960, 540));
+
+        assert_eq!(
+            slots.adjacent_neighbour(&id("focused")),
+            Some(id("up_left"))
+        );
+    }
+
+    #[test]
+    fn a_partial_neighbour_is_still_a_recipient() {
+        let mut slots = three_slot_workspace();
+
+        // `top_right` covers only half of `left`'s right edge, so it cannot absorb that slot, but
+        // it can perfectly well receive a window.
+        assert!(
+            slots
+                .complete_edge_group(
+                    slots.get(&id("left")).unwrap(),
+                    OperationDirection::Right,
+                    &id("left")
+                )
+                .is_some()
+        );
+        slots.remove(&id("bottom_right"));
+        assert!(
+            slots
+                .complete_edge_group(
+                    slots.get(&id("left")).unwrap(),
+                    OperationDirection::Right,
+                    &id("left")
+                )
+                .is_none()
+        );
+        assert_eq!(slots.adjacent_neighbour(&id("left")), Some(id("top_right")));
+    }
+
+    #[test]
+    fn a_lone_or_diagonal_slot_has_no_neighbour() {
+        let mut slots = LogicalSlots::default();
+        slots.set(id("only"), area());
+
+        assert_eq!(slots.adjacent_neighbour(&id("only")), None);
+        assert_eq!(slots.adjacent_neighbour(&id("missing")), None);
+
+        // Sharing nothing but a corner is not adjacency.
+        let mut diagonal = LogicalSlots::default();
+        diagonal.set(id("a"), LogicalRect::new(0, 0, 960, 540));
+        diagonal.set(id("b"), LogicalRect::new(960, 540, 960, 540));
+
+        assert_eq!(diagonal.adjacent_neighbour(&id("a")), None);
     }
 
     #[test]
