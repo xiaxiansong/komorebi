@@ -101,17 +101,45 @@ Gaps therefore cannot change adjacency: two containers are neighbours because th
 touch, whatever the gap between the windows drawn in them. A 50:50 split of an odd number of pixels
 gives the extra pixel to the older container.
 
+## The desktop komorebi opens on
+
+Every monitor is given four workspaces as komorebi learns about it - at startup and again when a
+monitor is plugged in - so the count does not depend on that monitor being named in
+`komorebi.json`. Configuration which asks for more still gets more; nothing ever shrinks the list.
+
+The windows already open when komorebi starts are enumerated into the *first* workspace of the
+monitor they are on, and the windows belonging to another monitor are given back to it, so initial
+adoption reaches workspace one and no other: the remaining workspaces open empty, with no
+containers. Those windows are then folded into a single container, the first one, in the desktop's
+own front-to-back order, so the window which was in the foreground is on top of the stack. Every
+window keeps its placement, visibility and presentation through the fold; only which container owns
+it is decided here.
+
+This is what `window_adoption_behaviour` selects. `SeparateContainers` keeps upstream's adoption,
+where each window found is given a container of its own.
+
+A komorebi which is restarting from a dumped state document applies that state instead: the
+arrangement a crash interrupted is restored rather than replaced by a fresh adoption. Passing
+`--clean-state` to `komorebic start` is what makes a start a cold one.
+
 ## Configuration
 
 | Field | Meaning | Default |
 | --- | --- | --- |
+| `default_workspace_count` | Workspaces every monitor is given, named in the configuration or not | `4` |
+| `window_adoption_behaviour` | What happens to the windows already open when komorebi starts | `SingleContainer` |
 | `floating_move_delta` | Step used by `komorebic move-floating-window` when no delta is passed | `50` |
 | `floating_resize_delta` | Step used by `komorebic resize-floating-window` when no delta is passed | `50` |
 
-Both are steps in logical units, scaled to the DPI of the monitor the window is on, and both are
-ordinary `komorebi.json` fields with serde defaults, so a configuration written for an older
-komorebi still loads. They are deliberately separate from `resize_delta`, which is the step for
-resizing a *container*.
+The two deltas are steps in logical units, scaled to the DPI of the monitor the window is on. All
+four are ordinary `komorebi.json` fields with serde defaults, so a configuration written for an
+older komorebi still loads, and a configuration which does not mention one leaves it at its
+default. The deltas are deliberately separate from `resize_delta`, which is the step for resizing a
+*container*.
+
+`window_adoption_behaviour` is read once, by the desktop enumeration during startup. Changing it
+and reloading stores it for the next start rather than for the running one, because the desktop has
+already been adopted by then.
 
 ## State documents
 
@@ -166,3 +194,6 @@ randomized sequences.
 - Containers and workspaces have stable IDs, and the commands which address them by ID are additions
   rather than replacements: the index-based commands still work.
 - The state document is versioned, and a document from an older komorebi is not applied.
+- Every monitor opens with four workspaces rather than one, and the windows already open are
+  adopted into a single container rather than one container each. Both are configurable, and
+  `window_adoption_behaviour: "SeparateContainers"` restores upstream's adoption.

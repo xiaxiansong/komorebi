@@ -152,6 +152,16 @@
       "format": "int32",
       "default": 10
     },
+    "default_workspace_count": {
+      "description": "Number of workspaces to create on every monitor, including monitors which this\nconfiguration does not name (default: 4)",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "default": 4,
+      "minimum": 0
+    },
     "default_workspace_padding": {
       "description": "Global default workspace padding",
       "type": [
@@ -544,6 +554,18 @@
         }
       ],
       "default": "Op"
+    },
+    "window_adoption_behaviour": {
+      "description": "Determine what happens to the windows which are already open when komorebi starts",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/WindowAdoptionBehaviour"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": "SingleContainer"
     },
     "window_container_behaviour": {
       "description": "Determine what happens when a new window is opened",
@@ -4230,6 +4252,21 @@
       },
       "required": [
         "path"
+      ]
+    },
+    "WindowAdoptionBehaviour": {
+      "description": "Adoption behaviour for the windows which are already open when komorebi starts",
+      "oneOf": [
+        {
+          "description": "Adopt every window already open into the first workspace's first container",
+          "type": "string",
+          "const": "SingleContainer"
+        },
+        {
+          "description": "Give every window already open a container of its own",
+          "type": "string",
+          "const": "SeparateContainers"
+        }
       ]
     },
     "WindowContainerBehaviour": {

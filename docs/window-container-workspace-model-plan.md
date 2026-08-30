@@ -2174,7 +2174,7 @@ only from `komorebi.json`, so a monitor the configuration does not name is born 
 - [x] 16C: `default_workspace_count`, a configuration field with a serde default of four, applied
   to every monitor as it is loaded and as it is connected, so the count does not depend on a
   monitor being named in the configuration. Configuration which asks for more still gets more.
-- [ ] 16D: regenerate `schema.json`, document both fields, update this plan, rebuild, install and
+- [x] 16D: regenerate `schema.json`, document both fields, update this plan, rebuild, install and
   verify against the live desktop.
 
 Planned files: `komorebi/src/workspace.rs`, `komorebi/src/windows_api.rs`,
@@ -2228,6 +2228,37 @@ count of zero is stored as one: a monitor with no workspace has nowhere to put a
 
 Verification: komorebi 537 -> 539 passing, full serial suite green; `cargo fmt --check` clean;
 Clippy clean apart from the pre-existing warning.
+
+16D actual files: `schema.json`, `docs/window-model.md`, this plan. Deployment files:
+`%USERPROFILE%\komorebi.json` (backed up as `komorebi.json.bak-20260831-072003`), and the four
+installed binaries.
+
+The schema was regenerated from the release `komorebic`, as in Phase 14E: both new fields carry
+their descriptions and defaults, and `check_schema_docs.py` reports neither of them among its 644
+pre-existing missing docstrings. It has to be run with `PYTHONUTF8=1` on this machine, where
+Python's default encoding is GBK and the schema is UTF-8.
+
+The live verification is the phase's real result. Cold start with `--clean-state` on commit
+`2d49746d`: one monitor, four workspaces, workspace one holding a single active container with all
+five windows in it, the foreground window on top of its stack and focused, one logical slot exactly
+covering the work area, three workspaces with no containers at all, and no ERROR or WARN in the log
+since the process booted.
+
+A bounded command smoke test followed, chosen so that it returns the desktop to the state it
+started in. `create-container` split the work area 50:50 with the new container on the left and the
+donor's most recently focused window in it; `focus right` and `focus left` moved between them;
+`raise-next-stack-window` answered exit 10 on a single-window container and reordered the
+four-window stack without changing its membership; `move-floating-window` answered exit 11 on a
+stored window; `toggle-float` left the window in the container it was already in; a 120-unit move
+and a 100-unit right-edge increase moved 150 and 125 physical pixels on this 125% display, changed
+only the floating rectangle's x and width respectively, and left the slot generation untouched;
+`destroy-container` gave the lone window back at the bottom of the surviving stack, expanded that
+container over the whole work area, and focused its own top window rather than following the window
+it received. Both AutoHotkey scripts pass `/validate` and every `komorebic` subcommand they name
+exists in the new binary.
+
+Verification: komorebi 539 passing; `cargo fmt --check` clean; Clippy clean apart from the
+pre-existing warning; schema regenerated; live desktop verified as above.
 
 ## Provisional affected-file inventory
 
