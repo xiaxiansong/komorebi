@@ -2169,7 +2169,7 @@ only from `komorebi.json`, so a monitor the configuration does not name is born 
   each window's placement, visibility, presentation and floating rectangle intact, the stack order
   of the ring preserved top to bottom, both histories left describing only what still exists, and
   the arrangement invalidated. Unit tests in `workspace.rs`.
-- [ ] 16B: apply it to initial adoption, behind a `window_adoption_behaviour` configuration field
+- [x] 16B: apply it to initial adoption, behind a `window_adoption_behaviour` configuration field
   with a serde default, so the upstream one-container-per-window adoption stays reachable.
 - [ ] 16C: `default_workspace_count`, a configuration field with a serde default of four, applied
   to every monitor as it is loaded and as it is connected, so the count does not depend on a
@@ -2197,6 +2197,23 @@ folded around rather than into.
 Verification: komorebi 527 -> 534 passing, full serial suite green; `cargo fmt --check` clean;
 `cargo clippy --workspace --all-targets` clean apart from the pre-existing `items after a test
 module` warning.
+
+16B actual files: `komorebi/src/core/mod.rs`, `komorebi/src/lib.rs`,
+`komorebi/src/static_config.rs`, `komorebi/src/windows_api.rs`.
+
+The fold is applied at the end of `load_workspace_information`, after the windows belonging to
+other monitors have been given back, so nothing is folded in and then taken out again. The
+behaviour travels as a global rather than through the call, because the enumeration runs from
+`WindowManager::init` with no configuration in reach; `apply_globals` sets it during preload, which
+happens first. A reload stores it for the next start rather than for this one, and that is what the
+comment on it says, because the desktop has already been adopted by then.
+
+`window_adoption_behaviour` is absent-means-unsaid like every other field here: a configuration
+which does not mention it leaves the global alone, so a reload cannot silently reset it, and an
+existing `komorebi.json` deserializes unchanged.
+
+Verification: komorebi 534 -> 537 passing, full serial suite green; `cargo fmt --check` clean;
+Clippy clean apart from the pre-existing warning.
 
 ## Provisional affected-file inventory
 

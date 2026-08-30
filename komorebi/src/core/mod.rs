@@ -525,6 +525,19 @@ pub enum WindowContainerBehaviour {
     Clone, Copy, Debug, Default, Serialize, Deserialize, Display, EnumString, ValueEnum, PartialEq,
 )]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+/// Adoption behaviour for the windows which are already open when komorebi starts
+pub enum WindowAdoptionBehaviour {
+    /// Adopt every window already open into the first workspace's first container
+    #[default]
+    SingleContainer,
+    /// Give every window already open a container of its own
+    SeparateContainers,
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, Serialize, Deserialize, Display, EnumString, ValueEnum, PartialEq,
+)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 /// Floating layer behaviour when a new window is opened
 pub enum FloatingLayerBehaviour {
     /// Tile new windows (unless they match a float rule or float override is active)

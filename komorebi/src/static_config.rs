@@ -29,9 +29,11 @@ use crate::SLOW_APPLICATION_COMPENSATION_TIME;
 use crate::SLOW_APPLICATION_IDENTIFIERS;
 use crate::TRANSPARENCY_BLACKLIST;
 use crate::TRAY_AND_MULTI_WINDOW_IDENTIFIERS;
+use crate::WINDOW_ADOPTION_BEHAVIOUR;
 use crate::WINDOW_HANDLING_BEHAVIOUR;
 use crate::WINDOWS_11;
 use crate::WORKSPACE_MATCHING_RULES;
+use crate::WindowAdoptionBehaviour;
 use crate::WindowHandlingBehaviour;
 use crate::animation::ANIMATION_DURATION_GLOBAL;
 use crate::animation::ANIMATION_DURATION_PER_ANIMATION;
@@ -516,6 +518,10 @@ pub struct StaticConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schemars", schemars(extend("default" = WindowContainerBehaviour::Create)))]
     pub window_container_behaviour: Option<WindowContainerBehaviour>,
+    /// Determine what happens to the windows which are already open when komorebi starts
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(extend("default" = WindowAdoptionBehaviour::SingleContainer)))]
+    pub window_adoption_behaviour: Option<WindowAdoptionBehaviour>,
     /// Enable or disable float override, which makes it so every new window opens in floating mode
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schemars", schemars(extend("default" = false)))]
@@ -893,6 +899,7 @@ impl From<&WindowManager> for StaticConfig {
             window_container_behaviour: Option::from(
                 value.window_management_behaviour.current_behaviour,
             ),
+            window_adoption_behaviour: Option::from(WINDOW_ADOPTION_BEHAVIOUR.load()),
             float_override: Option::from(value.window_management_behaviour.float_override),
             floating_layer_behaviour: Option::from(
                 value.window_management_behaviour.floating_layer_behaviour,
@@ -1007,6 +1014,13 @@ impl StaticConfig {
         if let Some(behaviour) = self.window_hiding_behaviour {
             let mut window_hiding_behaviour = HIDING_BEHAVIOUR.lock();
             *window_hiding_behaviour = behaviour;
+        }
+
+        // Read once, by the desktop enumeration during `WindowManager::init`, which happens after
+        // the configuration is preloaded. A reload stores it for the next start rather than for
+        // this one: the desktop has already been adopted.
+        if let Some(behaviour) = self.window_adoption_behaviour {
+            WINDOW_ADOPTION_BEHAVIOUR.store(behaviour);
         }
 
         if let Some(height) = self.minimum_window_height {
@@ -2018,6 +2032,8 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::StaticConfig;
+    use crate::WINDOW_ADOPTION_BEHAVIOUR;
+    use crate::WindowAdoptionBehaviour;
     use crate::WorkspaceConfig;
 
     #[test]
@@ -2090,5 +2106,54 @@ mod tests {
         #[allow(deprecated)]
         let custom_layout_rules = config.custom_layout_rules;
         assert_eq!(custom_layout_rules, None);
+    }
+
+    #[test]
+    fn a_configuration_without_an_adoption_behaviour_still_reads() {
+        let config = serde_json::from_str::<StaticConfig>("{}").unwrap();
+
+        // Absent means "this configuration does not say", and the startup default applies.
+        assert_eq!(config.window_adoption_behaviour, None);
+    }
+
+    #[test]
+    fn an_adoption_behaviour_round_trips() {
+        for behaviour in [
+            WindowAdoptionBehaviour::SingleContainer,
+            WindowAdoptionBehaviour::SeparateContainers,
+        ] {
+            let config = serde_json::from_str::<StaticConfig>(&format!(
+                r#"{{ "window_adoption_behaviour": "{behaviour}" }}"#
+            ))
+            .unwrap();
+
+            assert_eq!(config.window_adoption_behaviour, Some(behaviour));
+        }
+    }
+
+    #[test]
+    fn an_adoption_behaviour_reaches_the_global_the_enumeration_reads() {
+        let restore = WINDOW_ADOPTION_BEHAVIOUR.load();
+
+        let mut config = serde_json::from_str::<StaticConfig>(
+            r#"{ "window_adoption_behaviour": "SeparateContainers" }"#,
+        )
+        .unwrap();
+        config.apply_globals().unwrap();
+        assert_eq!(
+            WINDOW_ADOPTION_BEHAVIOUR.load(),
+            WindowAdoptionBehaviour::SeparateContainers
+        );
+
+        // A configuration which does not mention it leaves whatever was there, so a reload cannot
+        // silently reset it.
+        let mut config = serde_json::from_str::<StaticConfig>("{}").unwrap();
+        config.apply_globals().unwrap();
+        assert_eq!(
+            WINDOW_ADOPTION_BEHAVIOUR.load(),
+            WindowAdoptionBehaviour::SeparateContainers
+        );
+
+        WINDOW_ADOPTION_BEHAVIOUR.store(restore);
     }
 }

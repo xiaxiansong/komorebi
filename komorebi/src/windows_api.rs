@@ -163,8 +163,10 @@ use crate::core::Rect;
 use crate::DISPLAY_INDEX_PREFERENCES;
 use crate::DUPLICATE_MONITOR_SERIAL_IDS;
 use crate::MONITOR_INDEX_PREFERENCES;
+use crate::WINDOW_ADOPTION_BEHAVIOUR;
 use crate::WINDOW_HANDLING_BEHAVIOUR;
 use crate::Window;
+use crate::WindowAdoptionBehaviour;
 use crate::WindowHandlingBehaviour;
 use crate::WindowManager;
 use crate::container::Container;
@@ -418,7 +420,16 @@ impl WindowsApi {
         unsafe { EnumWindows(callback, LPARAM(callback_data_address)) }.process()
     }
 
+    /// Adopt the desktop komorebi finds when it starts.
+    ///
+    /// Every window is enumerated into the monitor's *first* workspace and then the windows which
+    /// belong to another monitor are given back, so initial adoption reaches workspace one and
+    /// nothing else - the remaining workspaces open empty. The enumeration gives each window a
+    /// container of its own; whether they stay that way is
+    /// [`WindowAdoptionBehaviour`](crate::WindowAdoptionBehaviour).
     pub fn load_workspace_information(monitors: &mut Ring<Monitor>) -> eyre::Result<()> {
+        let adoption = WINDOW_ADOPTION_BEHAVIOUR.load();
+
         for monitor in monitors.elements_mut() {
             let monitor_name = monitor.name.clone();
             if let Some(workspace) = monitor.workspaces_mut().front_mut() {
@@ -446,6 +457,12 @@ impl WindowsApi {
 
                 for hwnd in windows_on_other_monitors {
                     workspace.remove_window(hwnd)?;
+                }
+
+                // Folded only once the workspace holds exactly the windows which belong to this
+                // monitor, so no window is folded in and then taken back out again.
+                if matches!(adoption, WindowAdoptionBehaviour::SingleContainer) {
+                    workspace.consolidate_containers();
                 }
             }
         }

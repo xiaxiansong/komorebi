@@ -276,6 +276,14 @@ pub static SLOW_APPLICATION_COMPENSATION_TIME: AtomicU64 = AtomicU64::new(20);
 pub static WINDOW_HANDLING_BEHAVIOUR: AtomicCell<WindowHandlingBehaviour> =
     AtomicCell::new(WindowHandlingBehaviour::Sync);
 
+/// How the desktop komorebi finds when it starts is adopted.
+///
+/// Read once, by the enumeration in `WindowsApi::load_workspace_information`, so it has to be set
+/// by the time the window manager initialises - which is what `StaticConfig::apply_globals` does,
+/// since preloading the configuration happens first.
+pub static WINDOW_ADOPTION_BEHAVIOUR: AtomicCell<WindowAdoptionBehaviour> =
+    AtomicCell::new(WindowAdoptionBehaviour::SingleContainer);
+
 shadow_rs::shadow!(build);
 
 pub const PUBLIC_KEY: [u8; 32] = [
