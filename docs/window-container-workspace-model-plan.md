@@ -1403,43 +1403,137 @@ the only rectangle the arrangement will never correct, because nothing else ever
 
 #### Phase 11A - Floating rectangles across work areas
 
-- [ ] Add a pure work-area transfer to `floating_geometry`: position and size scale with the ratio
+- [x] Add a pure work-area transfer to `floating_geometry`: position and size scale with the ratio
   between the areas, then the result is clamped into the target with the existing rule.
-- [ ] Apply it across a container and across a whole workspace, touching only stored floating
+- [x] Apply it across a container and across a whole workspace, touching only stored floating
   rectangles and nothing else about a window.
-- [ ] Add identity, mixed-DPI, clamping, and untouched-stored-window tests.
-- [ ] Commit as `feat: carry floating rectangles between work areas`.
+- [x] Add identity, mixed-DPI, clamping, and untouched-stored-window tests.
+- [x] Commit as `feat: carry floating rectangles between work areas`.
 
-Expected handwritten change: 150-250 lines. Likely files: `floating_geometry.rs`, `container.rs`,
-`workspace.rs`.
+Actual files: `komorebi/src/floating_geometry.rs`, `komorebi/src/container.rs`,
+`komorebi/src/workspace.rs`.
+
+`transfer_between_areas` scales position and size by the ratio between the areas and then reuses
+`clamp_position`, so the two rules a transfer needs stay one rule each: relative placement is the
+scaling, reachability is the clamp. Scaling the size as well as the position is deliberate. A
+window moved from a 1920-wide work area to a 2560-wide one would otherwise keep its pixel width and
+occupy a visibly smaller share of the new display, which reads as the window having shrunk rather
+than as the monitor having changed.
+
+Two degenerate inputs are handled rather than refused, because both are states a monitor
+reconfiguration briefly reports: a source area with no width or height has no ratio to scale by and
+only clamps, and a scaled size is floored at one pixel so a window can never collapse to nothing.
+
+Only stored floating rectangles are rewritten. A stored window's rectangle comes from a slot the
+receiving workspace is about to recalculate in its own coordinates, and a window which has never
+floated has no rectangle to carry: it will be given one by the work area it is in when it first
+floats.
+
+Verification: `komorebi` lib tests 406 -> 416 passing, full workspace suite serial and green.
+`cargo fmt --check` and `cargo clippy --workspace --all-targets` clean apart from the pre-existing
+`items after a test module` warning.
 
 #### Phase 11B - Container adoption by a foreign workspace
 
-- [ ] Add adoption on `Workspace`: an arriving container fills an empty workspace, halves the
+- [x] Add adoption on `Workspace`: an arriving container fills an empty workspace, halves the
   geometry-focused active container's slot when the workspace is occupied, and takes no slot at all
   when it arrives Hidden.
-- [ ] Keep the container's ID, stack, window states and window focus history, and carry its
+- [x] Keep the container's ID, stack, window states and window focus history, and carry its
   floating rectangles into the target work area.
-- [ ] Add the `Monitor` transfer which removes with absorption on one side and adopts on the other,
+- [x] Add the `Monitor` transfer which removes with absorption on one side and adopts on the other,
   atomically.
-- [ ] Add empty-target, occupied-target 50:50, Hidden, preservation, absorption and refusal tests.
-- [ ] Commit as `feat: adopt containers into a foreign workspace`.
+- [x] Add empty-target, occupied-target 50:50, Hidden, preservation, absorption and refusal tests.
+- [x] Commit as `feat: adopt containers into a foreign workspace`.
 
-Expected handwritten change: 250-400 lines. Likely files: `workspace.rs`, `monitor.rs`.
+Actual files: `komorebi/src/workspace.rs`, `komorebi/src/monitor.rs`.
+
+`Workspace::adopt_container` moves the container value, which is what makes its preservation claims
+true by construction rather than field by field: the ID, the stack order, the window focus history
+and every window's placement, visibility, presentation and floating rectangle are the container
+itself. Its windows already name it as their container, so unlike `adopt_managed_window` there is
+nothing to restamp.
+
+Only placement is decided, and the rule follows the container's own state rather than where it came
+from. This is why `ContainerArrival` is a separate type from `NewWindowPlacement` despite the two
+sharing three of their four outcomes: adoption has an outcome placing a new window cannot have,
+which is arriving with nothing for the arrangement to place. A hidden arrival takes no slot, and
+focus does not follow it either - it has no focusable window to move to, and the container which
+was being shown goes on being shown.
+
+The split path reuses `LogicalSlots::plan_split` exactly as `split_for_new_window` does, so the
+division a container gets on arrival and the division a new window's container gets are the same
+code and cannot drift apart. Planning before inserting is what makes a slot which cannot be halved
+cost nothing but the fallback.
+
+Exact hidden restores are discarded on arrival, which the task's invalidation list requires for a
+container moving between monitors. This is the one place adoption is deliberately heavier than
+`split_for_new_window`, which leaves the records to be rejected by their own validity check: a
+container arriving from another work area is a topology change those records describe wrongly
+rather than merely staler.
+
+`Monitor::release_focused_container` and `Monitor::adopt_container` are the two halves the window
+manager needs. Release cancels any preselect first, because a preselect marker indexes a ring which
+is about to change and is not a container of the model. Adopt validates the target workspace before
+it touches the container, so a bad index refuses without stranding a container between two
+workspaces.
+
+Verification: `komorebi` lib tests 416 -> 428 passing, full workspace suite serial and green.
+`cargo fmt --check` and `cargo clippy --workspace --all-targets` clean apart from the pre-existing
+`items after a test module` warning.
 
 #### Phase 11C - Workspace migration and window manager wiring
 
-- [ ] Refuse to move a monitor's last workspace, and move the index-keyed name/last-focused tables
+- [x] Refuse to move a monitor's last workspace, and move the index-keyed name/last-focused tables
   and the global application rules with the workspace, as the ordering phase does.
-- [ ] Rewire `move_container_to_monitor` onto the adoption path so a whole container moves rather
+- [x] Rewire `move_container_to_monitor` onto the adoption path so a whole container moves rather
   than the foreground window the desktop happened to report.
-- [ ] Rewire `move_workspace_to_monitor` and the monitor workspace swap onto the transfer, keeping
+- [x] Rewire `move_workspace_to_monitor` and the monitor workspace swap onto the transfer, keeping
   workspace IDs and names and translating floating rectangles into the target work area.
-- [ ] Add end-to-end transfer, last-workspace refusal, rule-remap, Hidden and focus-follow tests.
-- [ ] Commit as `feat: preserve the model across monitor migrations`.
+- [x] Add end-to-end transfer, last-workspace refusal, rule-remap, Hidden and focus-follow tests.
+- [x] Commit as `feat: preserve the model across monitor migrations`.
 
-Expected handwritten change: 300-450 lines. Likely files: `monitor.rs`, `window_manager.rs`,
-`process_command.rs`.
+Actual files: `komorebi/src/monitor.rs`, `komorebi/src/window_manager.rs`.
+
+`move_container_to_monitor` was moving a window rather than a container. It asked Win32 which
+window had the foreground and, when that window was floating, took only that window across - a
+survival from the model in which a floating window belonged to a workspace's own list rather than
+to a container. It now releases and adopts the whole container, so a floating window changes
+monitor as part of the container which owns it, which is what the ownership invariant requires. A
+move direction, which a drag across a monitor boundary supplies, is mapped to a forced split axis
+rather than to an insertion index, because under adoption an arriving container gets a half of a
+slot rather than a position in a ring.
+
+`Monitor::release_workspace` refuses a monitor's only workspace, which is the phase's stated
+invariant, and returns the rearrangement its removal caused so every index-keyed description of a
+workspace can follow it. It differs from the merge's rearrangement in exactly one respect, and that
+respect is the whole distinction: both `new_idx` and `content_idx` answer `None` for the workspace
+which left, because nothing on this monitor inherited either the workspace or its windows. The
+configured name travels with the workspace rather than staying behind to describe whichever
+workspace slides into the index.
+
+Ordering is load-bearing between the two routing-rule passes, and this is the phase's real hazard.
+`readdress_workspace_rules` sends the departing workspace's rules to the monitor it went to, and it
+must run first, while every index still describes the list the rules were written against.
+Remapping first would slide a following workspace's rule down onto the vacated index, and the
+readdressing pass would then send that rule to the wrong monitor. Both passes run before anything
+talks to the desktop, for the atomicity reason Phase 10C established.
+
+`WindowManager::remove_focused_workspace` was deleted rather than left unused. It removed a
+workspace by index with no refusal at all, so it could leave a monitor with none - the exact state
+this phase exists to make unreachable - and after the rewiring its only remaining caller was its
+own test. That test is replaced by the refusal tests which pin the behaviour it violated. This is
+an intended API removal relative to upstream komorebi.
+
+The monitor workspace swap needed the same treatment as the move on both sides: each list arrives
+in a work area it was not arranged for, so floating rectangles are carried across and the slots and
+manual boundaries are discarded.
+
+Verification: `komorebi` lib tests 428 -> 441 passing, full workspace suite serial and green.
+`cargo fmt --check` and `cargo clippy --workspace --all-targets` clean apart from the pre-existing
+`items after a test module` warning. Size note: 11C came to 615 added and 131 removed lines against
+a 300-450 estimate. Roughly half is tests and the rewritten `move_container_to_monitor` is a
+replacement rather than an edit, so the reviewable unit is smaller than the count suggests, but the
+estimate was low and is recorded as such.
 
 ### Phase 12 - Socket protocol and komorebic CLI
 
@@ -1601,6 +1695,27 @@ This list is updated from actual diffs, not treated as permission to change ever
 - 2026-08-30: Minimize keeps container ownership, so restoring a window from the taskbar is a
   reconciliation rather than a fresh `manage`. This is an intended behaviour change from upstream
   komorebi and is what makes the minimize history able to name windows the workspace still owns.
+- 2026-08-30: A floating rectangle is the only rectangle in the model which no arrangement will
+  ever correct, so it is the only one a monitor transfer has to rewrite. Slots are recalculated for
+  the receiving work area and manual boundaries are discarded, and both of those are cheaper and
+  safer than trying to carry them across a change of area and DPI.
+- 2026-08-30: A transfer scales a floating window's size as well as its position. Keeping the pixel
+  size would make a window occupy a visibly smaller share of a denser display, which reads as the
+  window having shrunk rather than as the monitor having changed.
+- 2026-08-30: `ContainerArrival` is a separate type from `NewWindowPlacement` rather than a reuse of
+  it. They share three outcomes, but adoption has one they cannot share: a container can arrive with
+  nothing for the arrangement to place, and then it takes no slot at all.
+- 2026-08-30: Moving a container to another monitor moves the container, not the foreground window.
+  Upstream took a single floating window across when the desktop reported one as focused; a floating
+  window belongs to a container in this model, so it travels with it. This is an intended behaviour
+  change from upstream komorebi.
+- 2026-08-30: `WindowManager::remove_focused_workspace` was removed rather than guarded. It could
+  leave a monitor with no workspaces, and every caller now goes through `release_workspace`, which
+  refuses that. This is an intended API removal relative to upstream komorebi.
+- 2026-08-30: The two workspace routing-rule passes are ordered readdress-then-remap. The departing
+  workspace's rules must be sent on while the indices still describe the list they were written
+  against; the reverse order slides a following workspace's rule onto the vacated index and then
+  sends that one to the wrong monitor.
 
 ## Progress log
 
@@ -1759,3 +1874,20 @@ This list is updated from actual diffs, not treated as permission to change ever
   that option alone, and Clippy is clean apart from the pre-existing `items after a test module`
   warning. Three tests were corrected after failing, each recorded in its phase. Next phase: 11,
   cross-monitor container and workspace migration.
+- 2026-08-30: Phase 11 turn. The plan was re-read and the worktree confirmed clean at `6cd89fd6`
+  before editing, and `cargo check --workspace --all-targets` was re-run as the turn's baseline.
+  Phase 11 was split into 11A floating rectangles, 11B container adoption and 11C workspace
+  migration and wiring before coding. The phase's hazard turned out to be exactly what the split
+  was drawn around: a monitor transfer crosses a coordinate system, and of every rectangle the
+  model stores only the floating one has to survive it, because it is the only one nothing else
+  will correct. 11C found two defects rather than one. `move_container_to_monitor` was moving a
+  single foreground window instead of a container whenever the desktop reported a floating window
+  as focused, which the ownership invariant forbids, and the routing-rule passes had an ordering
+  constraint which is invisible until a workspace between two ruled ones moves away: readdressing
+  must precede remapping or a following workspace's rule is sent to the wrong monitor.
+  `remove_focused_workspace` was deleted rather than guarded, since it could leave a monitor with
+  no workspaces and its only remaining caller was its own test. Full serial workspace suite passed
+  at every step (komorebi 406 -> 416 -> 428 -> 441 passing); fmt and Clippy clean apart from the
+  pre-existing warning. The 1Password signing agent was unreachable for several minutes again and
+  refused four commit attempts; staging the finished 11B in the index kept the two phases separable
+  while it was down, as in Phase 9. Next phase: 12, socket protocol and komorebic CLI.
