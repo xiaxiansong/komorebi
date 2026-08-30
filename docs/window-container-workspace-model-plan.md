@@ -2300,6 +2300,38 @@ cross-check the AHK probes declared `GetWindowTextW` without `CharSet.Unicode`, 
 back truncated to one character and the panel looked absent when it was on screen. The AHK probes
 were right and the cross-check was wrong.
 
+### Phase 18 - The window a manual split leaves behind
+
+Added on 2026-08-31. The report was that creating a container appears to work - the arrangement
+divides - but the created half draws nothing; pressing the key again fills the half which was empty
+and leaves the newest one empty, and so on down the chain.
+
+The cause is one the model never had to face until a container could give a window away. A stack
+shows the window on top of it and hides every window underneath, so the moment
+`create_container_from_donor` takes the donor's most recent window out, the window left in charge
+of the donor is one komorebi hid when it was pushed down the stack, and nothing told it that it is
+now the window being shown. The donor keeps half of the work area and draws an empty rectangle in
+it. Only the *moved* window came out looking right, and by accident: the created container takes
+focus, and `raise_and_focus_window` passes `SWP_SHOWWINDOW`, so the focus call revealed it. That
+accident is also the whole of the chain the user saw - each press revealed the window the previous
+press had left hidden.
+
+- [x] 18A: `create_container_from_donor` loads the donor's focused window after the removal, the
+  way `take_window` and `move_window_to_container` already do on the same removal, and loads the
+  created container's focused window after the arrival, so that what a container shows is decided
+  by the container and not by whichever Win32 call happens to follow.
+
+Both calls are `Container::load_focused_window`, which shows the focused stored window, hides the
+rest, leaves floating windows alone and never restores a minimized one - so a split which creates a
+hidden container, or which leaves a hidden donor behind, still shows nothing, which is correct.
+
+Verified by a regression test rather than by inspection.
+`a_manual_split_shows_the_window_each_container_is_left_showing` asserts against `HIDDEN_HWNDS`,
+the set komorebi hides windows into, so it observes the reveal itself rather than a model field. It
+fails on the code as it was - the window left behind stays in the hidden set - and passes with the
+load in place. The serial komorebi suite passes at 540, fmt is clean, and Clippy reports only the
+pre-existing `items_after_test_module` warning.
+
 ## Provisional affected-file inventory
 
 This list is updated from actual diffs, not treated as permission to change every file.
@@ -2763,3 +2795,17 @@ This list is updated from actual diffs, not treated as permission to change ever
   does not survive it. Verified end to end rather than by reading: the elevated hotkey layer was
   reloaded through the watchdog by removing its pid file, and a `SendLevel 1` probe opened and
   closed the panel with both keys from a clean start while `komorebic state` showed it unmanaged.
+- 2026-08-31: Phase 18 turn. The plan was re-read and the worktree inspected first; it was clean on
+  `d41a29ff`. The report was a manual split whose created half draws nothing, and the diagnosis
+  came from the two screenshots rather than from a log: the empty half moves along by one every
+  press, which is the signature of a reveal happening one operation late. `create_container_from_donor`
+  was the only removal path in the workspace which did not load the donor's focused window
+  afterwards, and the container which was drawing nothing was the donor, not the new container -
+  the new one was being shown by its focus call, which is why it looked like the *new* container
+  was empty. Fixed in the model, next to the removal, so the CLI, the socket and the harness all
+  get it. The regression test asserts on `HIDDEN_HWNDS` so it observes the reveal itself; it was
+  confirmed to fail on the unfixed code before being kept. Serial suite 540 passing, fmt clean,
+  Clippy unchanged. Two window_manager tests fail under the default parallel runner both before and
+  after this change - they assert on the same global hidden set that other tests mutate - which is
+  a pre-existing test-isolation defect, not a regression, and is recorded here rather than fixed in
+  a bug-fix turn.

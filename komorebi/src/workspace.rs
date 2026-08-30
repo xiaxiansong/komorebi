@@ -3260,7 +3260,18 @@ impl Workspace {
             .and_then(|donor| donor.remove_window_by_idx(window_idx))
             .ok_or_eyre("the donor window disappeared while it was being moved")?;
 
+        // A stack only ever shows the window on top of it, so everything below the window which
+        // has just been taken away has been hidden all along. The donor keeps its half of the
+        // slot, so unless it is told to show what it is now showing it draws an empty rectangle.
+        if let Some(donor) = self.containers_mut().get_mut(donor_idx) {
+            donor.load_focused_window();
+        }
+
         container.add_managed_window(window);
+
+        // The window which was pulled out of the stack may have been a hidden member of it too,
+        // and the container it has landed in is the only thing which knows it is now on top.
+        container.load_focused_window();
 
         // The created container is inserted where its half actually is, and after the donor when
         // there is no half because the arrangement is about to be recalculated.
@@ -8572,6 +8583,50 @@ mod tests {
         assert_eq!(workspace.containers()[donor_idx].windows().len(), 1);
         assert!(!workspace.logical_slots.contains(&donor_id));
         assert_eq!(slot_of(&workspace, &created), LogicalRect::from(area));
+    }
+
+    /// Whether komorebi currently believes it has hidden `hwnd`.
+    ///
+    /// This is the set a stack hides its lower windows into, so it is what says whether a window
+    /// which is supposed to be on screen is actually being drawn.
+    fn is_programmatically_hidden(hwnd: isize) -> bool {
+        crate::HIDDEN_HWNDS.lock().contains(&hwnd)
+    }
+
+    #[test]
+    fn a_manual_split_shows_the_window_each_container_is_left_showing() {
+        // Handles no other test uses: the hidden set is global.
+        const TOP: isize = 9_102;
+        const BELOW: isize = 9_101;
+
+        let area = work_area(1920, 1080);
+        let mut workspace = Workspace::default();
+        let mut container = Container::default();
+        container.add_window(Window::from(BELOW));
+        container.add_window(Window::from(TOP));
+        workspace.add_container_to_back(container);
+        workspace.record_logical_slots(area);
+
+        // Only the top of the stack is on screen before the split.
+        assert!(is_programmatically_hidden(BELOW));
+        assert!(!is_programmatically_hidden(TOP));
+
+        let created = workspace.create_container_from_donor(None).unwrap();
+        let created_idx = workspace.container_idx_for_id(&created).unwrap();
+
+        // The window which was pulled out is the one its new container shows.
+        assert_eq!(
+            workspace.containers()[created_idx]
+                .focused_window()
+                .unwrap()
+                .hwnd,
+            TOP
+        );
+        assert!(!is_programmatically_hidden(TOP));
+
+        // And the window left behind is no longer hidden underneath it: the donor keeps half the
+        // work area, so it has to draw something in it.
+        assert!(!is_programmatically_hidden(BELOW));
     }
 
     #[test]
