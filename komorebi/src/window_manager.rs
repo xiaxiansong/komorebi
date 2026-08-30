@@ -64,6 +64,7 @@ use crate::floating_geometry::FloatingBounds;
 use crate::floating_geometry::FloatingLimits;
 use crate::floating_geometry::scale_delta;
 use crate::geometry::SplitAxis;
+use crate::invariants::ValidateInvariants;
 use crate::load_configuration;
 use crate::managed_window::FloatingRejection;
 use crate::managed_window::Presentation;
@@ -911,6 +912,80 @@ impl WindowManager {
         window.focus(self.mouse_follows_focus)?;
 
         Ok(Some(hwnd))
+    }
+
+    /// Apply a change to a copy of the focused workspace, validate it, and commit it only if the
+    /// model would be left consistent.
+    ///
+    /// This is the "validate before committing" rule made structural rather than remembered. A
+    /// refusal by the operation itself never wrote anything, and a result which breaks an
+    /// invariant is thrown away with the copy, so a compound operation cannot leave an empty
+    /// container, an overlapping slot or a dangling history entry behind. The desktop is only
+    /// touched once the model has been accepted.
+    fn commit_workspace_change<F>(&mut self, apply: F) -> eyre::Result<CommandResponse>
+    where
+        F: FnOnce(&mut Workspace) -> CommandResponse,
+    {
+        let mut candidate = self.focused_workspace()?.clone();
+        let response = apply(&mut candidate);
+
+        if !response.outcome.changed_state() {
+            return Ok(response);
+        }
+
+        let violations = candidate.validate_invariants();
+        if !violations.is_empty() {
+            return Ok(CommandResponse::from_violations(&violations));
+        }
+
+        *self.focused_workspace_mut()? = candidate;
+        self.update_focused_workspace(true, true)?;
+
+        Ok(response)
+    }
+
+    /// Split a new container off an eligible donor on the focused workspace.
+    ///
+    /// `axis` forces the dividing line and `None` divides the donor's longer edge, exactly as an
+    /// automatically placed window divides one. Focus follows the created container: the window
+    /// the operator just pulled out of a stack is the one they are working with.
+    pub fn create_container(&mut self, axis: Option<SplitAxis>) -> eyre::Result<CommandResponse> {
+        self.commit_workspace_change(|workspace| {
+            match workspace.create_container_from_donor(axis) {
+                Ok(created) => {
+                    if let Some(idx) = workspace.container_idx_for_id(&created) {
+                        workspace.focus_container(idx);
+                    }
+
+                    CommandResponse::new(
+                        CommandOutcome::Success,
+                        format!("created container {created}"),
+                    )
+                }
+                Err(error) => CommandResponse::new(CommandOutcome::NoTarget, error.to_string()),
+            }
+        })
+    }
+
+    /// Destroy the focused container, sharing out every window it still holds.
+    ///
+    /// A container with windows and nowhere to send them is the last container of a workspace, and
+    /// destroying it would leave its windows owned by nothing; that is refused rather than
+    /// half-performed.
+    pub fn destroy_focused_container(&mut self) -> eyre::Result<CommandResponse> {
+        self.commit_workspace_change(|workspace| {
+            if workspace.containers().is_empty() {
+                return CommandResponse::new(
+                    CommandOutcome::NoTarget,
+                    "this workspace has no container to destroy",
+                );
+            }
+
+            match workspace.destroy_focused_container() {
+                Ok(()) => CommandResponse::new(CommandOutcome::Success, "destroyed the container"),
+                Err(error) => CommandResponse::new(CommandOutcome::NoTarget, error.to_string()),
+            }
+        })
     }
 
     /// Set the global pause state, reporting whether it changed.
@@ -4969,6 +5044,84 @@ mod tests {
 
         assert!(!wm.suspend_managed_window(42).unwrap());
         assert!(wm.temporarily_unmanaged_hwnds.contains(&42));
+    }
+
+    #[test]
+    fn creating_a_container_splits_the_donor_and_follows_focus() {
+        let (mut wm, _test_context) = window_manager_with_container(&[42, 43]);
+
+        // The desktop focus which follows the split cannot succeed for unreal handles; what this
+        // asserts is the model the command committed before going near Win32.
+        let _ = wm.create_container(Some(SplitAxis::LeftRight));
+
+        let workspace = wm.focused_workspace().unwrap();
+        assert_eq!(workspace.containers().len(), 2);
+        assert!(
+            workspace
+                .containers()
+                .iter()
+                .all(|container| container.windows().len() == 1)
+        );
+        assert_eq!(
+            workspace.focused_container().unwrap().windows().len(),
+            1,
+            "the created container should be focused"
+        );
+    }
+
+    #[test]
+    fn creating_a_container_without_an_eligible_donor_refuses() {
+        let (mut wm, _test_context) = window_manager_with_container(&[42]);
+
+        let response = wm.create_container(None).unwrap();
+
+        assert_eq!(response.outcome, CommandOutcome::NoTarget);
+        assert_eq!(wm.focused_workspace().unwrap().containers().len(), 1);
+    }
+
+    #[test]
+    fn destroying_a_container_deals_its_windows_out() {
+        let (mut wm, _test_context) = window_manager_with_container(&[42, 43]);
+        let _ = wm.create_container(Some(SplitAxis::LeftRight));
+
+        let _ = wm.destroy_focused_container();
+
+        let workspace = wm.focused_workspace().unwrap();
+        assert_eq!(workspace.containers().len(), 1);
+        assert_eq!(workspace.containers()[0].windows().len(), 2);
+        assert!(workspace.contains_window(42));
+        assert!(workspace.contains_window(43));
+    }
+
+    #[test]
+    fn destroying_the_only_container_holding_windows_refuses() {
+        let (mut wm, _test_context) = window_manager_with_container(&[42, 43]);
+
+        let response = wm.destroy_focused_container().unwrap();
+
+        assert_eq!(response.outcome, CommandOutcome::NoTarget);
+        let workspace = wm.focused_workspace().unwrap();
+        assert_eq!(workspace.containers().len(), 1);
+        assert_eq!(workspace.containers()[0].windows().len(), 2);
+    }
+
+    #[test]
+    fn destroying_a_container_on_an_empty_workspace_reports_no_target() {
+        let (mut wm, _test_context) = setup_window_manager();
+        let monitor = monitor::new(
+            0,
+            Rect::default(),
+            Rect::default(),
+            "TestMonitor".to_string(),
+            "TestDevice".to_string(),
+            "TestDeviceID".to_string(),
+            Some("TestMonitorID".to_string()),
+        );
+        wm.monitors_mut().push_back(monitor);
+
+        let response = wm.destroy_focused_container().unwrap();
+
+        assert_eq!(response.outcome, CommandOutcome::NoTarget);
     }
 
     #[test]

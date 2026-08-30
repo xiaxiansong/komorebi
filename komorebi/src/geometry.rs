@@ -6,6 +6,7 @@
 //! never change which slots are considered adjacent, and rounding can never open a hole between
 //! two slots that logically share an edge.
 
+use clap::ValueEnum;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -278,7 +279,7 @@ impl fmt::Display for LogicalRect {
 }
 
 /// The dividing line used when a slot is split in two.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub enum SplitAxis {
     /// A vertical dividing line producing a left and a right slot.

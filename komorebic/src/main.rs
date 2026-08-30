@@ -59,6 +59,7 @@ use komorebi_client::OperationDirection;
 use komorebi_client::Rect;
 use komorebi_client::Sizing;
 use komorebi_client::SocketMessage;
+use komorebi_client::SplitAxis;
 use komorebi_client::StateQuery;
 use komorebi_client::StaticConfig;
 use komorebi_client::WindowKind;
@@ -380,6 +381,13 @@ struct Resize {
     edge: OperationDirection,
     #[clap(value_enum)]
     sizing: Sizing,
+}
+
+#[derive(Parser)]
+struct CreateContainer {
+    /// Dividing line for the split [default: the donor's longer edge]
+    #[clap(value_enum)]
+    axis: Option<SplitAxis>,
 }
 
 #[derive(Parser)]
@@ -1447,6 +1455,10 @@ enum SubCommand {
     ToggleLock,
     /// Restore all hidden windows (debugging command)
     RestoreWindows,
+    /// Split a new container off the most recently focused container with windows to spare
+    CreateContainer(CreateContainer),
+    /// Destroy the focused container, sharing its windows out among the containers which remain
+    DestroyContainer,
     /// Force komorebi to manage the focused window
     Manage,
     /// Unmanage a window that was forcibly managed
@@ -3260,6 +3272,12 @@ if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
         }
         SubCommand::ToggleTitleBars => {
             send_message(&SocketMessage::ToggleTitleBars)?;
+        }
+        SubCommand::CreateContainer(args) => {
+            send_command(&SocketMessage::CreateContainer(args.axis))?;
+        }
+        SubCommand::DestroyContainer => {
+            send_command(&SocketMessage::DestroyContainer)?;
         }
         SubCommand::Manage => {
             send_message(&SocketMessage::ManageFocusedWindow)?;

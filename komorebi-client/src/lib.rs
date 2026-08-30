@@ -73,6 +73,7 @@ pub use komorebi::core::StateQuery;
 pub use komorebi::core::WindowKind;
 pub use komorebi::core::config_generation::ApplicationConfigurationGenerator;
 pub use komorebi::core::replace_env_in_path;
+pub use komorebi::geometry::SplitAxis;
 pub use komorebi::monitor::Monitor;
 pub use komorebi::monitor_reconciliator::MonitorNotification;
 pub use komorebi::ring::Ring;

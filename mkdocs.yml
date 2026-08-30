@@ -133,6 +133,8 @@ nav:
       - cli/move-floating-window.md
       - cli/resize-floating-window.md
       - cli/restore-last-minimized-window.md
+      - cli/create-container.md
+      - cli/destroy-container.md
       - cli/move-to-monitor.md
       - cli/cycle-move-to-monitor.md
       - cli/move-to-workspace.md

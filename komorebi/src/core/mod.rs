@@ -15,6 +15,7 @@ use strum::EnumString;
 
 use crate::KomorebiTheme;
 use crate::animation::prefix::AnimationPrefix;
+use crate::geometry::SplitAxis;
 use crate::state::State;
 
 // Re-export everything from komorebi-layouts
@@ -132,6 +133,15 @@ pub enum SocketMessage {
     ToggleMonocleFocusBehaviour,
     MonocleFocusBehaviour(MonocleFocusBehaviour),
     UnmanagedWindowOperationBehaviour(OperationBehaviour),
+    /// Split a new container off an eligible donor on the focused workspace.
+    ///
+    /// The donor is the most recently focused active container holding at least two windows, and
+    /// it gives up its most recently focused window. An omitted axis divides the donor's longer
+    /// edge.
+    CreateContainer(Option<SplitAxis>),
+    /// Destroy the focused container, dealing every window it holds out to the containers which
+    /// remain.
+    DestroyContainer,
     // Current Workspace Commands
     ManageFocusedWindow,
     UnmanageFocusedWindow,

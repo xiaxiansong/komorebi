@@ -1916,6 +1916,14 @@ if (!(Get-Process komorebi-bar -ErrorAction SilentlyContinue))
                     }));
                 }
             }
+            SocketMessage::CreateContainer(axis) => {
+                let response = self.create_container(axis)?;
+                Self::respond(&mut reply, &response);
+            }
+            SocketMessage::DestroyContainer => {
+                let response = self.destroy_focused_container()?;
+                Self::respond(&mut reply, &response);
+            }
             SocketMessage::ManageFocusedWindow => {
                 self.manage_focused_window()?;
             }
