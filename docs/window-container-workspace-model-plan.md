@@ -1044,15 +1044,58 @@ Not in this phase: the shared-edge resize, which is 8C, and the command surface,
 
 #### Phase 8C - Multi-neighbour shared-edge resize
 
-- [ ] Add a validated, not-yet-applied shared-edge resize plan to the slot map.
-- [ ] Move one shared boundary at a time, changing only the axis the edge belongs to.
-- [ ] Move every active container on both sides of the boundary together.
-- [ ] Clamp the delta to the legal range and refuse rather than overlap or open a hole.
-- [ ] Invalidate the hidden restore records the moved boundary touches.
-- [ ] Add axis, multi-neighbour, clamp, minimum-size, refusal and hidden-target tests.
-- [ ] Commit as `feat: resize an active container along a shared edge`.
+- [x] Add a validated, not-yet-applied shared-edge resize plan to the slot map.
+- [x] Move one shared boundary at a time, changing only the axis the edge belongs to.
+- [x] Move every active container on both sides of the boundary together.
+- [x] Clamp the delta to the legal range and refuse rather than overlap or open a hole.
+- [x] Invalidate the hidden restore records the moved boundary touches.
+- [x] Add axis, multi-neighbour, clamp, minimum-size, refusal and hidden-target tests.
+- [x] Commit as `feat: resize an active container along a shared edge`.
 
 Expected handwritten change: 300-450 lines. Likely files: `geometry.rs`, `workspace.rs`.
+
+Actual files: `geometry.rs` and `workspace.rs`, as predicted. Actual Rust change: 718 added, 0
+removed. That is over the range this phase
+estimated; the overrun is entirely test code, and the two implementation files add 218 and 90 lines
+respectively, about two thirds of it tests.
+
+The insight the phase turns on is that a resize moves a *boundary*, not a container's edge. The
+task's wording - "synchronise the containers on the other side" - is only half of it: a container
+on the *near* side which shares the same line has to move too, or the column tears. So the plan
+starts from the target's edge interval and grows it to a fixpoint, taking in every slot which
+touches what it has grown to so far, until both sides are described by one line. The loop
+terminates because the interval only grows and the work area bounds it.
+
+Both sides are then checked to tile that line exactly. In a valid tiling the sweep always closes,
+so this is a safety net rather than a normal refusal path, and the test which covers it has to use a
+slot map with a hole in it to reach the check at all - which is exactly the condition it defends
+against.
+
+A positive delta grows the target whichever side the boundary is on, so no caller has to reason
+about which way the axis runs. Each mover's size along the moving axis is `size + coefficient *
+shift`, with the coefficient +1 on the near side and -1 on the far side, so the legal range of the
+shift is one bound per mover and the clamp is a single `clamp` rather than a case analysis. A delta
+which is too large settles against `MIN_SLOT_EDGE` instead of refusing, because a held-down resize
+key that stops working reads as a bug.
+
+The workspace side refuses when the slots are not authoritative. Editing them would mean adopting an
+arrangement the workspace is not in, and the pending recalculation would discard the edit anyway;
+refusing says so instead of pretending to work. `resize_dimensions` is deliberately untouched: it is
+part of the arrangement fingerprint, and a manual boundary now lives in the slots, which is what
+makes a layout change discard it - the behaviour the task asks for and a test now pins.
+
+Verification: `cargo test --workspace -- --test-threads=1` passed with komorebi 349 passed/1 ignored
+(up from 329), layouts 128, bar 3. `cargo fmt --all --check` clean; `cargo clippy --workspace
+--all-targets` reported only the two pre-existing warnings; `cargo check -p komorebi --features
+schemars` passed.
+
+Two of the tests were rewritten after first passing. One asserted conditionally, so it could not
+fail; the other was named for an asymmetric clamp it did not actually construct. Both now pin the
+property their names claim.
+
+Phase 8 is complete: a container's area is expanded over rather than relaid out when it goes, its
+windows are shared out when it is destroyed, and a boundary can be moved without tearing the tiling.
+Next phase: 9, independent floating window movement and edge resizing.
 
 ### Phase 9 - Floating move and edge resize
 
@@ -1351,6 +1394,22 @@ This list is updated from actual diffs, not treated as permission to change ever
   commits are signed through 1Password, which cannot be reached from the sandboxed shell, so commits
   are made from the unsandboxed one and may need an approval prompt answered. Next phase: 8,
   container deletion, distribution and multi-neighbour resize.
+- 2026-08-30: Phase 8 turn. The plan was re-read and the worktree confirmed clean at `8b389c28`
+  before editing, and `cargo check --workspace --all-targets` was re-run as the turn's baseline.
+  Phase 8 was split into 8A expansion, 8B distribution and 8C resize before coding: the three
+  concerns are what happens to the *area* a departing container leaves, what happens to the
+  *windows* it held, and a boundary move which deletes nothing at all. 8A found that every deletion
+  had been ending in a full recalculation, discarding the user's boundaries, and made the departing
+  container's absorption a planned local edit instead - the ordering constraint being that it can
+  only be planned while the slot is still in the map and only adopted once the container has left
+  the ring. 8B added destruction with distribution, whose recipient order turned out to be one rule
+  rather than two: follow the area. 8C established that a resize moves a boundary rather than an
+  edge, which means near-side containers move too. Full serial workspace suite passed at every step
+  (komorebi 312 -> 320 -> 329 -> 349 passing); fmt and Clippy clean apart from the two pre-existing
+  warnings. Three tests were rewritten after passing, twice because the test was wrong about correct
+  behaviour and once because it could not fail; each is recorded in its phase. The 1Password signing
+  agent is unreachable from the sandboxed shell and intermittently needs a second attempt from the
+  unsandboxed one. Next phase: 9, floating window move and edge resize.
 - 2026-08-29: Phase 3 was split into 3A identity and 3B histories/invariants after call-site review
   showed that doing both together would exceed the phase review-size limit. Phase 3A added
   transparent typed workspace/container IDs, migrated managed ownership and UI integration

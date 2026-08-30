@@ -40,6 +40,7 @@ use crate::geometry::LogicalRect;
 use crate::geometry::LogicalSlots;
 use crate::geometry::RenderInsets;
 use crate::geometry::SlotOrder;
+use crate::geometry::SlotResize;
 use crate::geometry::SlotShift;
 use crate::geometry::SplitAxis;
 use crate::lockable_sequence::LockableSequence;
@@ -2799,6 +2800,70 @@ impl Workspace {
         Ok(created)
     }
 
+    /// Move the boundary on one side of an active container.
+    ///
+    /// A positive `delta` grows the container on that side. The move is a boundary move, not a
+    /// container move: every active container touching the same line changes with it, on both
+    /// sides, which is what stops one container growing into a hole or over a neighbour. Only the
+    /// axis the boundary belongs to changes, so a left or right resize can never alter a slot's
+    /// vertical extent.
+    ///
+    /// A delta larger than the space available is clamped rather than refused, so holding down a
+    /// resize key settles against the minimum instead of stopping working. Refusals are for
+    /// boundaries which cannot move at all: the work area's own edge, a target with no slot, and
+    /// two sides which do not line up into one clean line.
+    pub fn resize_container(
+        &mut self,
+        id: &ContainerId,
+        direction: OperationDirection,
+        delta: i32,
+    ) -> eyre::Result<SlotResize> {
+        // Editing slots which are not the arrangement would be adopting an arrangement this
+        // workspace is not in; the pending recalculation would discard the edit anyway.
+        if !self.slots_are_authoritative() {
+            eyre::bail!("this workspace has to be laid out again before it can be resized");
+        }
+
+        let resize = self
+            .logical_slots
+            .plan_edge_resize(id, direction, delta)
+            .ok_or_eyre("that boundary cannot be moved")?;
+
+        let changed: Vec<ContainerId> = resize
+            .movers
+            .iter()
+            .map(|mover| mover.container.clone())
+            .collect();
+
+        self.logical_slots.apply_edge_resize(&resize);
+
+        // A hidden container's restore record promises its absorbers still hold exactly what the
+        // absorption gave them. Moving a boundary they touch breaks that promise.
+        self.invalidate_restores_touching(&changed);
+        self.adopt_slot_geometry();
+
+        Ok(resize)
+    }
+
+    /// Move the boundary on one side of the container geometry operations start from.
+    ///
+    /// A hidden container has no boundary to move, so when the focus is on one - a floating window
+    /// of an otherwise hidden container, for instance - the workspace's most recent active
+    /// container is used instead, exactly as it is for splitting.
+    pub fn resize_focused_container(
+        &mut self,
+        direction: OperationDirection,
+        delta: i32,
+    ) -> eyre::Result<SlotResize> {
+        let idx = self
+            .active_container_idx_for_geometry()
+            .ok_or_eyre("this workspace has no active container to resize")?;
+
+        let id = self.containers()[idx].id.clone();
+
+        self.resize_container(&id, direction, delta)
+    }
+
     /// Adopt the slots as they are now as the arrangement this workspace is in.
     ///
     /// A local edit changes the slots deliberately. Without this the next reconciliation would see
@@ -5002,6 +5067,160 @@ mod tests {
             before
         );
         assert_eq!(workspace.restore_last_minimized_window(), Some(1));
+    }
+
+    #[test]
+    fn resizing_a_container_keeps_the_workspace_tiled() {
+        let mut workspace = workspace_with_containers(&[1, 1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        let id = workspace.containers()[0].id.clone();
+        let before = slot_map(&workspace);
+
+        let resize = workspace
+            .resize_container(&id, OperationDirection::Right, 120)
+            .unwrap();
+
+        assert!(!resize.movers.is_empty());
+        assert!(
+            workspace
+                .logical_slots
+                .validate_coverage(LogicalRect::from(area))
+                .is_ok()
+        );
+
+        // Only the containers on the boundary moved.
+        let after = slot_map(&workspace);
+        let moved: Vec<_> = after.keys().filter(|k| after[*k] != before[*k]).collect();
+
+        assert_eq!(moved.len(), resize.movers.len());
+    }
+
+    #[test]
+    fn a_resize_survives_the_next_reconciliation() {
+        let mut workspace = workspace_with_containers(&[1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        let id = workspace.containers()[0].id.clone();
+        workspace
+            .resize_container(&id, OperationDirection::Right, 120)
+            .unwrap();
+
+        let after = slot_map(&workspace);
+
+        // A deliberate edit is adopted as the arrangement, so reconciling does not undo it.
+        workspace.record_logical_slots(area);
+
+        assert_eq!(slot_map(&workspace), after);
+    }
+
+    #[test]
+    fn a_layout_change_discards_a_manual_resize() {
+        let mut workspace = workspace_with_containers(&[1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        let original = slot_map(&workspace);
+        let id = workspace.containers()[0].id.clone();
+
+        workspace
+            .resize_container(&id, OperationDirection::Right, 120)
+            .unwrap();
+        assert_ne!(slot_map(&workspace), original);
+
+        workspace.invalidate_slot_geometry();
+        workspace.record_logical_slots(area);
+
+        assert_eq!(slot_map(&workspace), original);
+    }
+
+    #[test]
+    fn moving_a_boundary_makes_the_restores_it_touches_inexact() {
+        let mut workspace = workspace_with_containers(&[1, 1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        hide_container(&mut workspace, 2);
+        workspace.record_logical_slots(area);
+
+        let hidden = workspace.containers()[2].id.clone();
+        let absorber = workspace.hidden_slot_restores[&hidden].absorbers[0].clone();
+
+        assert!(workspace.hidden_slot_restores[&hidden].exact_restore_valid);
+
+        // Whichever way this absorber's boundary moves, it no longer holds what the absorption
+        // gave it, so the exact reverse is off the table.
+        let moved = [OperationDirection::Right, OperationDirection::Left]
+            .into_iter()
+            .any(|direction| workspace.resize_container(&absorber, direction, 80).is_ok());
+
+        assert!(moved, "the absorber had no boundary to move");
+        assert!(!workspace.hidden_slot_restores[&hidden].exact_restore_valid);
+    }
+
+    #[test]
+    fn a_hidden_container_is_not_a_resize_target() {
+        let mut workspace = workspace_with_containers(&[1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        hide_container(&mut workspace, 1);
+        workspace.record_logical_slots(area);
+
+        let hidden = workspace.containers()[1].id.clone();
+        let before = slot_map(&workspace);
+
+        assert!(
+            workspace
+                .resize_container(&hidden, OperationDirection::Left, 100)
+                .is_err()
+        );
+        assert_eq!(slot_map(&workspace), before);
+    }
+
+    #[test]
+    fn a_refused_resize_changes_nothing_at_all() {
+        let mut workspace = workspace_with_containers(&[1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        let before = workspace.clone();
+        let id = workspace.containers()[0].id.clone();
+
+        // The left edge of the leftmost container is the work area's own edge.
+        assert!(
+            workspace
+                .resize_container(&id, OperationDirection::Left, 100)
+                .is_err()
+        );
+
+        assert_eq!(slot_map(&workspace), slot_map(&before));
+        assert_eq!(
+            workspace.logical_slots.generation(),
+            before.logical_slots.generation()
+        );
+    }
+
+    #[test]
+    fn the_resize_target_falls_back_to_an_active_container_when_the_focus_is_hidden() {
+        let mut workspace = workspace_with_containers(&[1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        hide_container(&mut workspace, 1);
+        workspace.record_logical_slots(area);
+        workspace.focus_container(1);
+
+        // The only active container now covers the whole work area, so there is no boundary and
+        // this refuses - but it refuses having looked at the active container, not the hidden one.
+        assert!(workspace.active_container_idx_for_geometry() == Some(0));
+        assert!(
+            workspace
+                .resize_focused_container(OperationDirection::Right, 100)
+                .is_err()
+        );
     }
 
     fn workspace_with_containers(counts: &[usize]) -> Workspace {

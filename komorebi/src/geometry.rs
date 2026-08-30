@@ -446,6 +446,34 @@ pub struct SlotSplit {
     pub axis: SplitAxis,
 }
 
+/// A validated, not yet applied, move of one shared boundary between slots.
+///
+/// A boundary is a whole line, not one container's edge: every active container which touches it
+/// moves, on both sides, or the tiling would open a hole. Like [`SlotShift`] and [`SlotSplit`]
+/// nothing is written until the plan is applied, and the plan is only ever produced for a delta
+/// which has already been clamped into the legal range, so applying one cannot fail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotResize {
+    /// The side of the target the boundary is on.
+    pub direction: OperationDirection,
+    /// Where the boundary is now.
+    pub before: i32,
+    /// Where it is going. Never equal to `before`.
+    pub after: i32,
+    /// Every container whose edge moves, both sides of the boundary, in the deterministic order
+    /// along it.
+    pub movers: Vec<SlotMove>,
+}
+
+impl SlotResize {
+    /// How far the boundary actually moves, which is the requested delta only when the request
+    /// was already legal.
+    #[must_use]
+    pub const fn shift(&self) -> i32 {
+        self.after - self.before
+    }
+}
+
 /// A way in which a set of slots fails to be a valid tiling of a work area.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlotViolation {
@@ -822,6 +850,192 @@ impl LogicalSlots {
         })
     }
 
+    /// The slots whose `edge` lies on `coordinate` and which overlap `interval` along it.
+    #[must_use]
+    fn slots_on_boundary(
+        &self,
+        coordinate: i32,
+        edge: OperationDirection,
+        interval: (i32, i32),
+    ) -> Vec<(ContainerId, LogicalRect)> {
+        let mut found: Vec<(ContainerId, LogicalRect)> = self
+            .slots
+            .iter()
+            .filter(|(_, slot)| !slot.is_empty() && slot.edge(edge) == coordinate)
+            .filter(|(_, slot)| {
+                let (start, end) = slot.projection(edge);
+
+                start.max(interval.0) < end.min(interval.1)
+            })
+            .map(|(id, slot)| (id.clone(), *slot))
+            .collect();
+
+        sort_slots(&mut found, SlotOrder::for_direction(edge));
+
+        found
+    }
+
+    /// Whether these slots tile `interval` along `edge` exactly: no gap, no overlap, no overhang.
+    fn tiles_interval(
+        group: &[(ContainerId, LogicalRect)],
+        edge: OperationDirection,
+        interval: (i32, i32),
+    ) -> bool {
+        let mut covered = interval.0;
+
+        for (_, slot) in group {
+            let (start, end) = slot.projection(edge);
+
+            if start != covered {
+                return false;
+            }
+
+            covered = end;
+        }
+
+        covered == interval.1
+    }
+
+    /// Plan moving the boundary on the `direction` side of `container` by `delta`.
+    ///
+    /// A positive `delta` grows the container, whichever side the boundary is on, so the caller
+    /// never has to think about which way the coordinate axis runs. The delta is clamped to the
+    /// range which keeps every affected slot at or above [`MIN_SLOT_EDGE`], so a request which is
+    /// too large moves the boundary as far as it legally can rather than refusing.
+    ///
+    /// `None` means the boundary is not one this container can move: it has no slot, it is at the
+    /// edge of the work area, the containers on the two sides do not line up into a single clean
+    /// line, or there is no room to move it at all. Refusing is the whole point - the alternative
+    /// would be a hole or an overlap.
+    #[must_use]
+    pub fn plan_edge_resize(
+        &self,
+        container: &ContainerId,
+        direction: OperationDirection,
+        delta: i32,
+    ) -> Option<SlotResize> {
+        let slot = self.get(container)?;
+        let opposite = direction.opposite();
+        let boundary = slot.edge(direction);
+
+        // The boundary starts as this container's edge and grows to take in every slot which
+        // touches what it has grown to so far. It only ever grows and it is bounded by the work
+        // area, so the loop terminates; the fixpoint is the whole line the two sides share.
+        let mut interval = slot.projection(direction);
+        let (near, far) = loop {
+            let near = self.slots_on_boundary(boundary, direction, interval);
+            let far = self.slots_on_boundary(boundary, opposite, interval);
+
+            if far.is_empty() {
+                // Nothing on the other side: this is the edge of the work area.
+                return None;
+            }
+
+            let span = near
+                .iter()
+                .chain(far.iter())
+                .map(|(_, slot)| slot.projection(direction))
+                .fold(
+                    interval,
+                    |(start, end), (candidate_start, candidate_end)| {
+                        (start.min(candidate_start), end.max(candidate_end))
+                    },
+                );
+
+            if span == interval {
+                break (near, far);
+            }
+
+            interval = span;
+        };
+
+        if !Self::tiles_interval(&near, direction, interval)
+            || !Self::tiles_interval(&far, opposite, interval)
+        {
+            return None;
+        }
+
+        // Which way the coordinate has to move for the container to grow.
+        let outward = match direction {
+            OperationDirection::Right | OperationDirection::Down => 1,
+            OperationDirection::Left | OperationDirection::Up => -1,
+        };
+
+        // A near slot grows as the boundary moves outward; a far slot shrinks by the same amount.
+        // Each mover's size along the moving axis is `size + coefficient * shift`, so the legal
+        // range of `shift` is one bound per mover.
+        let extent = |slot: LogicalRect| match direction {
+            OperationDirection::Left | OperationDirection::Right => slot.width,
+            OperationDirection::Up | OperationDirection::Down => slot.height,
+        };
+
+        let mut lower = i32::MIN;
+        let mut upper = i32::MAX;
+
+        for (_, slot) in &near {
+            // size + outward * shift >= MIN
+            let bound = (MIN_SLOT_EDGE - extent(*slot)) * outward;
+
+            if outward > 0 {
+                lower = lower.max(bound);
+            } else {
+                upper = upper.min(bound);
+            }
+        }
+
+        for (_, slot) in &far {
+            // size - outward * shift >= MIN
+            let bound = (extent(*slot) - MIN_SLOT_EDGE) * outward;
+
+            if outward > 0 {
+                upper = upper.min(bound);
+            } else {
+                lower = lower.max(bound);
+            }
+        }
+
+        if lower > upper {
+            return None;
+        }
+
+        let shift = delta.saturating_mul(outward).clamp(lower, upper);
+
+        if shift == 0 {
+            return None;
+        }
+
+        let after = boundary + shift;
+        let movers = near
+            .into_iter()
+            .map(|(id, before)| SlotMove {
+                container: id,
+                before,
+                after: before.with_edge_at(direction, after),
+            })
+            .chain(far.into_iter().map(|(id, before)| SlotMove {
+                container: id,
+                before,
+                after: before.with_edge_at(opposite, after),
+            }))
+            .collect();
+
+        Some(SlotResize {
+            direction,
+            before: boundary,
+            after,
+            movers,
+        })
+    }
+
+    /// Apply a boundary move: every container which touches the boundary takes its new rectangle.
+    pub fn apply_edge_resize(&mut self, resize: &SlotResize) {
+        for mover in &resize.movers {
+            self.slots.insert(mover.container.clone(), mover.after);
+        }
+
+        self.bump_generation();
+    }
+
     /// Apply a split: the donor shrinks to its half and the created container takes the other.
     pub fn apply_split(&mut self, split: &SlotSplit) {
         self.slots
@@ -921,6 +1135,291 @@ mod tests {
             .iter()
             .map(|mover| (mover.container.to_string(), mover.after))
             .collect()
+    }
+
+    fn resized(slots: &LogicalSlots, name: &str) -> LogicalRect {
+        slots.get(&id(name)).unwrap()
+    }
+
+    #[test]
+    fn moving_a_boundary_changes_only_the_axis_it_belongs_to() {
+        let mut slots = LogicalSlots::default();
+        slots.set(id("a"), LogicalRect::new(0, 0, 960, 1080));
+        slots.set(id("b"), LogicalRect::new(960, 0, 960, 1080));
+
+        let resize = slots
+            .plan_edge_resize(&id("a"), OperationDirection::Right, 100)
+            .unwrap();
+
+        assert_eq!(resize.before, 960);
+        assert_eq!(resize.after, 1060);
+        assert_eq!(resize.shift(), 100);
+
+        slots.apply_edge_resize(&resize);
+
+        assert_eq!(resized(&slots, "a"), LogicalRect::new(0, 0, 1060, 1080));
+        assert_eq!(resized(&slots, "b"), LogicalRect::new(1060, 0, 860, 1080));
+        assert!(slots.validate_coverage(area()).is_ok());
+    }
+
+    #[test]
+    fn a_positive_delta_grows_the_container_whichever_side_the_boundary_is_on() {
+        let mut slots = LogicalSlots::default();
+        slots.set(id("a"), LogicalRect::new(0, 0, 960, 1080));
+        slots.set(id("b"), LogicalRect::new(960, 0, 960, 1080));
+
+        // `b` grows leftwards, so the boundary moves down the axis rather than up it.
+        let resize = slots
+            .plan_edge_resize(&id("b"), OperationDirection::Left, 100)
+            .unwrap();
+
+        assert_eq!(resize.after, 860);
+
+        slots.apply_edge_resize(&resize);
+
+        assert_eq!(resized(&slots, "b"), LogicalRect::new(860, 0, 1060, 1080));
+        assert_eq!(resized(&slots, "a"), LogicalRect::new(0, 0, 860, 1080));
+        assert!(slots.validate_coverage(area()).is_ok());
+    }
+
+    #[test]
+    fn every_container_touching_the_boundary_moves_with_it() {
+        let mut slots = three_slot_workspace();
+
+        let resize = slots
+            .plan_edge_resize(&id("left"), OperationDirection::Right, 200)
+            .unwrap();
+
+        // One container on the near side, two on the far side, and the boundary is the whole
+        // shared line rather than one container's edge.
+        assert_eq!(resize.movers.len(), 3);
+
+        slots.apply_edge_resize(&resize);
+
+        assert_eq!(resized(&slots, "left"), LogicalRect::new(0, 0, 1160, 1080));
+        assert_eq!(
+            resized(&slots, "top_right"),
+            LogicalRect::new(1160, 0, 760, 540)
+        );
+        assert_eq!(
+            resized(&slots, "bottom_right"),
+            LogicalRect::new(1160, 540, 760, 540)
+        );
+        assert!(slots.validate_coverage(area()).is_ok());
+    }
+
+    #[test]
+    fn a_boundary_takes_in_the_containers_which_share_it_on_the_near_side_too() {
+        // `top_left` and `bottom_left` stack against a single full-height `right`. Resizing from
+        // `top_left` alone would tear the column, so the boundary has to take in `bottom_left`.
+        let mut slots = LogicalSlots::default();
+        slots.set(id("top_left"), LogicalRect::new(0, 0, 960, 540));
+        slots.set(id("bottom_left"), LogicalRect::new(0, 540, 960, 540));
+        slots.set(id("right"), LogicalRect::new(960, 0, 960, 1080));
+
+        let resize = slots
+            .plan_edge_resize(&id("top_left"), OperationDirection::Right, 160)
+            .unwrap();
+
+        assert_eq!(resize.movers.len(), 3);
+
+        slots.apply_edge_resize(&resize);
+
+        assert_eq!(
+            resized(&slots, "top_left"),
+            LogicalRect::new(0, 0, 1120, 540)
+        );
+        assert_eq!(
+            resized(&slots, "bottom_left"),
+            LogicalRect::new(0, 540, 1120, 540)
+        );
+        assert_eq!(
+            resized(&slots, "right"),
+            LogicalRect::new(1120, 0, 800, 1080)
+        );
+        assert!(slots.validate_coverage(area()).is_ok());
+    }
+
+    #[test]
+    fn a_horizontal_boundary_changes_only_heights() {
+        let mut slots = LogicalSlots::default();
+        slots.set(id("top"), LogicalRect::new(0, 0, 1920, 540));
+        slots.set(id("bottom"), LogicalRect::new(0, 540, 1920, 540));
+
+        let resize = slots
+            .plan_edge_resize(&id("top"), OperationDirection::Down, 90)
+            .unwrap();
+
+        slots.apply_edge_resize(&resize);
+
+        assert_eq!(resized(&slots, "top"), LogicalRect::new(0, 0, 1920, 630));
+        assert_eq!(
+            resized(&slots, "bottom"),
+            LogicalRect::new(0, 630, 1920, 450)
+        );
+        assert!(slots.validate_coverage(area()).is_ok());
+    }
+
+    #[test]
+    fn an_oversized_delta_is_clamped_to_the_minimum_slot_edge() {
+        let mut slots = LogicalSlots::default();
+        slots.set(id("a"), LogicalRect::new(0, 0, 960, 1080));
+        slots.set(id("b"), LogicalRect::new(960, 0, 960, 1080));
+
+        let resize = slots
+            .plan_edge_resize(&id("a"), OperationDirection::Right, 100_000)
+            .unwrap();
+
+        // Clamped rather than refused: holding a resize key down settles against the minimum.
+        assert_eq!(resize.after, 1920 - MIN_SLOT_EDGE);
+
+        slots.apply_edge_resize(&resize);
+
+        assert_eq!(resized(&slots, "b").width, MIN_SLOT_EDGE);
+        assert!(slots.validate_coverage(area()).is_ok());
+    }
+
+    #[test]
+    fn the_clamp_respects_the_narrowest_container_on_the_boundary() {
+        // Two containers of different widths share the far side of the boundary. The narrower one
+        // has to keep MIN_SLOT_EDGE, so it - not the wider one, and not the work area - is what
+        // stops the move.
+        let mut slots = LogicalSlots::default();
+        slots.set(id("left"), LogicalRect::new(0, 0, 960, 1080));
+        slots.set(id("top_right"), LogicalRect::new(960, 0, 960, 540));
+        slots.set(id("bottom_near"), LogicalRect::new(960, 540, 400, 540));
+        slots.set(id("bottom_far"), LogicalRect::new(1360, 540, 560, 540));
+
+        assert!(slots.validate_coverage(area()).is_ok());
+
+        let resize = slots
+            .plan_edge_resize(&id("left"), OperationDirection::Right, 100_000)
+            .unwrap();
+
+        assert_eq!(resize.shift(), 400 - MIN_SLOT_EDGE);
+
+        slots.apply_edge_resize(&resize);
+
+        assert_eq!(resized(&slots, "bottom_near").width, MIN_SLOT_EDGE);
+        assert_eq!(
+            resized(&slots, "top_right").width,
+            960 - (400 - MIN_SLOT_EDGE)
+        );
+
+        // The container which is not on this boundary at all never moved.
+        assert_eq!(
+            resized(&slots, "bottom_far"),
+            LogicalRect::new(1360, 540, 560, 540)
+        );
+        assert!(slots.validate_coverage(area()).is_ok());
+    }
+
+    #[test]
+    fn the_edge_of_the_work_area_is_not_a_boundary() {
+        let mut slots = LogicalSlots::default();
+        slots.set(id("a"), LogicalRect::new(0, 0, 960, 1080));
+        slots.set(id("b"), LogicalRect::new(960, 0, 960, 1080));
+
+        assert!(
+            slots
+                .plan_edge_resize(&id("a"), OperationDirection::Left, 100)
+                .is_none()
+        );
+        assert!(
+            slots
+                .plan_edge_resize(&id("a"), OperationDirection::Up, 100)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_boundary_with_no_room_left_refuses_instead_of_overlapping() {
+        let mut slots = LogicalSlots::default();
+        slots.set(id("a"), LogicalRect::new(0, 0, 1920 - MIN_SLOT_EDGE, 1080));
+        slots.set(
+            id("b"),
+            LogicalRect::new(1920 - MIN_SLOT_EDGE, 0, MIN_SLOT_EDGE, 1080),
+        );
+
+        let before = slots.clone();
+
+        assert!(
+            slots
+                .plan_edge_resize(&id("a"), OperationDirection::Right, 10)
+                .is_none()
+        );
+        assert_eq!(slots.get(&id("a")), before.get(&id("a")));
+        assert_eq!(slots.get(&id("b")), before.get(&id("b")));
+    }
+
+    #[test]
+    fn a_zero_delta_is_not_a_boundary_move() {
+        let mut slots = LogicalSlots::default();
+        slots.set(id("a"), LogicalRect::new(0, 0, 960, 1080));
+        slots.set(id("b"), LogicalRect::new(960, 0, 960, 1080));
+
+        assert!(
+            slots
+                .plan_edge_resize(&id("a"), OperationDirection::Right, 0)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_container_with_no_slot_has_no_boundary_to_move() {
+        let mut slots = LogicalSlots::default();
+        slots.set(id("a"), LogicalRect::new(0, 0, 1920, 1080));
+
+        assert!(
+            slots
+                .plan_edge_resize(&id("hidden"), OperationDirection::Right, 100)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_boundary_which_does_not_line_up_is_refused() {
+        // A slot map with a hole in it. `b` only reaches halfway down the boundary, so moving it
+        // would leave the bottom half of `a`'s edge facing nothing. In a valid tiling the boundary
+        // sweep always closes; this is the safety net for a map which is not one.
+        let mut slots = LogicalSlots::default();
+        slots.set(id("a"), LogicalRect::new(0, 0, 960, 1080));
+        slots.set(id("b"), LogicalRect::new(960, 0, 960, 540));
+
+        assert!(
+            slots
+                .plan_edge_resize(&id("a"), OperationDirection::Right, 100)
+                .is_none()
+        );
+
+        // Filling the hole makes the same boundary movable, which is what pins the refusal on the
+        // missing coverage rather than on anything else about the fixture.
+        slots.set(id("c"), LogicalRect::new(960, 540, 960, 540));
+
+        let resize = slots
+            .plan_edge_resize(&id("a"), OperationDirection::Right, 100)
+            .unwrap();
+
+        assert_eq!(resize.movers.len(), 3);
+
+        slots.apply_edge_resize(&resize);
+        assert!(slots.validate_coverage(area()).is_ok());
+    }
+
+    #[test]
+    fn a_boundary_move_advances_the_geometry_generation() {
+        let mut slots = LogicalSlots::default();
+        slots.set(id("a"), LogicalRect::new(0, 0, 960, 1080));
+        slots.set(id("b"), LogicalRect::new(960, 0, 960, 1080));
+
+        let generation = slots.generation();
+        let resize = slots
+            .plan_edge_resize(&id("a"), OperationDirection::Right, 40)
+            .unwrap();
+
+        slots.apply_edge_resize(&resize);
+
+        assert!(slots.generation() > generation);
     }
 
     #[test]
