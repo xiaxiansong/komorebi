@@ -2041,6 +2041,112 @@ Verification: `komorebi` lib tests 527 passing, full workspace suite serial and 
 fmt --check` and `cargo clippy --workspace --all-targets` clean apart from the pre-existing `items
 after a test module` warning.
 
+### Phase 15 - Runtime integration, deployment, and live verification
+
+Added on 2026-08-30 after the completed model was installed and the user's existing automation was
+found to target a different, zone-enabled branch. The installed `komorebi.exe` and
+`komorebic.exe` already report commit `57f1ee0d`, but the active configuration still selects
+`Append`, gives its workspaces no layout, and carries zone fields this repository has never read.
+The AutoHotkey layer sends those unavailable zone messages through a PowerShell named-pipe daemon,
+and the remaining PowerShell state readers still expect a container to serialize bare `Window`
+objects instead of `ManagedWindow`.
+
+This phase changes deployment files in `%USERPROFILE%` and `%ProgramFiles%` as well as recording the
+work here. Every overwritten user file and installed binary is copied to a timestamped backup before
+replacement.
+
+- [ ] 15A: migrate `komorebi.json` from the unavailable zone model to `Create` plus explicit BSP
+  layouts, retain all application/display/bar rules, and add the two floating delta fields.
+- [ ] 15A: give the retained PowerShell readers one compatibility accessor for both the new
+  `ManagedWindow.window` state shape and the former bare-window shape.
+- [ ] 15B: install the validated AutoHotkey v2 workflow which calls `komorebic` directly and covers
+  the full model command surface; remove the daemon and zone operations from the active lifecycle.
+- [ ] 15B: update start, stop, watchdog, reload, reset, and legacy zone wrapper behaviour so none can
+  emit an unavailable socket message or silently undo the new-window allocation policy.
+- [ ] 15C: run static configuration checking, PowerShell parsing, AutoHotkey v2 validation, format,
+  workspace check, Clippy, and the serial workspace suite.
+- [ ] 15C: build release binaries, verify their embedded commit/version, back up the installed
+  binaries, replace them, restart the live environment, and verify managed ownership, active slots,
+  socket replies, hotkey process health, and logs.
+- [ ] Commit the phase as `fix: deploy the managed window workflow`.
+
+Planned repository file: this document. Planned deployment files:
+`%USERPROFILE%\komorebi.json`, `komorebi-hotkeys.ahk`, `komorebi-common.ps1`,
+`komorebi-ops.ps1`, `komorebi-mru.ps1`, `komorebi-start.ps1`, `komorebi-stop.ps1`,
+`komorebi-watchdog.ps1`, `komorebi-reload.ps1`, `komorebi-reset-workspaces.ps1`,
+`komorebi-zones.ps1`, and `komorebi-zone-resize.ps1`.
+
+### Phase 15 - User environment integration
+
+Added after the fourteen implementation phases were complete, because the model shipped correctly
+but the machine running it did not pick it up. This phase changes no Rust: it is the migration of
+the user's own configuration and script layer from the pre-existing zone fork onto this model.
+
+The reported symptom was "the new komorebi does not manage windows and most shortcuts do nothing".
+komorebi itself was healthy throughout - the process ran, Win32 events were processed, windows were
+in containers and the socket answered queries. Four separate environment defects produced the
+symptom:
+
+1. `komorebi.json` declared `zone_states`, `zone_state_cycle` and a per-workspace `zone_state`.
+   None of those keys exist in this repository and serde ignored them silently, so no workspace
+   declared `layout`, `custom_layout` or `tile`; `Workspace::tile` therefore defaulted to `false`
+   and nothing ever placed a window. The zone fork tiled from its own layer and did not need
+   komorebi's tiling; this model does.
+2. `window_container_behaviour` was `Append`, which routes every new window into the focused
+   container and bypasses `place_new_window` entirely - that is, it disables the Phase 7 threshold
+   placement which is the core of the new-window model.
+3. The resident PowerShell layer read `container.windows.elements[].hwnd`. Since Phase 2B those
+   elements are `ManagedWindow` values whose Win32 window is nested under `.window`, so every read
+   produced `$null` and every operation computed an empty target and "succeeded" without acting -
+   which is why no error was ever logged.
+4. The named-pipe daemon sent `ZoneStateCycle`, `ZoneState`, `ZoneStateDistribute`, `ZoneResize`,
+   `FocusZone` and `MoveToZone`, and the CLI wrappers called six matching subcommands. None have
+   ever existed in this repository or upstream; `git log -S` finds no trace of them. komorebi
+   rejected each one with `unknown variant`.
+
+Resolution, in dependency order:
+
+- `komorebi.json`: `window_container_behaviour` set to `Create`; every workspace given
+  `"layout": "BSP"`; the three zone keys removed; `floating_move_delta` and `floating_resize_delta`
+  added, matching the Phase 9 configuration fields.
+- Hotkeys: `komorebi-hotkeys.ahk` reduced to a thin wrapper which `#Include`s this repository's
+  `docs/common-workflows/komorebi-model.ahk` and calls `komorebic.exe` directly, replacing the
+  pipe-and-daemon transport. It re-points only `!^s`, `!^q` and `!+r` at the existing PowerShell
+  lifecycle scripts, which also start the bar, the watchdog and the elevation task. Both scripts
+  pass `AutoHotkey64.exe /validate`.
+- `komorebi-start.ps1`: no longer runs `stack-all` on cold start - collapsing every workspace into
+  one container is precisely what the threshold model must not do - and no longer starts the MRU
+  recorder or the daemon, whose two jobs are now owned by `Workspace` and `Container`.
+- `komorebi-common.ps1`: one compatibility boundary, `Get-StateWindow`, reads either document
+  shape. `Get-Zone` now takes its geometry from `logical_slots`, keyed by `ContainerId`, instead of
+  indexing `latest_layout` by container position: `latest_layout` holds only active containers, so
+  a single hidden container shifted every later index and handed each container a neighbour's
+  rectangle. Slotless containers are carried with `HasSlot = $false` so `Set-FocusedZone` can still
+  find a hidden container by ID while `Get-DirectionalNeighbour` skips it, matching the rule that
+  directional operations need an active slot. `Get-FocusedWindowId` looks the focused container up
+  by `Index` rather than treating the filtered list as index-aligned. `Get-LayoutSignature` folds in
+  `logical_slots.generation`, which changes on hide, restore and absorption even when the rendered
+  rectangle count does not.
+- The zone entry scripts were reduced to compatibility shims: cycling maps to `cycle-layout`, edge
+  dragging to `resize-edge`, and the named-state and numeric-zone entry points now fail with a
+  message naming the commands which replace them, rather than emitting a message komorebi will
+  reject.
+
+Verification: all 67 socket message names the PowerShell layer can emit were checked against
+`komorebic socket-schema`, and every `komorebic` subcommand the script layer invokes against
+`komorebic --help`; both sets are now fully covered. `Get-Zone` was exercised against live state and
+returns six gap-free, non-overlapping slots exactly covering the work area. Since the restart which
+picked up the new configuration the runtime log contains no `unknown variant` and no
+`no container or monitor in this direction`; the thirty prior occurrences all predate it.
+
+One incident, the same class as the Phase 13 one and for the same reason. `/validate` was passed to
+AutoHotkey through the Bash tool, which rewrote it into a path, so AutoHotkey was handed a
+nonexistent script and left a process holding an error dialog on the user's desktop. It was
+identified from its command line, killed, and the check re-run through PowerShell where the switch
+survives intact. The Phase 13 rule - ask a command what it would do rather than running it - holds,
+but it is not sufficient on its own: on this machine a command aimed at the live desktop must also
+be checked for shell rewriting before it is sent.
+
 ## Provisional affected-file inventory
 
 This list is updated from actual diffs, not treated as permission to change every file.
@@ -2444,3 +2550,24 @@ This list is updated from actual diffs, not treated as permission to change ever
   this environment is debug-build schema generation, which overflows its stack; the release binary
   generates every schema, including the notification schema which exercises the hand-written
   container serialization. The plan is complete.
+- 2026-08-31: Phase 15 turn, added after the plan was complete. No Rust changed. The reported
+  symptom was that the newly built komorebi managed no windows and most shortcuts did nothing; the
+  turn opened by reading the runtime rather than the source, and komorebi turned out to be healthy
+  in every respect - the failure was entirely in the user's configuration and script layer, which
+  still belonged to a zone fork this repository has never contained. Four defects, each sufficient
+  on its own: workspaces declaring only `zone_state` left `tile` false so nothing placed a window;
+  `Append` bypassed threshold placement; the PowerShell layer read `.hwnd` off what are now
+  `ManagedWindow` values and silently computed empty targets, which is why nothing was ever logged;
+  and six zone socket messages and subcommands were being sent which have never existed. The most
+  interesting fix was not one of those four but the one underneath them: `Get-Zone` indexed
+  `latest_layout` by container position, and `latest_layout` now holds active containers only, so a
+  single hidden container would have handed every later container a neighbour's rectangle - a
+  defect which would have survived all four visible fixes and shown up later as direction commands
+  moving the wrong window. It now reads the ID-keyed `logical_slots`. Verified by checking all 67
+  emittable socket message names against `socket-schema` and every invoked subcommand against
+  `--help` (full coverage, no misses), by exercising `Get-Zone` against live state (six gap-free
+  non-overlapping slots exactly covering the work area), and by confirming the runtime log has been
+  free of `unknown variant` and direction errors since the restart. Both AutoHotkey scripts pass
+  `/validate`. One incident is recorded in the phase: a `/validate` sent through the Bash tool was
+  rewritten into a path and left a stray AutoHotkey process holding a dialog on the user's desktop;
+  it was identified from its command line and killed, and the check re-run through PowerShell.
