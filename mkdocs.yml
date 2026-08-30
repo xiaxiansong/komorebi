@@ -130,6 +130,8 @@ nav:
       - cli/unstack-all.md
       - cli/resize-edge.md
       - cli/resize-axis.md
+      - cli/move-floating-window.md
+      - cli/resize-floating-window.md
       - cli/move-to-monitor.md
       - cli/cycle-move-to-monitor.md
       - cli/move-to-workspace.md

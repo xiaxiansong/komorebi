@@ -382,6 +382,26 @@ struct Resize {
 }
 
 #[derive(Parser)]
+struct MoveFloatingWindow {
+    #[clap(value_enum)]
+    direction: OperationDirection,
+    /// Distance to move by in logical units, scaled to the monitor's DPI
+    /// [default: the configured floating_move_delta]
+    delta: Option<i32>,
+}
+
+#[derive(Parser)]
+struct ResizeFloatingWindow {
+    #[clap(value_enum)]
+    edge: OperationDirection,
+    #[clap(value_enum)]
+    sizing: Sizing,
+    /// Distance to resize by in logical units, scaled to the monitor's DPI
+    /// [default: the configured floating_resize_delta]
+    delta: Option<i32>,
+}
+
+#[derive(Parser)]
 struct ResizeAxis {
     #[clap(value_enum)]
     axis: Axis,
@@ -1165,6 +1185,12 @@ enum SubCommand {
     /// Resize the focused window or primary column along the specified axis
     #[clap(arg_required_else_help = true)]
     ResizeAxis(ResizeAxis),
+    /// Move the focused floating window in the specified direction without touching any container
+    #[clap(arg_required_else_help = true)]
+    MoveFloatingWindow(MoveFloatingWindow),
+    /// Resize the focused floating window from the specified edge, leaving the opposite edge fixed
+    #[clap(arg_required_else_help = true)]
+    ResizeFloatingWindow(ResizeFloatingWindow),
     /// Move the focused window to the specified monitor
     #[clap(arg_required_else_help = true)]
     MoveToMonitor(MoveToMonitor),
@@ -3094,6 +3120,19 @@ if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
         }
         SubCommand::ResizeAxis(args) => {
             send_message(&SocketMessage::ResizeWindowAxis(args.axis, args.sizing))?;
+        }
+        SubCommand::MoveFloatingWindow(args) => {
+            send_message(&SocketMessage::MoveFloatingWindow(
+                args.direction,
+                args.delta,
+            ))?;
+        }
+        SubCommand::ResizeFloatingWindow(args) => {
+            send_message(&SocketMessage::ResizeFloatingWindow(
+                args.edge,
+                args.sizing,
+                args.delta,
+            ))?;
         }
         SubCommand::FocusFollowsMouse(args) => {
             send_message(&SocketMessage::FocusFollowsMouse(

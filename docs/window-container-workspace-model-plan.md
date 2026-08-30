@@ -1171,6 +1171,8 @@ which are 9B, and the command spelling, which is 9C.
 - [x] Add rejection, isolation, hidden-container, clamp and read-back tests.
 - [x] Commit as `feat: move and resize floating windows independently`.
 
+Commit: `7e76c9c4`.
+
 Expected handwritten change: 300-450 lines. Likely files: `workspace.rs`, `window_manager.rs`,
 `windows_api.rs`, `managed_window.rs`.
 
@@ -1215,14 +1217,47 @@ Not in this phase: the command spelling, which is 9C.
 
 #### Phase 9C - Distinct floating commands
 
-- [ ] Add socket messages for floating move and floating edge resize with an optional delta.
-- [ ] Add the `komorebic` subcommands and client bindings, distinct from the container commands.
-- [ ] Add hand-written CLI documentation pages in the checked-in format.
-- [ ] Add parsing/serialization tests.
-- [ ] Commit as `feat: add distinct floating window commands`.
+- [x] Add socket messages for floating move and floating edge resize with an optional delta.
+- [x] Add the `komorebic` subcommands and client bindings, distinct from the container commands.
+- [x] Add hand-written CLI documentation pages in the checked-in format.
+- [x] Add parsing/serialization tests.
+- [x] Commit as `feat: add distinct floating window commands`.
 
 Expected handwritten change: 150-300 lines. Likely files: `core/mod.rs`, `process_command.rs`,
 `komorebic/src/main.rs`, `komorebi-client/src/lib.rs`, `docs/cli/`.
+
+Actual files: `core/mod.rs`, `process_command.rs`, `komorebic/src/main.rs`, two new `docs/cli/`
+pages and `mkdocs.yml`. `komorebi-client/src/lib.rs` needed no change, because it re-exports
+`SocketMessage` rather than enumerating its variants, so a new variant reaches every client for
+free. Actual change: 113 lines of Rust, 43 lines of new CLI documentation and 2 navigation
+entries.
+
+The delta is `Option<i32>` rather than a required argument, so `komorebic move-floating-window left`
+uses the configured step and `komorebic move-floating-window left 200` overrides it for that press
+only. That is what lets one AutoHotkey script bind both a normal and a coarse step without keeping
+its own copy of the configuration.
+
+`move-floating-window` and `resize-floating-window` are separate commands rather than modes of
+`move` and `resize-edge`. The existing pair act on containers and boundaries, and their names
+already mean that; overloading them would have made the meaning of a key depend on the placement of
+whatever happened to be focused. The floating layer's existing directional move still routes to the
+same core operation, so there is one implementation and two ways in.
+
+The CLI pages were hand-written in the checked-in format for the reason recorded in Phase 7:
+`komorebic docgen` disagrees with the 177 checked-in pages, so running it to add two pages would
+have rewritten every one of them.
+
+`schema.json` is deliberately not regenerated for the two new configuration fields. A regeneration
+against the current toolchain also rewrites three unrelated descriptions and repairs mojibake em
+dashes in the checked-in file, which is upstream drift rather than this task's change; Phase 14
+owns reconciling the generated artifacts in one place. The fields have serde defaults, so a
+configuration which omits them is unaffected either way.
+
+Verification: `cargo test --workspace -- --test-threads=1` passed with komorebi 374 passed/1 ignored
+(up from 372), layouts 128, bar 3. `cargo fmt --all --check` clean; `cargo clippy --workspace
+--all-targets` reported only the pre-existing `items after a test module` warning. The two new
+commands' generated help was read from a release `komorebic` build, because a debug build overflows
+its stack building the clap command tree, as recorded in Phase 7.
 
 ### Phase 10 - Workspace ordering, deletion, merge, and minimized restore
 
@@ -1530,3 +1565,20 @@ This list is updated from actual diffs, not treated as permission to change ever
   boundaries, preserved workspace IDs in state snapshots, and maintained legacy JSON compatibility.
   Compile, schema, focused serial tests, and the full serial workspace suite passed. Next phase:
   explicit focus/minimize histories and ownership/history invariant validation.
+- 2026-08-30: Phase 9 turn. The plan was re-read and the worktree confirmed clean at `77f90f57`
+  before editing, and `cargo check --workspace --all-targets` was re-run as the turn's baseline.
+  Phase 9 was split into 9A primitives, 9B validated operations and 9C commands before coding, and
+  9C was brought forward from Phase 12 for these two commands only, because "independent of
+  container movement" is a claim about the command surface which cannot be shown while the only way
+  to reach the behaviour is the existing `MoveWindow`. Upstream's `move_floating_window_in_direction`
+  was replaced rather than extended: it shared the container resize delta, asked the desktop who was
+  focused instead of asking the model, recorded nothing in `floating_rect` and validated nothing.
+  The phase's real content is in what a floating command is allowed to touch - one window's
+  rectangle and nothing else - and the isolation tests pin that by comparing the slot map and the
+  container identities across each command, including for a floating window inside a Hidden
+  container, which moves without its container reclaiming a slot. Full serial workspace suite passed
+  at every step (komorebi 349 -> 361 -> 372 -> 374 passing); fmt and Clippy clean apart from the
+  pre-existing warning. One environment note: the 1Password signing agent was unreachable for
+  several minutes mid-turn and refused three commit attempts before recovering; staging the
+  finished phase in the index kept the two phases separable while it was down. Next phase: 10,
+  workspace ordering, deletion, merge and minimized restore.

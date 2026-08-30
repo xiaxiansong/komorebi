@@ -186,6 +186,23 @@ pub fn listen_for_commands_tcp(wm: Arc<Mutex<WindowManager>>, port: usize) {
 }
 
 impl WindowManager {
+    /// Log what a floating geometry command did.
+    ///
+    /// A rejection is information rather than a failure: the command found the focused window and
+    /// declined to act on it because it was the wrong kind of window, which is a fact about the
+    /// window rather than about komorebi. Typed outcomes reach the caller in Phase 12.
+    fn report_floating_outcome(outcome: FloatingOutcome) {
+        match outcome {
+            FloatingOutcome::Applied(rect) => {
+                tracing::info!("floating window moved to {rect:?}");
+            }
+            FloatingOutcome::NoOp => {
+                tracing::info!("floating window is already against its limit");
+            }
+            FloatingOutcome::Rejected(rejection) => tracing::info!("{rejection}"),
+        }
+    }
+
     // TODO(raggi): wrap reply in a newtype that can decorate a human friendly
     // name for the peer, such as getting the pid of the komorebic process for
     // the UDS or the IP:port for TCP.
@@ -1504,6 +1521,16 @@ impl WindowManager {
             }
             SocketMessage::ResizeWindowEdge(direction, sizing) => {
                 self.resize_window(direction, sizing, self.resize_delta, true)?;
+            }
+            SocketMessage::MoveFloatingWindow(direction, delta) => {
+                // No retile follows either of these: a floating window's rectangle is the only
+                // thing they own, so there is no arrangement to bring back into agreement.
+                Self::report_floating_outcome(self.move_floating_window(direction, delta)?);
+            }
+            SocketMessage::ResizeFloatingWindow(direction, sizing, delta) => {
+                Self::report_floating_outcome(
+                    self.resize_floating_window(direction, sizing, delta)?,
+                );
             }
             SocketMessage::ResizeWindowAxis(axis, sizing) => {
                 // If the user has a custom layout, allow for the resizing of the primary column

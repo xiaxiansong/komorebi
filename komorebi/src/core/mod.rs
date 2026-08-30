@@ -77,6 +77,16 @@ pub enum SocketMessage {
     UnstackAll,
     ResizeWindowEdge(OperationDirection, Sizing),
     ResizeWindowAxis(Axis, Sizing),
+    /// Move the focused floating window, leaving every container and slot untouched.
+    ///
+    /// Deliberately distinct from `MoveWindow`, which moves a container within the arrangement.
+    /// An omitted delta uses the configured `floating_move_delta`.
+    MoveFloatingWindow(OperationDirection, Option<i32>),
+    /// Move one edge of the focused floating window, leaving the opposite edge where it is.
+    ///
+    /// Deliberately distinct from `ResizeWindowEdge`, which moves a boundary shared by tiled
+    /// containers. An omitted delta uses the configured `floating_resize_delta`.
+    ResizeFloatingWindow(OperationDirection, Sizing, Option<i32>),
     MoveContainerToLastWorkspace,
     SendContainerToLastWorkspace,
     MoveContainerToMonitorNumber(usize),
@@ -779,5 +789,42 @@ mod tests {
         };
 
         assert_eq!(path, PathBuf::from("/path/VALUE/d"));
+    }
+
+    #[test]
+    fn floating_commands_are_distinct_from_the_container_commands() {
+        let moved: SocketMessage =
+            serde_json::from_str(r#"{"type":"MoveFloatingWindow","content":["Left",120]}"#)
+                .unwrap();
+        assert!(matches!(
+            moved,
+            SocketMessage::MoveFloatingWindow(OperationDirection::Left, Some(120))
+        ));
+
+        let resized: SocketMessage = serde_json::from_str(
+            r#"{"type":"ResizeFloatingWindow","content":["Right","Increase",null]}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            resized,
+            SocketMessage::ResizeFloatingWindow(OperationDirection::Right, Sizing::Increase, None)
+        ));
+    }
+
+    #[test]
+    fn an_omitted_floating_delta_round_trips_as_null() {
+        let message = SocketMessage::MoveFloatingWindow(OperationDirection::Up, None);
+        let json = serde_json::to_string(&message).unwrap();
+
+        assert_eq!(
+            json,
+            r#"{"type":"MoveFloatingWindow","content":["Up",null]}"#
+        );
+
+        let parsed: SocketMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            SocketMessage::MoveFloatingWindow(OperationDirection::Up, None)
+        ));
     }
 }
