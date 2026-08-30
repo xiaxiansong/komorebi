@@ -1763,16 +1763,39 @@ Verification: `komorebi` lib tests 487 -> 491 passing, full workspace suite seri
 
 ### Phase 13 - AutoHotkey v2 workflow
 
-- [ ] Add a directly runnable AHK v2 example using top-level executable/config/delta variables and
+- [x] Add a directly runnable AHK v2 example using top-level executable/config/delta variables and
   helper functions around `Run`/`RunWait`.
-- [ ] Cover every shortcut group in the task with Chinese comments; never emit whkd config.
-- [ ] Use safe stop/start restart and the version-correct static configuration replacement command.
-- [ ] Prefer existing `komorebic gui`; otherwise add a small AHK v2 shortcut panel.
-- [ ] Validate generated command lines against `komorebic --help`.
-- [ ] Commit as `docs: add complete AutoHotkey v2 workflow`.
+- [x] Cover every shortcut group in the task with Chinese comments; never emit whkd config.
+- [x] Use safe stop/start restart and the version-correct static configuration replacement command.
+- [x] Prefer an existing shortcut panel command; otherwise add a small AHK v2 shortcut panel.
+- [x] Validate generated command lines against `komorebic --help`.
+- [x] Commit as `docs: add complete AutoHotkey v2 workflow`.
 
-Expected handwritten change: 200-400 lines. Likely files: new `docs/common-workflows/komorebi-model.ahk`,
-`docs/common-workflows/autohotkey.md`, possibly `mkdocs.yml`.
+Actual files: new `docs/common-workflows/komorebi-model.ahk`, new
+`docs/common-workflows/autohotkey-window-model.md`, `mkdocs.yml`.
+
+The upstream `docs/common-workflows/autohotkey.md` and `docs/komorebi.ahk.txt` were left untouched.
+They document the whkd-equivalent sample this project has always shipped, and rewriting them would
+have replaced an unrelated example rather than adding the model's own workflow.
+
+`komorebic toggle-shortcuts` was rejected as the panel command after reading what it opens:
+`komorebi-shortcuts` parses a `whkdrc`, so with no whkd configuration - which this task forbids -
+the panel would come up empty. The task's fallback applies, and the script carries a small
+AutoHotkey v2 ListView panel built from a table of its own bindings.
+
+Command lines were validated rather than assumed. Every subcommand the script names was checked to
+exist with `komorebic <name> --help` from a release build, and the enum arguments - `increase` /
+`decrease`, `previous` / `next`, `left-right` / `top-bottom`, the four directions - were read out
+of the same help output. The script itself was parsed by the installed AutoHotkey v2 with
+`AutoHotkey64.exe /validate`, which exits 0 for this file and 2 for a deliberately broken one.
+
+Two commands the shortcut list needs did not exist when the phase started, which is why Phases 12F
+and 12G were added ahead of it: raising the next window in a stack, and sending a single window to
+another monitor.
+
+Verification: AHK v2 syntax validation clean; all 34 subcommands used by the script exist in the
+release `komorebic`; no Rust source changed, so the test suite is unchanged from Phase 12G at 491
+passing.
 
 ### Phase 14 - Event reconciliation, serialization, documentation, and final verification
 
@@ -1945,6 +1968,14 @@ This list is updated from actual diffs, not treated as permission to change ever
   workspace's rules must be sent on while the indices still describe the list they were written
   against; the reverse order slides a following workspace's rule onto the vacated index and then
   sends that one to the wrong monitor.
+
+- 2026-08-30: `komorebic toggle-shortcuts` is not the shortcut panel for this workflow. It launches
+  `komorebi-shortcuts`, which parses a `whkdrc`; with no whkd configuration the panel is empty, so
+  the AutoHotkey script carries its own.
+- 2026-08-30: Environment hazard, recorded so it is not repeated. A komorebi built from an earlier
+  phase of this work is running on this machine, so *any* `komorebic` invocation from this
+  repository is a live command to the user's desktop, not a dry run. Command-line validation must
+  use `komorebic <name> --help` only, which parses and exits without sending anything.
 
 ## Progress log
 
@@ -2137,3 +2168,22 @@ This list is updated from actual diffs, not treated as permission to change ever
   was unreachable for several minutes again and refused three attempts at the 12A commit; staging
   the finished phase in the index kept the phases separable while it was down, as in Phases 9 and
   11. Next phase: 13, the AutoHotkey v2 workflow.
+- 2026-08-30: Phase 13 turn. The plan was re-read and the worktree confirmed clean at `b7db727b`
+  before editing, and `cargo check --workspace --all-targets` was re-run as the turn's baseline.
+  The turn opened with a shortcut audit rather than with the script, and it found two commands the
+  task's shortcut list needs which no socket message could reach: raising the next window in a
+  stack (task section 7) and sending a single window to another monitor (task section 12). Both
+  were built first, as Phases 12F and 12G, because binding a hotkey to a command which does not
+  exist is not an option. 12F also fixed the removal-focus defect underneath the first of them:
+  `remove_window_by_idx` focused `idx - 1` whatever was there, which could both move focus off an
+  untouched window and land on a minimized one. 12G found that the ID-addressed transfer had been
+  able to cross monitors since 12E while carrying its floating rectangle across unchanged, and
+  applied Phase 11A's rule to it. Phase 13 itself is documentation: an AutoHotkey v2 script whose
+  every command line was checked against `komorebic --help` and whose syntax was validated by the
+  installed AutoHotkey v2, plus a page explaining the outcome exit codes and the three window
+  classes as a user meets them. Full serial workspace suite passed at every step (komorebi 478 ->
+  487 -> 491 passing); fmt and Clippy clean apart from the pre-existing warning. One incident worth
+  recording: an early attempt to validate command lines ran them instead of asking for their help
+  text, and a komorebi from an earlier phase of this work is running on this machine, so a handful
+  of real commands reached the user's desktop. The rule this produced is in the decision log. Next
+  phase: 14, event reconciliation, serialization, documentation and final verification.

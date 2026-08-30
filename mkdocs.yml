@@ -71,6 +71,7 @@ nav:
           - common-workflows/autostart.md
           - common-workflows/animations.md
           - common-workflows/autohotkey.md
+          - common-workflows/autohotkey-window-model.md
           - common-workflows/borders.md
           - common-workflows/stackbar.md
           - common-workflows/remove-gaps.md
