@@ -2250,6 +2250,120 @@ impl Workspace {
         container
     }
 
+    /// The containers a destroyed container's windows are shared out among, in the order they are
+    /// offered windows.
+    ///
+    /// An active container hands its windows to the same group which takes its area, so the windows
+    /// and the space they occupied travel together. A hidden container has no area to give, so it
+    /// falls back to the containers which absorbed it when it was hidden - they are where its space
+    /// went - and then to the workspace's own most-recently-used order, active containers before
+    /// hidden ones. `source` is never offered a window back.
+    #[must_use]
+    fn distribution_recipients(&self, source: &ContainerId) -> Vec<ContainerId> {
+        let mut recipients = Vec::new();
+        let offer = |id: &ContainerId, recipients: &mut Vec<ContainerId>| {
+            if id != source && !recipients.contains(id) {
+                recipients.push(id.clone());
+            }
+        };
+
+        if let Some(SlotDeparture::Absorbed(shift)) = self.plan_departure(source) {
+            for mover in &shift.movers {
+                offer(&mover.container, &mut recipients);
+            }
+        } else if let Some(record) = self.hidden_slot_restores.get(source) {
+            for absorber in &record.absorbers {
+                if self.container_idx_for_id(absorber).is_some() {
+                    offer(absorber, &mut recipients);
+                }
+            }
+        }
+
+        // Most recent first, active containers before hidden ones, and finally anything the
+        // history has never seen so an empty history cannot refuse a workable operation.
+        let by_recency = |active: bool, recipients: &mut Vec<ContainerId>| {
+            for id in self.container_focus_history.iter() {
+                if let Some(idx) = self.container_idx_for_id(id)
+                    && self.containers()[idx].is_active() == active
+                {
+                    offer(id, recipients);
+                }
+            }
+
+            for container in self.containers() {
+                if container.is_active() == active && !container.is_preselect() {
+                    offer(&container.id, recipients);
+                }
+            }
+        };
+
+        by_recency(true, &mut recipients);
+        by_recency(false, &mut recipients);
+
+        recipients
+    }
+
+    /// Destroy the container at `idx`, sharing out every window it still holds.
+    ///
+    /// The windows are taken from the top of the source stack downwards and dealt round-robin to
+    /// the recipients, each arriving at the bottom of its new stack, so the recipients keep showing
+    /// what they were showing. Every window keeps its placement, visibility, presentation and
+    /// floating rectangle, and the workspace's minimize history keeps its order, because the
+    /// windows have not left the workspace - only the container they belonged to has.
+    ///
+    /// Refuses without changing anything when the container still holds windows and there is
+    /// nowhere to send them, which is the last container of a workspace.
+    pub fn destroy_container(&mut self, idx: usize) -> eyre::Result<()> {
+        let source = self
+            .containers()
+            .get(idx)
+            .ok_or_eyre("there is no container at that index")?
+            .id
+            .clone();
+
+        let recipients = self.distribution_recipients(&source);
+
+        if recipients.is_empty() && !self.containers()[idx].windows().is_empty() {
+            eyre::bail!("this workspace has nowhere to send the windows of {source}");
+        }
+
+        // Nothing above this point has written anything, and nothing below it can fail.
+        let expansion = self.expansion_focus_target(idx);
+
+        // The minimize history is about windows, not containers, and these windows are staying in
+        // this workspace; removing their container must not silently reorder it.
+        let minimize_history = self.minimize_history.clone();
+
+        let container = self
+            .remove_container_by_idx(idx)
+            .ok_or_eyre("the container disappeared while it was being destroyed")?;
+
+        // Top of the stack first: the ring holds a stack bottom-up, so the last element is the
+        // window the source container was showing.
+        let windows: Vec<ManagedWindow> = container.windows().iter().rev().cloned().collect();
+
+        for (position, window) in windows.into_iter().enumerate() {
+            let recipient = &recipients[position % recipients.len()];
+
+            if let Some(recipient_idx) = self.container_idx_for_id(recipient)
+                && let Some(container) = self.containers_mut().get_mut(recipient_idx)
+            {
+                container.receive_window_at_bottom(window);
+            }
+        }
+
+        self.minimize_history = minimize_history;
+        self.prune_histories();
+        self.focus_after_removal(expansion);
+
+        Ok(())
+    }
+
+    /// Destroy the focused container, sharing out every window it still holds.
+    pub fn destroy_focused_container(&mut self) -> eyre::Result<()> {
+        self.destroy_container(self.focused_container_idx())
+    }
+
     pub fn preselect_container_idx(&mut self, insertion_idx: usize) {
         self.preselected_container_idx = Some(insertion_idx);
         self.insert_container_at_idx(insertion_idx, Container::preselect());
@@ -4651,6 +4765,243 @@ mod tests {
         if let Some(window) = workspace.containers()[idx].focused_managed_window() {
             assert_eq!(window.visibility, Visibility::Visible);
         }
+    }
+
+    /// Every window this workspace holds, by container, bottom of the stack first.
+    fn stacks(workspace: &Workspace) -> Vec<Vec<isize>> {
+        workspace
+            .containers()
+            .iter()
+            .map(|container| container.windows().iter().map(|w| w.hwnd).collect())
+            .collect()
+    }
+
+    #[test]
+    fn destroying_a_container_deals_its_windows_round_robin() {
+        let mut workspace = workspace_with_containers(&[4, 1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        let source: Vec<isize> = workspace.containers()[0]
+            .windows()
+            .iter()
+            .map(|w| w.hwnd)
+            .collect();
+        let recipients = workspace.distribution_recipients(&workspace.containers()[0].id.clone());
+
+        workspace.destroy_container(0).unwrap();
+
+        assert_eq!(workspace.containers().len(), 2);
+
+        // The source stack is dealt top down, so its top window goes to the first recipient, the
+        // one below it to the second, and so on around again.
+        let top_down: Vec<isize> = source.iter().rev().copied().collect();
+
+        for (position, hwnd) in top_down.iter().enumerate() {
+            let expected = &recipients[position % recipients.len()];
+            let idx = workspace.container_idx_for_id(expected).unwrap();
+
+            assert!(
+                workspace.containers()[idx].contains_window(*hwnd),
+                "window {hwnd} did not go to recipient {position}"
+            );
+        }
+
+        // No window was lost or duplicated on the way.
+        let mut landed: Vec<isize> = stacks(&workspace).concat();
+        landed.sort_unstable();
+        let mut expected: Vec<isize> = source.clone();
+        expected.extend([4, 5]);
+        expected.sort_unstable();
+
+        assert_eq!(landed, expected);
+
+        crate::invariants::assert_invariants(&workspace, "after destroying a container");
+    }
+
+    #[test]
+    fn distributed_windows_arrive_underneath_what_the_recipient_was_showing() {
+        let mut workspace = workspace_with_containers(&[2, 2]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        let recipient_id = workspace.containers()[1].id.clone();
+        let showing = workspace.containers()[1].focused_window().unwrap().hwnd;
+
+        workspace.destroy_container(0).unwrap();
+
+        let idx = workspace.container_idx_for_id(&recipient_id).unwrap();
+        let container = &workspace.containers()[idx];
+
+        // Dealing the source top down and inserting each window at the bottom lands them in the
+        // recipient in the order they had in the source, underneath everything already there.
+        assert_eq!(container.windows()[0].hwnd, 0);
+        assert_eq!(container.windows()[1].hwnd, 1);
+        assert_eq!(container.windows()[2].hwnd, 2);
+        assert_eq!(container.focused_window().unwrap().hwnd, showing);
+
+        // They are underneath in the focus history too, so a later focus selection prefers the
+        // window this container already had.
+        assert_eq!(container.focus_history().most_recent(), Some(&showing));
+    }
+
+    #[test]
+    fn a_distributed_window_keeps_every_dimension_of_its_own_state() {
+        let mut workspace = workspace_with_containers(&[2, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        workspace.float_window(0, floating_rect(3)).unwrap();
+        workspace.containers_mut()[0].windows_mut()[0].presentation = Presentation::Maximized;
+        workspace.minimize_window(0).unwrap();
+
+        workspace.destroy_container(0).unwrap();
+
+        let container = workspace.container_for_window(0).unwrap();
+        let window = container
+            .windows()
+            .iter()
+            .find(|w| w.hwnd == 0)
+            .expect("the window kept its state but lost its container");
+
+        assert_eq!(window.placement, ManagedPlacement::Floating);
+        assert_eq!(window.visibility, Visibility::Minimized);
+        assert_eq!(window.presentation, Presentation::Maximized);
+        assert_eq!(window.floating_rect, Some(floating_rect(3)));
+
+        // Ownership is the one thing which did change.
+        assert_eq!(window.container_id, container.id);
+    }
+
+    #[test]
+    fn destroying_a_container_expands_its_neighbours_over_its_slot() {
+        let mut workspace = workspace_with_containers(&[2, 1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        let destroyed = workspace.containers()[1].id.clone();
+
+        workspace.destroy_container(1).unwrap();
+
+        assert!(!workspace.logical_slots.contains(&destroyed));
+        assert!(
+            workspace
+                .logical_slots
+                .validate_coverage(LogicalRect::from(area))
+                .is_ok()
+        );
+        assert!(!workspace.relayout_pending);
+    }
+
+    #[test]
+    fn a_hidden_container_sends_its_windows_to_the_containers_which_took_its_area() {
+        let mut workspace = workspace_with_containers(&[1, 1, 2]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        hide_container(&mut workspace, 2);
+        workspace.record_logical_slots(area);
+
+        let hidden = workspace.containers()[2].id.clone();
+        let absorbers = workspace.hidden_slot_restores[&hidden].absorbers.clone();
+        let recipients = workspace.distribution_recipients(&hidden);
+        let before = slot_map(&workspace);
+
+        // The containers which took this one's area are offered its windows first.
+        assert!(!absorbers.is_empty());
+        assert_eq!(recipients[..absorbers.len()], absorbers[..]);
+
+        let top = workspace.containers()[2].focused_window().unwrap().hwnd;
+
+        workspace.destroy_container(2).unwrap();
+
+        // A hidden container holds no slot, so nothing expands.
+        assert_eq!(slot_map(&workspace), before);
+
+        // Its stack is dealt from the top, so its top window goes to the first absorber. There are
+        // more windows here than absorbers, so the rest go on round the recipient order, which is
+        // why this asserts the deal rather than that every window landed on an absorber.
+        let owner = workspace.container_for_window(top).unwrap().id.clone();
+        assert_eq!(owner, recipients[0]);
+        assert!(absorbers.contains(&owner));
+
+        crate::invariants::assert_invariants(&workspace, "after destroying a hidden container");
+    }
+
+    #[test]
+    fn destroying_the_only_container_of_a_workspace_refuses_without_changing_anything() {
+        let mut workspace = workspace_with_containers(&[2]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        let before = workspace.clone();
+
+        assert!(workspace.destroy_container(0).is_err());
+
+        assert_eq!(workspace.containers(), before.containers());
+        assert_eq!(slot_map(&workspace), slot_map(&before));
+        assert_eq!(
+            workspace.container_focus_history.len(),
+            before.container_focus_history.len()
+        );
+    }
+
+    #[test]
+    fn an_empty_container_can_always_be_destroyed() {
+        let mut workspace = workspace_with_containers(&[1]);
+        workspace.containers_mut()[0].windows_mut().clear();
+
+        assert!(workspace.destroy_container(0).is_ok());
+        assert!(workspace.containers().is_empty());
+    }
+
+    #[test]
+    fn focus_after_a_destruction_does_not_follow_the_distributed_windows() {
+        let mut workspace = workspace_with_containers(&[2, 1, 1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        let expected = workspace.expansion_focus_target(1).unwrap();
+        let moved: Vec<isize> = workspace.containers()[1]
+            .windows()
+            .iter()
+            .map(|w| w.hwnd)
+            .collect();
+
+        workspace.destroy_container(1).unwrap();
+
+        let idx = workspace.focused_container_idx();
+        assert_eq!(workspace.containers()[idx].id, expected);
+
+        // The recipient shows what it was already showing, not a window which has just arrived.
+        let focused = workspace.containers()[idx].focused_window().unwrap().hwnd;
+        assert!(!moved.contains(&focused));
+    }
+
+    #[test]
+    fn the_minimize_history_survives_a_destruction() {
+        let mut workspace = workspace_with_containers(&[2, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        workspace.minimize_window(0).unwrap();
+        workspace.minimize_window(1).unwrap();
+
+        let before: Vec<isize> = workspace.minimize_history.iter().copied().collect();
+
+        workspace.destroy_container(0).unwrap();
+
+        // The windows are still minimized and still in this workspace, so the order in which they
+        // would be restored is unchanged.
+        assert_eq!(
+            workspace
+                .minimize_history
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            before
+        );
+        assert_eq!(workspace.restore_last_minimized_window(), Some(1));
     }
 
     fn workspace_with_containers(counts: &[usize]) -> Workspace {

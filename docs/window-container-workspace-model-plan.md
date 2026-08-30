@@ -944,28 +944,103 @@ directional expansion rule exists to avoid.
 
 #### Phase 8A - Active deletion expansion and post-deletion focus
 
-- [ ] Plan the departing container's absorption while its slot is still in place, and apply it as a
+- [x] Plan the departing container's absorption while its slot is still in place, and apply it as a
   local slot edit rather than falling through to a recalculation.
-- [ ] Fall back to invalidation, not to a hole, when no edge can absorb the slot.
-- [ ] Invalidate the hidden restore records whose absorbers the expansion moved.
-- [ ] Select post-deletion focus from the first expansion recipient in plan order.
-- [ ] Add expansion, multi-neighbour expansion, fallback, restore-invalidation and focus tests.
-- [ ] Commit as `feat: expand neighbours over a deleted container`.
+- [x] Fall back to invalidation, not to a hole, when no edge can absorb the slot.
+- [x] Invalidate the hidden restore records whose absorbers the expansion moved.
+- [x] Select post-deletion focus from the first expansion recipient in plan order.
+- [x] Add expansion, multi-neighbour expansion, fallback, restore-invalidation and focus tests.
+- [x] Commit as `feat: expand neighbours over a deleted container`.
 
 Expected handwritten change: 250-400 lines. Likely files: `workspace.rs`.
 
+Commit: `a3bf6443`. Actual files: `workspace.rs` only, as predicted. Actual Rust change: 418 added,
+8 removed, about two thirds of it tests.
+
+The whole phase turns on one ordering constraint. The absorption can only be planned while the
+departing slot is still in the map, because that is the only moment the group which can take it is
+knowable; it can only be *adopted* once the container has left the ring, because the arrangement
+fingerprint from 6B contains the container list, and adopting a list the container is still in would
+leave the next reconciliation certain to recalculate. So `remove_container_by_idx` plans first,
+removes, then applies - and it is the single removal chokepoint, so every deletion path in the
+workspace gets the expansion without having to opt in.
+
+`SlotDeparture` exists because "no plan" was being asked to mean two different things. A hidden
+container leaving changes no geometry at all and must cost the user nothing; a slot no edge can
+absorb must cost a rearrangement. Collapsing them into `Option<SlotShift>` would have made every
+hidden container's deletion throw away the workspace's manual boundaries.
+
+Restore-record invalidation is now explicit rather than incidental. `plan_release` would already
+have refused a record whose absorber had grown again, so the *outcome* was correct before this
+phase; but the record kept claiming `exact_restore_valid`, which is a lie the state output would
+have published. Marking it is the same answer arrived at honestly, and it keeps `old_rect` as the
+anchor the fallback placement needs. `forget_container` also drops the departing container's own
+record, which it had been leaving behind for the next recalculation to clear.
+
+`slots_are_authoritative` was factored out of `try_local_slot_update` rather than written fresh, so
+there is one definition of "the slots are the arrangement" and a local edit and a departure cannot
+disagree about it.
+
+Verification: `cargo test --workspace -- --test-threads=1` passed with komorebi 320 passed/1 ignored
+(up from 312), layouts 128, bar 3. `cargo fmt --all --check` clean; `cargo clippy --workspace
+--all-targets` reported only the two pre-existing warnings; `cargo check -p komorebi --features
+schemars` passed.
+
+Not in this phase: destroying a container which still holds windows, which is 8B, and the command
+surface for it, which is Phase 12.
+
 #### Phase 8B - Explicit destruction and window distribution
 
-- [ ] Add explicit destruction of a container which still holds windows.
-- [ ] Order recipients: surviving absorbers, then active MRU, then hidden MRU, for a Hidden source;
+- [x] Add explicit destruction of a container which still holds windows.
+- [x] Order recipients: surviving absorbers, then active MRU, then hidden MRU, for a Hidden source;
   the expansion group for an Active one.
-- [ ] Distribute source windows top-to-bottom, round-robin, to recipient stack bottoms, preserving
+- [x] Distribute source windows top-to-bottom, round-robin, to recipient stack bottoms, preserving
   placement, visibility, presentation and floating rectangle.
-- [ ] Refuse atomically when a non-empty container has nowhere to send its windows.
-- [ ] Add distribution-order, state-preservation, hidden-source, refusal and focus tests.
-- [ ] Commit as `feat: distribute the windows of a destroyed container`.
+- [x] Refuse atomically when a non-empty container has nowhere to send its windows.
+- [x] Add distribution-order, state-preservation, hidden-source, refusal and focus tests.
+- [x] Commit as `feat: distribute the windows of a destroyed container`.
 
 Expected handwritten change: 250-400 lines. Likely files: `workspace.rs`, `container.rs`.
+
+Actual files: `workspace.rs` and `container.rs`, as predicted. Actual Rust change: 383 added, 0
+removed, about two thirds of it tests.
+
+The recipient order is the phase's actual content, and it is one rule rather than two. An active
+container hands its windows to the same group which takes its area, so the windows and the space
+they occupied travel together; a hidden container has no area to give, so it falls back to the
+containers which absorbed it when it was hidden, which is where its space went. Both answers are
+"follow the area", and only the way of finding it differs. The workspace MRU, active before hidden,
+is underneath both, and container order underneath that, so an empty history cannot refuse an
+operation the workspace can obviously perform.
+
+Dealing top-down into stack bottoms turned out to preserve the source's own stack order, which was
+not something the rule was designed for but is what makes it feel right: the destroyed container's
+windows arrive together, in the order they had, underneath whatever the recipient was already
+showing. `receive_window_at_bottom` is where that lives, and it also has to move the recipient's
+ring index up by one, because everything it was holding has shifted; without that the recipient
+would silently start showing its neighbour.
+
+Two test expectations were written wrong and the code was right both times. The first assumed the
+deal reversed the source stack, and the second assumed every window of a hidden container lands on
+an absorber, which only holds when there are no more windows than absorbers. Both were corrected to
+assert the behaviour rather than the guess, and the second now pins the recipient *ordering*, which
+is the property that actually matters.
+
+The minimize history is snapshotted across the destruction and restored. `forget_container` drops
+the entries of every window of a departing container, which is right when the container is leaving
+the workspace and wrong when only the container is going and its windows are staying. Restoring the
+snapshot and then pruning to owned handles is what keeps the restore order the user had.
+
+Refusal is by construction, as in 7C: the only thing which can fail is having nowhere to send the
+windows, and that is decided before anything has been written.
+
+Verification: `cargo test --workspace -- --test-threads=1` passed with komorebi 329 passed/1 ignored
+(up from 320), layouts 128, bar 3. Two of the new tests assert the workspace invariant validator
+directly rather than only the geometry. `cargo fmt --all --check` clean; `cargo clippy --workspace
+--all-targets` reported only the two pre-existing warnings; `cargo check -p komorebi --features
+schemars` passed.
+
+Not in this phase: the shared-edge resize, which is 8C, and the command surface, which is Phase 12.
 
 #### Phase 8C - Multi-neighbour shared-edge resize
 

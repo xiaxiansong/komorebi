@@ -475,6 +475,38 @@ impl Container {
         }
     }
 
+    /// Take on a window underneath everything this container is already holding.
+    ///
+    /// This is the receiving half of a distribution: the windows of a destroyed container are
+    /// shared out among the survivors, and an arrival must not displace what its new container was
+    /// showing. So it goes to the bottom of the stack rather than the top, it takes the oldest
+    /// place in the focus history rather than the most recent one, and a stored window which was
+    /// visible is hidden, because only the top of a stack is on screen.
+    ///
+    /// Everything else about the window is left alone. Its placement, visibility, presentation and
+    /// floating rectangle are its own state, not its container's, and only its ownership changes.
+    pub fn receive_window_at_bottom(&mut self, mut window: ManagedWindow) {
+        window.container_id.clone_from(&self.id);
+
+        if window.placement == ManagedPlacement::Stored && window.visibility == Visibility::Visible
+        {
+            window.hide();
+        }
+
+        let hwnd = window.hwnd;
+        let was_empty = self.windows().is_empty();
+        let focused_idx = self.focused_window_idx();
+
+        self.windows.elements_mut().push_front(window);
+
+        // Everything which was already here moved up one place, the focused window included, so
+        // the ring index has to move with it or the container would start showing its neighbour.
+        self.windows
+            .focus(if was_empty { 0 } else { focused_idx + 1 });
+
+        self.focus_history.record_oldest(hwnd);
+    }
+
     #[tracing::instrument(skip(self))]
     pub fn focus_window(&mut self, idx: usize) {
         tracing::info!("focusing window");
