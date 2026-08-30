@@ -67,9 +67,16 @@ script can tell "you asked to move a tiled window" apart from "komorebi is not r
   a workspace or container ID - `komorebic state` reports them - and the `Alt+Shift` variants add
   `--follow` so focus travels with the window. `Alt+Shift+F1..F3` does the same across monitors
   with `move-window-to-monitor`.
-- **`Alt+/` opens the script's own panel.** `komorebic toggle-shortcuts` shows the bindings from a
-  `whkdrc`, which this configuration does not have, so the script carries a small AutoHotkey v2
-  panel listing what it actually binds.
+- **`Alt+I` opens the script's own panel**, and `Alt+/` does the same. `komorebic
+  toggle-shortcuts` shows the bindings from a `whkdrc`, which this configuration does not have, so
+  the script carries a small AutoHotkey v2 panel listing what it actually binds. The tray icon
+  carries the same entry, for when a hotkey is swallowed by an elevated foreground window. The
+  panel is an ordinary captioned window, so `window_is_eligible` would hand it a slot; give it an
+  `ignore_rules` entry so it floats over the tiling instead:
+
+    ```json
+    { "kind": "Title", "id": "komorebi 快捷键", "matching_strategy": "StartsWith" }
+    ```
 
 ## The script
 

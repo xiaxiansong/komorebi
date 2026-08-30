@@ -2260,6 +2260,46 @@ exists in the new binary.
 Verification: komorebi 539 passing; `cargo fmt --check` clean; Clippy clean apart from the
 pre-existing warning; schema regenerated; live desktop verified as above.
 
+### Phase 17 - The shortcut panel key
+
+Added on 2026-08-31. The report was that `Alt+I` does not open the shortcut panel, and that the
+panel is wanted as the surface for testing the rest of the model by hand.
+
+The cause is a key that moved. The user's pre-Phase-15 script bound the Chinese cheat sheet to
+`Alt+I`; the script this repository ships bound it to `Alt+/`, and Phase 15 replaced the former
+with the latter. Nothing at all is bound to `Alt+I`, so the key does nothing - there is no failure
+in komorebi, in the socket, or in the hotkey layer. Everything else was healthy while this was
+diagnosed: komorebi answered `state`, was not paused, and held the desktop's five windows.
+
+- [x] 17A: bind `Alt+I` to `ToggleShortcutPanel`, keeping `Alt+/` as a second entry, and add a tray
+  menu entry so the panel is reachable when a hotkey is swallowed by an elevated foreground window.
+- [x] 17B: the panel's own `ignore_rules` entry. The panel is a captioned window with
+  `WS_EX_WINDOWEDGE`, which is exactly what `window_is_eligible` looks for, so komorebi would give
+  it a slot and shift the tiling every time it is opened. The user's configuration already ignored
+  the *old* panel by its exact title, `komorebi 快捷键速查`, which the new panel's title does not
+  match; the rule is now `StartsWith` on `komorebi 快捷键`, which covers both.
+
+Two things were tried and rejected on evidence rather than taste. `+ToolWindow` alone does not take
+the panel out of `window_is_eligible` - a tool window still carries `WS_EX_WINDOWEDGE` - and
+stripping that bit between `Gui()` and `Show()` does not survive `Show()`, which puts it back. The
+option is kept for the taskbar-button behaviour only, and the script now says so rather than
+claiming a protection it does not provide. An `ignore_rules` entry is the mechanism komorebi
+actually offers here, and it is what komorebi's own `komorebi-shortcuts.exe` relies on.
+
+Verification was end to end, not by inspection. The hotkey layer runs elevated - deliberately, for
+UIPI - so it cannot be replaced from an unelevated shell; deleting `hotkeys.pid` makes the
+watchdog relaunch it with the same token, and `#SingleInstance Force` retires the old instance.
+A probe script sending at `SendLevel 1` (AHK hotkeys ignore level-0 input from other AHK scripts)
+pressed `Alt+I` from its own caption-less window: from a clean start the panel opened, a second
+press closed it, and `Alt+/` opened and closed it again. With the panel open, `komorebic state`
+listed the same five managed windows and not the panel, so the ignore rule holds. The panel was
+closed again afterwards.
+
+One thing recorded because it nearly produced a wrong answer: the first Win32 enumerator written to
+cross-check the AHK probes declared `GetWindowTextW` without `CharSet.Unicode`, so every title came
+back truncated to one character and the panel looked absent when it was on screen. The AHK probes
+were right and the cross-check was wrong.
+
 ## Provisional affected-file inventory
 
 This list is updated from actual diffs, not treated as permission to change every file.
@@ -2710,3 +2750,16 @@ This list is updated from actual diffs, not treated as permission to change ever
   code whose `CoCreateInstance(CLSID_ImmersiveShell).unwrap()` aborted the process once on
   2026-08-30 with `0x80040154`. It is not a regression from this work and hardening it would edit
   an upstream file for a once-in-five-days event, so it is reported rather than fixed.
+- 2026-08-31: Phase 17 turn. No Rust changed. `Alt+I` opened no panel because nothing is bound to
+  it: the panel moved to `Alt+/` when Phase 15 replaced the user's script with this repository's,
+  and the user's key is the one their previous script used. komorebi itself was healthy throughout
+  - answering `state`, unpaused, holding all five desktop windows - so the fix is entirely in the
+  script and the configuration. `Alt+I` is now bound alongside `Alt+/`, the tray icon carries the
+  same entry for when an elevated foreground window swallows a hotkey, and the panel's
+  `ignore_rules` entry was widened from an `Equals` on the old panel's title to a `StartsWith` on
+  `komorebi 快捷键`, which covers both panels - without it komorebi gives the panel a slot and
+  shifts the tiling every time it opens. Two self-contained alternatives were tried and dropped on
+  evidence: `+ToolWindow` does not clear `WS_EX_WINDOWEDGE`, and stripping that bit before `Show()`
+  does not survive it. Verified end to end rather than by reading: the elevated hotkey layer was
+  reloaded through the watchdog by removing its pid file, and a `SendLevel 1` probe opened and
+  closed the panel with both keys from a clean start while `komorebic state` showed it unmanaged.

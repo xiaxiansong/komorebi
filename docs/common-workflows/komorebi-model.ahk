@@ -170,7 +170,8 @@ ResizeFloating(Edge, Sizing) {
 !p::Komorebic("toggle-pause")                     ; 全局暂停 / 恢复
 !u::Komorebic("suspend-window")                   ; 暂停接管当前窗口
 !+u::Komorebic("resume-window")                   ; 恢复接管窗口（按新窗口重新处理）
-!/::ToggleShortcutPanel()                         ; 显示 / 隐藏快捷键面板
+!i::ToggleShortcutPanel()                         ; 显示 / 隐藏快捷键面板
+!/::ToggleShortcutPanel()                         ; 面板的第二个入口
 
 ; ============================================================================
 ; 布局与焦点
@@ -323,6 +324,14 @@ ResizeFloating(Edge, Sizing) {
 ;
 ; komorebic toggle-shortcuts 打开的面板读取的是 whkdrc，本配置不使用 whkd，
 ; 所以这里用一个 AutoHotkey v2 的小面板列出本文件真正绑定的快捷键。
+;
+; 面板窗口本身是可接管的：komorebi 接管同时具备 WS_CAPTION 和 WS_EX_WINDOWEDGE
+; 的窗口（komorebi/src/window.rs 的 window_is_eligible），而这个面板两者都有 ——
+; +ToolWindow 不影响判定，显示前摘掉 WS_EX_WINDOWEDGE 也会被 Show 重新加回来。
+; 所以要让面板浮在平铺之上而不是占掉一个槽位，得在 komorebi.json 里给它一条
+; ignore_rules：
+;
+;   { "kind": "Title", "id": "komorebi 快捷键", "matching_strategy": "StartsWith" }
 ; ============================================================================
 
 global ShortcutPanel := ""
@@ -357,7 +366,7 @@ global ShortcutTable := [
     ["Alt+Shift+F1..F3", "窗口送到显示器", "move-window-to-monitor"],
     ["Alt+Ctrl+F1..F3", "容器送到显示器", "move-to-monitor"],
     ["Alt+Ctrl+Shift+F1..F3", "工作区送到显示器", "move-workspace-to-monitor"],
-    ["Alt+/", "显示 / 隐藏本面板", "（由本脚本提供）"]
+    ["Alt+I 或 Alt+/", "显示 / 隐藏本面板", "（由本脚本提供，托盘菜单也能打开）"]
 ]
 
 ToggleShortcutPanel() {
@@ -368,7 +377,7 @@ ToggleShortcutPanel() {
         return
     }
 
-    ShortcutPanel := Gui("+AlwaysOnTop -MinimizeBox", "komorebi 快捷键")
+    ShortcutPanel := Gui("+AlwaysOnTop +ToolWindow -MinimizeBox", "komorebi 快捷键")
     ShortcutPanel.SetFont("s10", "Microsoft YaHei UI")
 
     list := ShortcutPanel.Add("ListView", "w900 r30", ["快捷键", "作用", "komorebic 命令"])
@@ -392,3 +401,6 @@ CloseShortcutPanel() {
 
     ShortcutPanel := ""
 }
+
+; 托盘菜单里也放一个入口：热键被前台的提权窗口吞掉时，面板仍然打得开。
+A_TrayMenu.Insert("1&", "显示快捷键面板", (*) => ToggleShortcutPanel())
