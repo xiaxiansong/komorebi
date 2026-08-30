@@ -53,6 +53,7 @@ use crate::border_manager;
 use crate::border_manager::IMPLEMENTATION;
 use crate::border_manager::STYLE;
 use crate::build;
+use crate::command_outcome::CommandResponse;
 use crate::config_generation::WorkspaceMatchingRule;
 use crate::core::ApplicationIdentifier;
 use crate::core::Axis;
@@ -87,7 +88,6 @@ use crate::theme_manager;
 use crate::transparency_manager;
 use crate::window::RuleDebug;
 use crate::window::Window;
-use crate::window_manager::FloatingOutcome;
 use crate::window_manager::WindowManager;
 use crate::windows_api::WindowsApi;
 use crate::winevent_listener;
@@ -186,20 +186,24 @@ pub fn listen_for_commands_tcp(wm: Arc<Mutex<WindowManager>>, port: usize) {
 }
 
 impl WindowManager {
-    /// Log what a floating geometry command did.
+    /// Report what a command did, both to the log and to whoever sent it.
     ///
-    /// A rejection is information rather than a failure: the command found the focused window and
-    /// declined to act on it because it was the wrong kind of window, which is a fact about the
-    /// window rather than about komorebi. Typed outcomes reach the caller in Phase 12.
-    fn report_floating_outcome(outcome: FloatingOutcome) {
-        match outcome {
-            FloatingOutcome::Applied(rect) => {
-                tracing::info!("floating window moved to {rect:?}");
-            }
-            FloatingOutcome::NoOp => {
-                tracing::info!("floating window is already against its limit");
-            }
-            FloatingOutcome::Rejected(rejection) => tracing::info!("{rejection}"),
+    /// A rejection is information rather than a failure: the command found its subject and
+    /// declined to act on it because it was the wrong kind of subject, which is a fact about the
+    /// window rather than about komorebi.
+    ///
+    /// The write is best-effort. A caller which sent its message without reading a reply - which
+    /// is every caller written against an older komorebi - leaves a socket nobody reads, and a
+    /// reply which cannot be delivered must not turn a command that already succeeded into an
+    /// error.
+    fn respond(reply: &mut impl std::io::Write, response: &CommandResponse) {
+        match &response.detail {
+            Some(detail) => tracing::info!("{}: {detail}", response.outcome),
+            None => tracing::info!("{}", response.outcome),
+        }
+
+        if let Err(error) = reply.write_all(response.as_line().as_bytes()) {
+            tracing::trace!("could not write the command response: {error}");
         }
     }
 
@@ -349,11 +353,8 @@ impl WindowManager {
                         // The floating layer's directional move is the same operation as the
                         // explicit floating move command, taking its delta from the
                         // configuration; a window it may not act on is reported, not an error.
-                        if let FloatingOutcome::Rejected(rejection) =
-                            self.move_floating_window(direction, None)?
-                        {
-                            tracing::info!("{rejection}");
-                        }
+                        let outcome = self.move_floating_window(direction, None)?;
+                        Self::respond(&mut reply, &CommandResponse::from(outcome));
                     }
                 }
             }
@@ -1521,12 +1522,12 @@ impl WindowManager {
             SocketMessage::MoveFloatingWindow(direction, delta) => {
                 // No retile follows either of these: a floating window's rectangle is the only
                 // thing they own, so there is no arrangement to bring back into agreement.
-                Self::report_floating_outcome(self.move_floating_window(direction, delta)?);
+                let outcome = self.move_floating_window(direction, delta)?;
+                Self::respond(&mut reply, &CommandResponse::from(outcome));
             }
             SocketMessage::ResizeFloatingWindow(direction, sizing, delta) => {
-                Self::report_floating_outcome(
-                    self.resize_floating_window(direction, sizing, delta)?,
-                );
+                let outcome = self.resize_floating_window(direction, sizing, delta)?;
+                Self::respond(&mut reply, &CommandResponse::from(outcome));
             }
             SocketMessage::ResizeWindowAxis(axis, sizing) => {
                 // If the user has a custom layout, allow for the resizing of the primary column

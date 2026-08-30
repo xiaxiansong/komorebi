@@ -3,6 +3,7 @@
 pub mod animation;
 pub mod border_manager;
 pub mod com;
+pub mod command_outcome;
 #[macro_use]
 pub mod ring;
 pub mod container;
@@ -54,6 +55,7 @@ use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
+pub use command_outcome::*;
 pub use core::*;
 pub use komorebi_themes::colour::*;
 pub use managed_window::*;

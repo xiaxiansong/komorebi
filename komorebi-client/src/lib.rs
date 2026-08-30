@@ -33,6 +33,8 @@ pub use komorebi::animation::PerAnimationPrefixConfig;
 pub use komorebi::animation::prefix::AnimationPrefix;
 pub use komorebi::asc::ApplicationSpecificConfiguration;
 pub use komorebi::border_manager::BorderInfo;
+pub use komorebi::command_outcome::CommandOutcome;
+pub use komorebi::command_outcome::CommandResponse;
 pub use komorebi::config_generation::ApplicationConfiguration;
 pub use komorebi::config_generation::IdWithIdentifier;
 pub use komorebi::config_generation::IdWithIdentifierAndComment;

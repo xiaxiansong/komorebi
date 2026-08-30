@@ -28,6 +28,7 @@ use color_eyre::eyre::bail;
 use fs_tail::TailedFile;
 use komorebi_client::AppSpecificConfigurationPath;
 use komorebi_client::ApplicationSpecificConfiguration;
+use komorebi_client::CommandResponse;
 use komorebi_client::send_message;
 use komorebi_client::send_query;
 use lazy_static::lazy_static;
@@ -1609,6 +1610,48 @@ enum SubCommand {
     DisableAutostart,
 }
 
+// send_command sends a mutating message and reports the typed outcome komorebi replied with.
+//
+// The outcome reaches the caller as the process exit code, and anything komorebi added about it
+// goes to stderr, so a successful command stays as silent as it has always been and a script can
+// still tell "the window was not floating" apart from "komorebi could not be reached".
+//
+// Two replies mean "this komorebi does not report an outcome for this command": an empty one, from
+// a build older than the outcome protocol, and no reply at all within the read timeout, from a
+// command still working when the timeout expired. Both are reported as success, because the
+// message was delivered either way.
+fn send_command(message: &SocketMessage) -> eyre::Result<()> {
+    let reply = match send_query(message) {
+        Ok(reply) => reply,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    let Some(line) = reply.lines().find(|line| !line.trim().is_empty()) else {
+        return Ok(());
+    };
+
+    let response: CommandResponse = serde_json::from_str(line)?;
+
+    if response.outcome.changed_state() {
+        return Ok(());
+    }
+
+    match &response.detail {
+        Some(detail) => eprintln!("{}: {detail}", response.outcome),
+        None => eprintln!("{}", response.outcome),
+    }
+
+    std::process::exit(response.outcome.exit_code());
+}
+
 // print_query is a helper that queries komorebi and prints the response.
 // panics on error.
 fn print_query(message: &SocketMessage) {
@@ -3122,13 +3165,13 @@ if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
             send_message(&SocketMessage::ResizeWindowAxis(args.axis, args.sizing))?;
         }
         SubCommand::MoveFloatingWindow(args) => {
-            send_message(&SocketMessage::MoveFloatingWindow(
+            send_command(&SocketMessage::MoveFloatingWindow(
                 args.direction,
                 args.delta,
             ))?;
         }
         SubCommand::ResizeFloatingWindow(args) => {
-            send_message(&SocketMessage::ResizeFloatingWindow(
+            send_command(&SocketMessage::ResizeFloatingWindow(
                 args.edge,
                 args.sizing,
                 args.delta,
