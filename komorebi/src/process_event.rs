@@ -40,6 +40,7 @@ use crate::window_manager::WindowManager;
 use crate::window_manager_event::WindowManagerEvent;
 use crate::windows_api::WindowsApi;
 use crate::winevent::WinEvent;
+use crate::workspace::NewWindowPlacement;
 use crate::workspace::WorkspaceLayer;
 
 fn should_skip_focus_change(foreground_hwnd: Option<isize>, window_hwnd: isize) -> bool {
@@ -716,9 +717,20 @@ impl WindowManager {
                             } else {
                                 match behaviour.current_behaviour {
                                     WindowContainerBehaviour::Create => {
-                                        workspace.new_container_for_window(window);
+                                        // Creating is a threshold, not an unconditional rule: past
+                                        // two active containers the window joins a neighbour's
+                                        // stack instead, which is a stacking event like an append.
+                                        let placement = workspace.place_new_window(window);
                                         workspace.layer = WorkspaceLayer::Tiling;
-                                        self.update_focused_workspace(false, false)?;
+
+                                        let joined =
+                                            matches!(placement, NewWindowPlacement::Joined(_));
+
+                                        self.update_focused_workspace(joined, false)?;
+
+                                        if joined {
+                                            stackbar_manager::send_notification();
+                                        }
                                     }
                                     WindowContainerBehaviour::Append => {
                                         workspace

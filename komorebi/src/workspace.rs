@@ -40,6 +40,7 @@ use crate::geometry::LogicalRect;
 use crate::geometry::LogicalSlots;
 use crate::geometry::RenderInsets;
 use crate::geometry::SlotOrder;
+use crate::geometry::SplitAxis;
 use crate::lockable_sequence::LockableSequence;
 use crate::managed_window::ManagedPlacement;
 use crate::managed_window::ManagedWindow;
@@ -199,6 +200,28 @@ pub struct SlotInputs {
     resize_dimensions: Vec<Option<Rect>>,
     containers: Vec<ContainerId>,
     monocle: Option<ContainerId>,
+}
+
+/// Where a newly managed window ended up.
+///
+/// Returned rather than only logged because what follows differs: joining an existing container is
+/// a stack change and the stackbar has to be told about it, while creating one is an arrangement
+/// change and is not a stacking event at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NewWindowPlacement {
+    /// The window got a container of its own whose slot the layout will produce.
+    ///
+    /// This is the empty-workspace case, an explicit preselection, and the fallback taken when a
+    /// donor's slot cannot be halved.
+    NewContainer(ContainerId),
+    /// A new container was split off `donor`'s slot along `axis`.
+    Split {
+        created: ContainerId,
+        donor: ContainerId,
+        axis: SplitAxis,
+    },
+    /// The window joined an existing active container's stack.
+    Joined(ContainerId),
 }
 
 /// How to give one hidden container's logical slot back to it.
@@ -2256,6 +2279,163 @@ impl Workspace {
 
         self.focus_container_by_window(hwnd).ok()?;
         self.floating_windows().get(idx).copied()
+    }
+
+    /// The position in the ring of the container with this identity.
+    #[must_use]
+    pub fn container_idx_for_id(&self, id: &ContainerId) -> Option<usize> {
+        self.containers()
+            .iter()
+            .position(|container| &container.id == id)
+    }
+
+    /// Place a newly managed window according to the active container count.
+    ///
+    /// The rule is a threshold, not a layout: with no active container the window's container takes
+    /// the whole work area; with one or two the focused active container's slot is halved and the
+    /// window gets a container of its own; from three onwards no container is created and the window
+    /// joins an active neighbour instead. Hidden containers are not counted, because they hold no
+    /// slot for anything to be split off.
+    ///
+    /// The split is applied to the slots here rather than left to the layout so that the halves the
+    /// user was promised are the halves they get, whatever arrangement the layout would have chosen.
+    pub fn place_new_window(&mut self, window: Window) -> NewWindowPlacement {
+        // A preselection is an instruction about this particular window, so it outranks the
+        // automatic rule.
+        if self.preselected_container_idx.is_some() {
+            return self.new_container_for_new_window(window);
+        }
+
+        match self.active_container_ids().len() {
+            0 => self.new_container_for_new_window(window),
+            1 | 2 => self.split_for_new_window(window, None),
+            _ => self.join_neighbour_for_new_window(window),
+        }
+    }
+
+    /// Give the window a container of its own and let the arrangement place it.
+    fn new_container_for_new_window(&mut self, window: Window) -> NewWindowPlacement {
+        self.new_container_for_window(window);
+
+        let id = self
+            .focused_container()
+            .map_or_else(ContainerId::new, |container| container.id.clone());
+
+        NewWindowPlacement::NewContainer(id)
+    }
+
+    /// Halve the geometry-focused active container's slot and give one half to a new container.
+    ///
+    /// `axis` forces the dividing line; `None` divides the longer edge. Falls back to an ordinary
+    /// container creation - and therefore to a full recalculation - when there is no donor slot to
+    /// halve, so a refusal here can never leave a container without a slot.
+    pub fn split_for_new_window(
+        &mut self,
+        window: Window,
+        axis: Option<SplitAxis>,
+    ) -> NewWindowPlacement {
+        // The scrolling layout defines its own arrangement from the focused container, so a local
+        // edit to its slots would be overwritten by the next recalculation anyway.
+        if self.layout_follows_focus() {
+            return self.new_container_for_new_window(window);
+        }
+
+        let Some(donor_idx) = self.active_container_idx_for_geometry() else {
+            return self.new_container_for_new_window(window);
+        };
+
+        let Some(donor) = self
+            .containers()
+            .get(donor_idx)
+            .map(|container| container.id.clone())
+        else {
+            return self.new_container_for_new_window(window);
+        };
+
+        let mut container = Container::default();
+        let created = container.id.clone();
+
+        // Planned before anything is inserted, so a slot which cannot be halved costs nothing but
+        // the fallback path.
+        let Some(split) = self.logical_slots.plan_split(&donor, &created, axis) else {
+            return self.new_container_for_new_window(window);
+        };
+
+        container.add_window(window);
+
+        // Container order is what the layout would arrange, so the new container is inserted where
+        // its half actually is: a left/right split puts it on the left, before the donor, and a
+        // top/bottom split puts it below, after it.
+        let insertion_idx = match split.axis {
+            SplitAxis::LeftRight => donor_idx,
+            SplitAxis::TopBottom => donor_idx + 1,
+        };
+
+        self.insert_container_at_idx(insertion_idx, container);
+        self.logical_slots.apply_split(&split);
+        self.adopt_slot_geometry();
+
+        NewWindowPlacement::Split {
+            created,
+            donor,
+            axis: split.axis,
+        }
+    }
+
+    /// Add the window to the top of an active neighbour's stack.
+    ///
+    /// The neighbour is chosen from the slots in left, right, up, down order, so the same
+    /// arrangement always sends a new window to the same container.
+    fn join_neighbour_for_new_window(&mut self, window: Window) -> NewWindowPlacement {
+        let Some(focused_idx) = self.active_container_idx_for_geometry() else {
+            return self.new_container_for_new_window(window);
+        };
+
+        let Some(focused) = self
+            .containers()
+            .get(focused_idx)
+            .map(|container| container.id.clone())
+        else {
+            return self.new_container_for_new_window(window);
+        };
+
+        let target = self
+            .logical_slots
+            .adjacent_neighbour(&focused)
+            .unwrap_or_else(|| {
+                // Three or more active containers tile the work area, so at least one of them
+                // borders this one. Reaching this arm means the slots and the containers disagree.
+                tracing::warn!(
+                    "container {focused} has no adjacent active container; the new window joins it instead"
+                );
+
+                focused.clone()
+            });
+
+        let Some(target_idx) = self.container_idx_for_id(&target) else {
+            return self.new_container_for_new_window(window);
+        };
+
+        let Some(container) = self.containers_mut().get_mut(target_idx) else {
+            return self.new_container_for_new_window(window);
+        };
+
+        // The top of the stack is the focused window of the container, which is what `add_window`
+        // makes the added window.
+        container.add_window(window);
+        self.focus_container(target_idx);
+
+        NewWindowPlacement::Joined(target)
+    }
+
+    /// Adopt the slots as they are now as the arrangement this workspace is in.
+    ///
+    /// A local edit changes the slots deliberately. Without this the next reconciliation would see
+    /// inputs it has never arranged - a container list with one more entry in it - and recalculate
+    /// the whole workspace, discarding exactly the edit that was just made.
+    fn adopt_slot_geometry(&mut self) {
+        self.relayout_pending = false;
+        self.slot_inputs = Some(self.slot_inputs());
     }
 
     pub fn new_container_for_window(&mut self, window: Window) {
@@ -5505,5 +5685,255 @@ mod tests {
             assert_eq!(visible_windows[0].unwrap().hwnd, 200);
             assert_eq!(visible_windows[1].unwrap().hwnd, 300);
         }
+    }
+    /// A workspace whose slots are already recorded, so placement can edit them locally.
+    fn arranged_workspace(counts: &[usize], area: Rect) -> Workspace {
+        let mut workspace = workspace_with_containers(counts);
+        workspace.record_logical_slots(area);
+        workspace
+    }
+
+    fn slot_of(workspace: &Workspace, id: &ContainerId) -> LogicalRect {
+        workspace
+            .logical_slots
+            .get(id)
+            .expect("an active container holds a slot")
+    }
+
+    #[test]
+    fn the_first_window_of_an_empty_workspace_takes_the_whole_area() {
+        let mut workspace = Workspace::default();
+        let area = work_area(1920, 1080);
+
+        let placement = workspace.place_new_window(Window::from(1));
+        workspace.record_logical_slots(area);
+
+        let NewWindowPlacement::NewContainer(id) = placement else {
+            panic!("the first window gets a container of its own, got {placement:?}");
+        };
+
+        assert_eq!(workspace.containers().len(), 1);
+        assert_eq!(slot_of(&workspace, &id), LogicalRect::from(area));
+        assert_eq!(workspace.focused_container_idx(), 0);
+    }
+
+    #[test]
+    fn the_second_window_halves_the_focused_container() {
+        let area = work_area(1920, 1080);
+        let mut workspace = arranged_workspace(&[1], area);
+        let donor_id = workspace.containers()[0].id.clone();
+
+        let placement = workspace.place_new_window(Window::from(99));
+
+        let NewWindowPlacement::Split {
+            created,
+            donor,
+            axis,
+        } = placement
+        else {
+            panic!("the second window splits the focused container, got {placement:?}");
+        };
+
+        assert_eq!(donor, donor_id);
+        assert_eq!(axis, SplitAxis::LeftRight);
+        // A left/right split puts the new container on the left.
+        assert_eq!(
+            slot_of(&workspace, &created),
+            LogicalRect::new(0, 0, 960, 1080)
+        );
+        assert_eq!(
+            slot_of(&workspace, &donor_id),
+            LogicalRect::new(960, 0, 960, 1080)
+        );
+        assert_eq!(workspace.containers().len(), 2);
+        assert_eq!(workspace.focused_container().unwrap().id, created);
+        assert_eq!(
+            workspace
+                .logical_slots
+                .validate_coverage(LogicalRect::from(area)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_tall_donor_is_divided_top_to_bottom_and_keeps_the_top() {
+        let area = work_area(800, 1200);
+        let mut workspace = arranged_workspace(&[1], area);
+        let donor_id = workspace.containers()[0].id.clone();
+
+        let placement = workspace.place_new_window(Window::from(99));
+
+        let NewWindowPlacement::Split { created, axis, .. } = placement else {
+            panic!("expected a split, got {placement:?}");
+        };
+
+        assert_eq!(axis, SplitAxis::TopBottom);
+        assert_eq!(
+            slot_of(&workspace, &donor_id),
+            LogicalRect::new(0, 0, 800, 600)
+        );
+        assert_eq!(
+            slot_of(&workspace, &created),
+            LogicalRect::new(0, 600, 800, 600)
+        );
+        // The new container is below the donor, so it comes after it in container order too.
+        assert_eq!(workspace.containers()[1].id, created);
+    }
+
+    #[test]
+    fn an_odd_donor_leaves_the_extra_pixel_with_the_donor_and_no_hole() {
+        let area = work_area(1921, 1080);
+        let mut workspace = arranged_workspace(&[1], area);
+        let donor_id = workspace.containers()[0].id.clone();
+
+        let NewWindowPlacement::Split { created, .. } =
+            workspace.place_new_window(Window::from(99))
+        else {
+            panic!("expected a split");
+        };
+
+        assert_eq!(slot_of(&workspace, &created).width, 960);
+        assert_eq!(slot_of(&workspace, &donor_id).width, 961);
+        assert_eq!(
+            workspace
+                .logical_slots
+                .validate_coverage(LogicalRect::from(area)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_third_window_still_splits_but_a_fourth_joins_a_neighbour() {
+        let area = work_area(1920, 1080);
+        let mut workspace = arranged_workspace(&[1, 1], area);
+
+        assert!(matches!(
+            workspace.place_new_window(Window::from(30)),
+            NewWindowPlacement::Split { .. }
+        ));
+        assert_eq!(workspace.active_container_count(), 3);
+
+        let placement = workspace.place_new_window(Window::from(40));
+
+        let NewWindowPlacement::Joined(target) = placement else {
+            panic!("a fourth window joins a neighbour, got {placement:?}");
+        };
+
+        // No container was created, and the window is the one its container now shows.
+        assert_eq!(workspace.containers().len(), 3);
+        let target_idx = workspace.container_idx_for_id(&target).unwrap();
+        assert_eq!(
+            workspace.containers()[target_idx]
+                .focused_window()
+                .unwrap()
+                .hwnd,
+            40
+        );
+        assert_eq!(workspace.focused_container().unwrap().id, target);
+    }
+
+    #[test]
+    fn a_joined_window_goes_to_the_neighbour_chosen_left_before_up() {
+        let area = work_area(1920, 1080);
+        let mut workspace = arranged_workspace(&[1, 1, 1], area);
+
+        // Lay the three containers out explicitly: a left column and two stacked on the right.
+        let ids: Vec<ContainerId> = workspace
+            .containers()
+            .iter()
+            .map(|container| container.id.clone())
+            .collect();
+        workspace.logical_slots.replace_all(vec![
+            (ids[0].clone(), LogicalRect::new(0, 0, 960, 1080)),
+            (ids[1].clone(), LogicalRect::new(960, 0, 960, 540)),
+            (ids[2].clone(), LogicalRect::new(960, 540, 960, 540)),
+        ]);
+
+        // The bottom right container has a left neighbour and an up neighbour; left wins.
+        workspace.focus_container(2);
+        assert_eq!(
+            workspace.place_new_window(Window::from(50)),
+            NewWindowPlacement::Joined(ids[0].clone())
+        );
+
+        // The left container borders both right slots; the upper one is taken first.
+        workspace.focus_container(0);
+        assert_eq!(
+            workspace.place_new_window(Window::from(51)),
+            NewWindowPlacement::Joined(ids[1].clone())
+        );
+    }
+
+    #[test]
+    fn a_hidden_focused_container_is_not_the_donor() {
+        let area = work_area(1920, 1080);
+        let mut workspace = arranged_workspace(&[1, 1], area);
+        let active_id = workspace.containers()[0].id.clone();
+
+        workspace.focus_container(0);
+        workspace.focus_container(1);
+        hide_container(&mut workspace, 1);
+        workspace.record_logical_slots(area);
+
+        // The focused container holds no slot, so the split comes off the most recent one which
+        // does.
+        let NewWindowPlacement::Split { donor, created, .. } =
+            workspace.place_new_window(Window::from(60))
+        else {
+            panic!("expected a split off the geometry-focused container");
+        };
+
+        assert_eq!(donor, active_id);
+        assert_eq!(slot_of(&workspace, &created).width, 960);
+        assert_eq!(slot_of(&workspace, &active_id).width, 960);
+        // Placing a window does not unhide anything: the hidden container still holds no slot.
+        assert_eq!(workspace.logical_slots.len(), 2);
+    }
+
+    #[test]
+    fn a_placed_window_does_not_discard_the_arrangement_it_was_placed_into() {
+        let area = work_area(1920, 1080);
+        let mut workspace = arranged_workspace(&[1], area);
+
+        let NewWindowPlacement::Split { created, donor, .. } =
+            workspace.place_new_window(Window::from(70))
+        else {
+            panic!("expected a split");
+        };
+
+        let created_slot = slot_of(&workspace, &created);
+        let donor_slot = slot_of(&workspace, &donor);
+
+        // The next reconciliation has nothing to reconcile: the split is the arrangement now.
+        workspace.record_logical_slots(area);
+
+        assert_eq!(slot_of(&workspace, &created), created_slot);
+        assert_eq!(slot_of(&workspace, &donor), donor_slot);
+    }
+
+    #[test]
+    fn a_preselection_outranks_the_threshold_rule() {
+        let area = work_area(1920, 1080);
+        let mut workspace = arranged_workspace(&[1, 1, 1], area);
+
+        workspace.preselect_container_idx(0);
+
+        // Three active containers would otherwise mean joining a neighbour.
+        let placement = workspace.place_new_window(Window::from(80));
+
+        assert!(matches!(placement, NewWindowPlacement::NewContainer(_)));
+        assert_eq!(workspace.containers().len(), 4);
+        assert_eq!(workspace.containers()[0].focused_window().unwrap().hwnd, 80);
+    }
+
+    #[test]
+    fn a_donor_too_small_to_halve_gets_a_plain_container_instead() {
+        let area = work_area(3, 3);
+        let mut workspace = arranged_workspace(&[1], area);
+
+        let placement = workspace.place_new_window(Window::from(90));
+
+        assert!(matches!(placement, NewWindowPlacement::NewContainer(_)));
+        assert_eq!(workspace.containers().len(), 2);
     }
 }

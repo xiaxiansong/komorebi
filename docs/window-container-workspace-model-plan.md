@@ -834,15 +834,52 @@ the upstream `net2` note).
 
 #### Phase 7B - Active-count allocation for new windows
 
-- [ ] Implement the N=0, N<=2 and N>2 rules against the active container count.
-- [ ] Apply the split as a local slot edit at insertion so the arrangement is not recalculated.
-- [ ] Use the geometry-focused container when the focused container is hidden.
-- [ ] Add the no-neighbour diagnostic fallback to the focused active container.
-- [ ] Add N=0/1/2/3, split-position, odd-pixel, neighbour-order and hidden-focus tests.
-- [ ] Commit as `feat: add threshold based container allocation`.
+- [x] Implement the N=0, N<=2 and N>2 rules against the active container count.
+- [x] Apply the split as a local slot edit at insertion so the arrangement is not recalculated.
+- [x] Use the geometry-focused container when the focused container is hidden.
+- [x] Add the no-neighbour diagnostic fallback to the focused active container.
+- [x] Add N=0/1/2/3, split-position, odd-pixel, neighbour-order and hidden-focus tests.
+- [x] Commit as `feat: add threshold based container allocation`.
 
 Expected handwritten change: 250-400 lines. Likely files: `workspace.rs`, `window_manager.rs`,
 `process_event.rs`.
+
+Actual files: `workspace.rs` and `process_event.rs`. `window_manager.rs` did not need to change:
+its one `new_container_for_window` call is a cross-workspace send, which is Phase 10/11's rule and
+not this one. Actual Rust change: 436 added, 2 removed, a little over half of it tests.
+
+The threshold is expressed where the existing `WindowContainerBehaviour::Create` behaviour was,
+rather than as a new behaviour beside it. Creating a container for every new window and stopping at
+two are not two policies a user would want to choose between per workspace; they are one rule with a
+threshold in it, and `Append` still means what it always meant. This does change what `Create` does
+for anyone with three or more containers, and it is recorded as an intentional incompatibility.
+
+The decision worth recording is that the split is applied to the slots at insertion rather than left
+to the layout. The slot map is the geometry authority, but the arrangement fingerprint from 6B
+contains the container list, so an insertion would otherwise be seen as an input the arrangement has
+never been calculated for, and the next reconciliation would recalculate the whole workspace and
+discard the halves the rule had just produced. `adopt_slot_geometry` is the counterpart to
+`invalidate_slot_geometry`: this edit was deliberate, so the arrangement is what the slots now say
+it is. A split which cannot be planned - a slot too small to halve, no donor at all - falls back to
+an ordinary creation and therefore to a recalculation, so a refusal can never leave a container
+without a slot.
+
+`DefaultLayout::Scrolling` is excluded from the local split for the same reason it invalidates
+geometry on focus change: it defines its arrangement from the focused container, so an edit to its
+slots would not survive its next recalculation. It gets the fallback creation instead.
+
+Joining does not require a complete edge group, only adjacency, which is what 7A separated. The
+no-neighbour arm is unreachable while three or more slots tile the work area - it means the slots
+and the containers disagree - so it warns and falls back to the focused container rather than
+failing the window's placement.
+
+Verification: `cargo test --workspace -- --test-threads=1` passed with komorebi 300 passed/1 ignored
+(up from 290), layouts 128, bar 3. `cargo fmt --all --check` clean; `cargo clippy --workspace
+--all-targets` reported only the two pre-existing warnings; `cargo check -p komorebi --features
+schemars` passed.
+
+Not in this phase: the manual split command and its donor selection, which is 7C, and the CLI
+surface for either, which is Phase 12.
 
 #### Phase 7C - Manual container creation from an eligible donor
 
