@@ -1812,7 +1812,7 @@ question.
   it so an older state document is recognised rather than silently misread.
 - [x] 14D: add a deterministic seeded operation harness which drives long random operation
   sequences against the invariants.
-- [ ] 14E: map all 16 invariants to their implementation and tests, regenerate the schemas, run
+- [x] 14E: map all 16 invariants to their implementation and tests, regenerate the schemas, run
   every available check and write the final delivery summary.
 
 #### Phase 14A - Suspended handle identity and orphan cleanup
@@ -2010,7 +2010,36 @@ after a test module` warning.
 
 #### Phase 14E - Invariant map, schemas, documentation and final verification
 
-Expected handwritten change: documentation only, plus regenerated schemas.
+- [x] Write the model reference: the three window classes, the window state dimensions, Active and
+  Hidden containers, the hide-and-restore algorithm, the three rectangles, the configuration
+  fields, the state document and the differences from upstream.
+- [x] Map all 16 invariants to the code which implements them and the tests which check them, with
+  every citation verified to exist.
+- [x] Regenerate the schemas.
+- [x] Run every available check and record what was not run and why.
+- [x] Commit as `docs: map the model invariants and regenerate the schema`.
+
+Actual files: new `docs/window-model.md`, `mkdocs.yml`, `schema.json`.
+
+`schema.json` had been stale since Phase 9A: `floating_move_delta` and `floating_resize_delta` were
+added to the static configuration then and the schema was never regenerated. Regenerating also
+picked up three upstream docstring changes which predate this work, and replaced the mojibake em
+dashes the previously committed file carried - it had been generated through a console which was
+not UTF-8. `schema.asc.json` regenerates identically and was left alone.
+
+The generated notification schema was checked as well, because Phase 14C hand-wrote `Container`'s
+`Serialize` and `JsonSchema`: it reports `state` among the container's properties, `version` among
+the state's, and `StateVersion` as a definition, so the published schema and the published document
+agree.
+
+One environment note which is not a defect: `cargo run --package komorebic -- static-config-schema`
+overflows the stack in a *debug* build. The release binary generates every schema without
+complaint, and a release binary built before this phase behaves the same way, so this is a debug
+stack-size limitation in schema generation rather than anything this work introduced.
+
+Verification: `komorebi` lib tests 527 passing, full workspace suite serial and green. `cargo
+fmt --check` and `cargo clippy --workspace --all-targets` clean apart from the pre-existing `items
+after a test module` warning.
 
 ## Provisional affected-file inventory
 
@@ -2386,3 +2415,32 @@ This list is updated from actual diffs, not treated as permission to change ever
   text, and a komorebi from an earlier phase of this work is running on this machine, so a handful
   of real commands reached the user's desktop. The rule this produced is in the decision log. Next
   phase: 14, event reconciliation, serialization, documentation and final verification.
+- 2026-08-30: Phase 14 turn, the last one. The plan was re-read and the worktree confirmed clean at
+  `2e30dfb4` before editing, and the full serial workspace suite was re-run as the turn's baseline
+  at komorebi 491 passing. The turn opened with an audit of the event pipeline, the state output
+  and the test inventory rather than with code, and it split Phase 14 into five sub-phases along
+  what that audit found. 14A: a suspended window is removed from the reaper's cache, so nothing
+  ever noticed when one went away, and its handle stayed in the suspension set for the lifetime of
+  the process - Windows reuses handles, and the next window given that number was suppressed
+  forever with no command able to recover it; entries now carry the process which owned the window
+  and are given up when the handle stops naming it, and the reaper forgets everything the destroy
+  path clears. 14B: the model has owned a window's presentation since Phase 5D and the retile
+  reapplies it, but nothing read it back, so a user who restored a maximized window by hand was
+  fighting komorebi; only the maximized state bit is believed, and only in the direction of leaving
+  a recorded presentation, because a fullscreen rectangle is one komorebi writes itself and an
+  observation which disagrees with it cannot be told from one which has not landed yet. 14C: the
+  state output was complete but for the one field a consumer cannot compute - a container's derived
+  Active or Hidden state - and carried no way to tell which model wrote it; the derived state is
+  now published without being stored, and a document from another version is refused rather than
+  read with serde's defaults filling in a model which never held. 14D is the phase which paid for
+  itself: a seeded random-operation harness found, on its second run, that a split adopted the
+  current slots as the arrangement even when the workspace already owed a recalculation, so a
+  layout change followed by a container deletion and a new window could leave a workspace tiling
+  half its work area permanently. 14E is the model reference, the invariant map with every citation
+  verified to exist, and the schema, which had been stale since Phase 9A. Two harness assumptions
+  turned out to be wrong rather than the model, and both are recorded in the harness itself. Full
+  serial workspace suite passed at every step (komorebi 491 -> 503 -> 517 -> 522 -> 527 passing);
+  fmt and Clippy clean apart from the pre-existing warning. The one check which does not run in
+  this environment is debug-build schema generation, which overflows its stack; the release binary
+  generates every schema, including the notification schema which exercises the hand-written
+  container serialization. The plan is complete.

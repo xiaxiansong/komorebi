@@ -52,6 +52,7 @@ nav:
       - About:
           - index.md
           - design.md
+          - window-model.md
       - Getting started:
           - Installation: installation.md
           - Example configurations: example-configurations.md
