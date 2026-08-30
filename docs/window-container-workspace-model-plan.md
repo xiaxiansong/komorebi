@@ -684,15 +684,37 @@ clean; `cargo clippy --workspace --all-targets` reported only the pre-existing u
 
 ### Phase 6 - Hidden slot absorption and restoration
 
-- [ ] Implement complete-edge neighbor group selection in left/right/up/down order.
-- [ ] Implement local absorption plus `HiddenSlotRestore` snapshots and geometry generations.
-- [ ] Implement exact reverse restoration with existence, geometry, generation, and min-size checks.
-- [ ] Invalidate restores on all named topology/geometry operations and full-relayout fallback.
-- [ ] Add single/multiple neighbor, only-active, consecutive hide/restore, exact/fallback tests.
+Split into 6A and 6B on 2026-08-30, before coding. The phase has a pure-geometry half and a
+workspace-state half, and the geometry half is what the state half has to be written against, so
+doing them together would mean reviewing an unproven algorithm and its wiring at once. 6A owns the
+edge algebra and both directions of the plan; 6B owns the records, the transition detection and the
+invalidation rules.
+
+This is also the phase where the slot map stops being a pure function of the layout. Until now
+`record_logical_slots` recomputed every slot from `layout.calculate()` on every update, so hiding a
+container meant a full relayout of the workspace. From 6B the map can carry local edits, and the
+layout recalculation becomes the fallback rather than the only path.
+
+#### Phase 6A - Complete-edge groups and the absorption algebra
+
+- [ ] Implement complete-edge neighbour group selection in left/right/up/down order.
+- [ ] Implement the absorption plan and its exact reverse as validated, not-yet-applied values.
+- [ ] Add single/multiple neighbour, direction priority, partial-cover refusal, odd-pixel,
+  round-trip and min-size tests.
+- [ ] Commit as `feat: add complete edge slot absorption`.
+
+Expected handwritten change: 300-400 lines. Likely files: `geometry.rs`.
+
+#### Phase 6B - Hidden slot records, transitions and invalidation
+
+- [ ] Add `HiddenSlotRestore` snapshots keyed by container, carrying the geometry generation.
+- [ ] Drive absorption from Active -> Hidden and exact release from Hidden -> Active.
+- [ ] Invalidate restores on all named topology/geometry operations and fall back to full relayout.
+- [ ] Add only-active, consecutive hide/restore, exact/fallback and invalidation tests.
 - [ ] Commit as `feat: restore hidden container slots safely`.
 
-Expected handwritten change: 350-500 lines. Likely files: `geometry.rs`, `container.rs`,
-`workspace.rs`, `window_manager.rs`.
+Expected handwritten change: 300-450 lines. Likely files: `workspace.rs`, `window_manager.rs`,
+`state.rs`.
 
 ### Phase 7 - New-window threshold placement and manual split
 

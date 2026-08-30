@@ -367,6 +367,70 @@ pub fn sort_slots(slots: &mut [(ContainerId, LogicalRect)], order: SlotOrder) {
     slots.sort_by_key(|(_, slot)| order.key(*slot));
 }
 
+/// The directions a freed slot offers itself to its neighbours, in priority order.
+///
+/// The order is fixed rather than chosen per situation so that hiding, restoring and deleting a
+/// container all redistribute its area the same way, and so that the same topology always produces
+/// the same result.
+pub const ABSORPTION_DIRECTIONS: [OperationDirection; 4] = [
+    OperationDirection::Left,
+    OperationDirection::Right,
+    OperationDirection::Up,
+    OperationDirection::Down,
+];
+
+/// One container's part in a [`SlotShift`]: the slot it holds now and the slot it will hold.
+///
+/// Exactly one edge differs between the two, so a mover can only change its width or its height,
+/// never both, and never its position along the other axis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotMove {
+    pub container: ContainerId,
+    pub before: LogicalRect,
+    pub after: LogicalRect,
+}
+
+/// A validated, not yet applied, transfer of one whole slot between a container and its neighbours.
+///
+/// The same value describes both directions. In an absorption `slot` is given up by `container` and
+/// shared out among `movers`; in a release it is taken back by `container` and the movers shrink to
+/// exactly the rectangles they had before. Nothing is written until the plan is applied, which is
+/// what lets a caller refuse a whole operation without having half-changed the geometry.
+///
+/// Not `PartialEq`: `OperationDirection` is an upstream type which does not implement it, and
+/// deriving it here would mean changing that crate for the sake of a test convenience.
+#[derive(Debug, Clone)]
+pub struct SlotShift {
+    /// The container giving up or taking back `slot`.
+    pub container: ContainerId,
+    /// The slot being redistributed.
+    pub slot: LogicalRect,
+    /// The side of `slot` the movers are on.
+    pub direction: OperationDirection,
+    /// The neighbours changing size, in the deterministic order for `direction`.
+    pub movers: Vec<SlotMove>,
+}
+
+impl SlotShift {
+    /// The movers' current rectangles, in plan order, as a restoration record stores them.
+    #[must_use]
+    pub fn rects_before(&self) -> Vec<(ContainerId, LogicalRect)> {
+        self.movers
+            .iter()
+            .map(|mover| (mover.container.clone(), mover.before))
+            .collect()
+    }
+
+    /// The first mover in the deterministic order for this direction.
+    ///
+    /// This is the container focus moves to after a deletion: top to bottom along a vertical edge,
+    /// left to right along a horizontal one.
+    #[must_use]
+    pub fn first_mover(&self) -> Option<&ContainerId> {
+        self.movers.first().map(|mover| &mover.container)
+    }
+}
+
 /// A way in which a set of slots fails to be a valid tiling of a work area.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlotViolation {
@@ -519,6 +583,160 @@ impl LogicalSlots {
         }
     }
 
+    /// The neighbours on the `direction` side of `slot` which together cover that whole edge.
+    ///
+    /// A group is only usable when it covers the edge completely, with no overlap and no gap: any
+    /// other group would leave a hole or produce an overlap once the slot is given away. The
+    /// containers are returned in the deterministic order for `direction`.
+    #[must_use]
+    pub fn complete_edge_group(
+        &self,
+        slot: LogicalRect,
+        direction: OperationDirection,
+        exclude: &ContainerId,
+    ) -> Option<Vec<(ContainerId, LogicalRect)>> {
+        if slot.is_empty() {
+            return None;
+        }
+
+        let mut group: Vec<(ContainerId, LogicalRect)> = self
+            .slots
+            .iter()
+            .filter(|(id, candidate)| *id != exclude && slot.is_neighbour(**candidate, direction))
+            .map(|(id, candidate)| (id.clone(), *candidate))
+            .collect();
+
+        if group.is_empty() {
+            return None;
+        }
+
+        sort_slots(&mut group, SlotOrder::for_direction(direction));
+
+        // The edge is one interval. Walking the candidates in order, each must begin exactly where
+        // the previous one ended, the first must begin where the edge begins, and the last must end
+        // where it ends. That single sweep rejects overlaps, gaps and partial cover at once.
+        let (edge_start, edge_end) = slot.projection(direction);
+        let mut covered = edge_start;
+
+        for (_, candidate) in &group {
+            let (start, end) = candidate.projection(direction);
+
+            if start != covered {
+                return None;
+            }
+
+            covered = end;
+        }
+
+        (covered == edge_end).then_some(group)
+    }
+
+    /// Plan giving `slot` away to whichever neighbour group can take all of it.
+    ///
+    /// Directions are tried in [`ABSORPTION_DIRECTIONS`] order and the first complete group wins.
+    /// `None` means no single edge can absorb the slot, which is the caller's signal to fall back
+    /// to a full relayout rather than to leave a hole.
+    #[must_use]
+    pub fn plan_absorption(&self, container: &ContainerId) -> Option<SlotShift> {
+        let slot = self.get(container)?;
+
+        ABSORPTION_DIRECTIONS.into_iter().find_map(|direction| {
+            let group = self.complete_edge_group(slot, direction, container)?;
+            let opposite = direction.opposite();
+            let coordinate = slot.edge(opposite);
+
+            let movers = group
+                .into_iter()
+                .map(|(id, before)| SlotMove {
+                    container: id,
+                    before,
+                    // The mover reaches across the freed slot by moving the edge which faced it,
+                    // keeping its far edge where it is.
+                    after: before.with_edge_at(opposite, coordinate),
+                })
+                .collect();
+
+            Some(SlotShift {
+                container: container.clone(),
+                slot,
+                direction,
+                movers,
+            })
+        })
+    }
+
+    /// Plan giving `slot` back to `container`, shrinking the recorded movers to exactly the
+    /// rectangles they had before they absorbed it.
+    ///
+    /// Every recorded mover must still exist and must still hold exactly the rectangle the
+    /// absorption gave it. That single equality is the whole validity test: if it holds for all of
+    /// them, moving each edge back releases precisely `slot` and nothing else, and if it fails for
+    /// any of them the topology has changed underneath the record and an exact restore would open a
+    /// hole or an overlap. `None` is the caller's signal to fall back to a full relayout.
+    #[must_use]
+    pub fn plan_release(
+        &self,
+        container: &ContainerId,
+        slot: LogicalRect,
+        direction: OperationDirection,
+        recorded: &[(ContainerId, LogicalRect)],
+    ) -> Option<SlotShift> {
+        if slot.is_empty() || recorded.is_empty() || self.contains(container) {
+            return None;
+        }
+
+        let opposite = direction.opposite();
+        let coordinate = slot.edge(opposite);
+        let mut movers = Vec::with_capacity(recorded.len());
+
+        for (id, before) in recorded {
+            let current = self.get(id)?;
+
+            if current != before.with_edge_at(opposite, coordinate) {
+                return None;
+            }
+
+            // The rectangle being restored was a valid slot when it was recorded, but it arrives
+            // here from stored state, so it is checked rather than trusted.
+            if before.width < MIN_SLOT_EDGE || before.height < MIN_SLOT_EDGE {
+                return None;
+            }
+
+            movers.push(SlotMove {
+                container: id.clone(),
+                before: current,
+                after: *before,
+            });
+        }
+
+        Some(SlotShift {
+            container: container.clone(),
+            slot,
+            direction,
+            movers,
+        })
+    }
+
+    /// Apply an absorption: the movers grow and the container gives up its slot.
+    pub fn apply_absorption(&mut self, shift: &SlotShift) {
+        for mover in &shift.movers {
+            self.slots.insert(mover.container.clone(), mover.after);
+        }
+
+        self.slots.remove(&shift.container);
+        self.bump_generation();
+    }
+
+    /// Apply a release: the movers shrink and the container takes its slot back.
+    pub fn apply_release(&mut self, shift: &SlotShift) {
+        for mover in &shift.movers {
+            self.slots.insert(mover.container.clone(), mover.after);
+        }
+
+        self.slots.insert(shift.container.clone(), shift.slot);
+        self.bump_generation();
+    }
+
     /// Check that these slots tile `area` exactly.
     ///
     /// Containment plus pairwise non-overlap plus an exact total area is equivalent to gap-free
@@ -591,6 +809,267 @@ mod tests {
 
     fn id(value: &str) -> ContainerId {
         ContainerId::from(value)
+    }
+
+    /// Three containers: `left` over the left half, `top_right` and `bottom_right` stacked over
+    /// the right half. Deleting `left` needs both right slots together, and neither right slot can
+    /// be absorbed by `left` alone.
+    fn three_slot_workspace() -> LogicalSlots {
+        let mut slots = LogicalSlots::default();
+        slots.set(id("left"), LogicalRect::new(0, 0, 960, 1080));
+        slots.set(id("top_right"), LogicalRect::new(960, 0, 960, 540));
+        slots.set(id("bottom_right"), LogicalRect::new(960, 540, 960, 540));
+        slots
+    }
+
+    fn mover_rects(shift: &SlotShift) -> Vec<(String, LogicalRect)> {
+        shift
+            .movers
+            .iter()
+            .map(|mover| (mover.container.to_string(), mover.after))
+            .collect()
+    }
+
+    #[test]
+    fn a_single_neighbour_covering_the_whole_edge_absorbs_the_slot() {
+        let mut slots = LogicalSlots::default();
+        slots.set(id("a"), LogicalRect::new(0, 0, 960, 1080));
+        slots.set(id("b"), LogicalRect::new(960, 0, 960, 1080));
+
+        let shift = slots.plan_absorption(&id("b")).unwrap();
+
+        assert!(matches!(shift.direction, OperationDirection::Left));
+        assert_eq!(
+            mover_rects(&shift),
+            vec![("a".to_string(), LogicalRect::new(0, 0, 1920, 1080))]
+        );
+
+        slots.apply_absorption(&shift);
+
+        assert!(!slots.contains(&id("b")));
+        assert_eq!(slots.get(&id("a")), Some(area()));
+        assert!(slots.validate_coverage(area()).is_ok());
+    }
+
+    #[test]
+    fn several_neighbours_on_one_edge_expand_together() {
+        let mut slots = three_slot_workspace();
+
+        let shift = slots.plan_absorption(&id("left")).unwrap();
+
+        // Nothing is on the left edge of `left`, so the two right slots are the first complete
+        // group, ordered top to bottom because the shared edge is vertical.
+        assert!(matches!(shift.direction, OperationDirection::Right));
+        assert_eq!(
+            mover_rects(&shift),
+            vec![
+                ("top_right".to_string(), LogicalRect::new(0, 0, 1920, 540)),
+                (
+                    "bottom_right".to_string(),
+                    LogicalRect::new(0, 540, 1920, 540)
+                ),
+            ]
+        );
+        assert_eq!(shift.first_mover(), Some(&id("top_right")));
+
+        slots.apply_absorption(&shift);
+        assert!(slots.validate_coverage(area()).is_ok());
+    }
+
+    #[test]
+    fn a_group_which_only_partly_covers_the_edge_is_refused() {
+        let slots = three_slot_workspace();
+
+        assert!(
+            slots
+                .complete_edge_group(
+                    LogicalRect::new(0, 0, 960, 1080),
+                    OperationDirection::Right,
+                    &id("left"),
+                )
+                .is_some()
+        );
+
+        // A shorter target has the same two neighbours, but they now overshoot its edge.
+        assert!(
+            slots
+                .complete_edge_group(
+                    LogicalRect::new(0, 0, 960, 700),
+                    OperationDirection::Right,
+                    &id("left"),
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn absorption_tries_left_before_right_before_up_before_down() {
+        // A slot with a complete neighbour on every one of its four edges.
+        let mut slots = LogicalSlots::default();
+        slots.set(id("middle"), LogicalRect::new(100, 100, 100, 100));
+        slots.set(id("left"), LogicalRect::new(0, 100, 100, 100));
+        slots.set(id("right"), LogicalRect::new(200, 100, 100, 100));
+        slots.set(id("up"), LogicalRect::new(100, 0, 100, 100));
+        slots.set(id("down"), LogicalRect::new(100, 200, 100, 100));
+
+        let shift = slots.plan_absorption(&id("middle")).unwrap();
+
+        assert!(matches!(shift.direction, OperationDirection::Left));
+        assert_eq!(
+            mover_rects(&shift),
+            vec![("left".to_string(), LogicalRect::new(0, 100, 200, 100))]
+        );
+    }
+
+    #[test]
+    fn an_isolated_slot_cannot_be_absorbed() {
+        let mut slots = LogicalSlots::default();
+        slots.set(id("only"), area());
+
+        assert!(slots.plan_absorption(&id("only")).is_none());
+        assert!(slots.plan_absorption(&id("missing")).is_none());
+    }
+
+    #[test]
+    fn a_diagonal_neighbour_is_not_an_absorber() {
+        let mut slots = LogicalSlots::default();
+        slots.set(id("target"), LogicalRect::new(100, 100, 100, 100));
+        // Touches only the corner of `target`.
+        slots.set(id("corner"), LogicalRect::new(0, 0, 100, 100));
+
+        assert!(slots.plan_absorption(&id("target")).is_none());
+    }
+
+    #[test]
+    fn an_odd_split_absorbs_without_leaving_a_hole() {
+        let odd = LogicalRect::new(0, 0, 1921, 1080);
+        let split = odd.split(SplitAxis::LeftRight).unwrap();
+
+        let mut slots = LogicalSlots::default();
+        slots.set(id("new"), split.new_slot);
+        slots.set(id("existing"), split.existing_slot);
+
+        let shift = slots.plan_absorption(&id("new")).unwrap();
+        slots.apply_absorption(&shift);
+
+        assert_eq!(slots.get(&id("existing")), Some(odd));
+        assert!(slots.validate_coverage(odd).is_ok());
+    }
+
+    #[test]
+    fn a_release_puts_every_absorber_back_exactly_where_it_was() {
+        let mut slots = three_slot_workspace();
+        let before = slots.clone();
+
+        let absorption = slots.plan_absorption(&id("left")).unwrap();
+        let recorded = absorption.rects_before();
+        slots.apply_absorption(&absorption);
+
+        let release = slots
+            .plan_release(
+                &id("left"),
+                absorption.slot,
+                absorption.direction,
+                &recorded,
+            )
+            .unwrap();
+        slots.apply_release(&release);
+
+        for container in ["left", "top_right", "bottom_right"] {
+            assert_eq!(slots.get(&id(container)), before.get(&id(container)));
+        }
+        assert!(slots.validate_coverage(area()).is_ok());
+    }
+
+    #[test]
+    fn a_release_is_refused_once_an_absorber_no_longer_holds_what_it_absorbed() {
+        let mut slots = three_slot_workspace();
+        let absorption = slots.plan_absorption(&id("left")).unwrap();
+        let recorded = absorption.rects_before();
+        slots.apply_absorption(&absorption);
+
+        let mut gone = slots.clone();
+        gone.remove(&id("top_right"));
+        assert!(
+            gone.plan_release(
+                &id("left"),
+                absorption.slot,
+                absorption.direction,
+                &recorded
+            )
+            .is_none()
+        );
+
+        // A manual resize of the shared boundary makes the exact reverse impossible.
+        let mut moved = slots.clone();
+        moved.set(id("top_right"), LogicalRect::new(0, 0, 1920, 600));
+        moved.set(id("bottom_right"), LogicalRect::new(0, 600, 1920, 480));
+        assert!(
+            moved
+                .plan_release(
+                    &id("left"),
+                    absorption.slot,
+                    absorption.direction,
+                    &recorded
+                )
+                .is_none()
+        );
+
+        // The untouched map still releases, so both refusals are about the change and not about
+        // the record.
+        assert!(
+            slots
+                .plan_release(
+                    &id("left"),
+                    absorption.slot,
+                    absorption.direction,
+                    &recorded
+                )
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_release_is_refused_when_the_container_already_holds_a_slot() {
+        let slots = three_slot_workspace();
+        let absorption = slots.plan_absorption(&id("left")).unwrap();
+        let recorded = absorption.rects_before();
+
+        // The absorption was planned but never applied, so releasing onto `left` would overlap.
+        assert!(
+            slots
+                .plan_release(
+                    &id("left"),
+                    absorption.slot,
+                    absorption.direction,
+                    &recorded
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn absorbing_and_releasing_both_advance_the_geometry_generation() {
+        let mut slots = three_slot_workspace();
+        let start = slots.generation();
+
+        let absorption = slots.plan_absorption(&id("left")).unwrap();
+        let recorded = absorption.rects_before();
+        slots.apply_absorption(&absorption);
+        let absorbed = slots.generation();
+        assert!(absorbed > start);
+
+        let release = slots
+            .plan_release(
+                &id("left"),
+                absorption.slot,
+                absorption.direction,
+                &recorded,
+            )
+            .unwrap();
+        slots.apply_release(&release);
+
+        assert!(slots.generation() > absorbed);
     }
 
     #[test]
