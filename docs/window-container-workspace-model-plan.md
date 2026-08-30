@@ -697,13 +697,40 @@ layout recalculation becomes the fallback rather than the only path.
 
 #### Phase 6A - Complete-edge groups and the absorption algebra
 
-- [ ] Implement complete-edge neighbour group selection in left/right/up/down order.
-- [ ] Implement the absorption plan and its exact reverse as validated, not-yet-applied values.
-- [ ] Add single/multiple neighbour, direction priority, partial-cover refusal, odd-pixel,
+- [x] Implement complete-edge neighbour group selection in left/right/up/down order.
+- [x] Implement the absorption plan and its exact reverse as validated, not-yet-applied values.
+- [x] Add single/multiple neighbour, direction priority, partial-cover refusal, odd-pixel,
   round-trip and min-size tests.
-- [ ] Commit as `feat: add complete edge slot absorption`.
+- [x] Commit as `feat: add complete edge slot absorption`. Commit: `273052ca`.
 
 Expected handwritten change: 300-400 lines. Likely files: `geometry.rs`.
+
+Actual files: `geometry.rs` only, as predicted. Actual Rust change: 479 added, 0 removed, roughly
+half of it tests.
+
+`SlotShift` describes both directions with one value, because an absorption and its release are the
+same operation with the movers' before and after swapped. Nothing is written until a plan is
+applied, which is what lets a caller refuse a whole operation without having half-changed the
+geometry -- the atomicity requirement, expressed as a type rather than as a rollback path.
+
+`complete_edge_group` is one sweep: the candidates on an edge are walked in their deterministic
+order and each must begin exactly where the previous one ended, the first at the edge's start and
+the last at its end. Overlaps, gaps and partial cover are all rejected by that one condition, so
+there is no separate check which could disagree with another.
+
+`plan_release`'s whole validity test is that every recorded absorber still holds exactly the
+rectangle the absorption gave it. That equality is stronger than a generation comparison and than a
+minimum-size check: if it holds for all of them, moving each edge back releases precisely the
+recorded slot and nothing else. The minimum-size check is kept anyway because the recorded
+rectangles arrive from stored state and are therefore checked rather than trusted.
+
+`SlotShift` deliberately does not derive `PartialEq`: `OperationDirection` is an upstream
+`komorebi-layouts` type which does not implement it, and deriving it there for a test convenience
+would widen the upstream conflict surface for no model benefit.
+
+Verification: `cargo test --workspace -- --test-threads=1` passed with komorebi 268 passed/1 ignored
+(up from 257), layouts 128, bar 3. `cargo fmt --all --check` clean; `cargo clippy --workspace
+--all-targets` reported only the pre-existing upstream warning.
 
 #### Phase 6B - Hidden slot records, transitions and invalidation
 
