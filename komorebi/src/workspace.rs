@@ -47,6 +47,7 @@ use crate::geometry::RenderInsets;
 use crate::geometry::SlotOrder;
 use crate::geometry::SlotResize;
 use crate::geometry::SlotShift;
+use crate::geometry::SlotSplit;
 use crate::geometry::SplitAxis;
 use crate::lockable_sequence::LockableSequence;
 use crate::managed_window::FloatingRejection;
@@ -1768,6 +1769,27 @@ impl Workspace {
         !self.relayout_pending && self.slot_inputs.as_ref() == Some(&self.slot_inputs())
     }
 
+    /// A split of the current slots, or `None` when the slots are not the arrangement this
+    /// workspace is in.
+    ///
+    /// Editing slots which are about to be replaced would be harmless on its own. Adopting the
+    /// result as the arrangement is not: it clears a recalculation something else asked for -
+    /// a layout change, a merge, a monitor move - and freezes whatever the slots happened to hold,
+    /// which after any of those need not even cover the work area. A caller which cannot get a
+    /// split here inserts its container and lets the recalculation place it.
+    fn plan_authoritative_split(
+        &self,
+        donor: &ContainerId,
+        created: &ContainerId,
+        axis: Option<SplitAxis>,
+    ) -> Option<SlotSplit> {
+        if !self.slots_are_authoritative() {
+            return None;
+        }
+
+        self.logical_slots.plan_split(donor, created, axis)
+    }
+
     /// What happens to the arrangement when `id` leaves this workspace.
     ///
     /// Planned while the departing slot is still in the map, because that is the only moment the
@@ -2348,7 +2370,7 @@ impl Workspace {
 
         // Planned before anything is inserted, so a slot which cannot be halved costs nothing but
         // the rearrangement.
-        let Some(split) = self.logical_slots.plan_split(&donor_id, &arrived, axis) else {
+        let Some(split) = self.plan_authoritative_split(&donor_id, &arrived, axis) else {
             let idx = self.containers().len();
             self.insert_container_at_idx(idx, container);
             self.invalidate_slot_geometry();
@@ -3020,7 +3042,7 @@ impl Workspace {
 
         // Planned before anything is inserted, so a slot which cannot be halved costs nothing but
         // the fallback path.
-        let Some(split) = self.logical_slots.plan_split(&donor, &created, axis) else {
+        let Some(split) = self.plan_authoritative_split(&donor, &created, axis) else {
             return self.new_container_for_new_window(window);
         };
 
@@ -3144,7 +3166,7 @@ impl Workspace {
         let split = if self.layout_follows_focus() {
             None
         } else {
-            self.logical_slots.plan_split(&donor, &created, axis)
+            self.plan_authoritative_split(&donor, &created, axis)
         };
 
         if split.is_none() {
@@ -5087,6 +5109,41 @@ mod tests {
         assert_eq!(workspace.containers().len(), 3);
         assert_eq!(workspace.containers()[1].id, hidden_id);
         assert_eq!(workspace.containers()[1].windows().len(), 1);
+    }
+
+    #[test]
+    fn a_new_window_does_not_freeze_an_arrangement_which_owes_a_recalculation() {
+        let mut workspace = workspace_with_containers(&[1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        // Something the slots cannot express locally: the layout changed, so the whole
+        // arrangement is owed a recalculation and the slots still hold the old one.
+        workspace.layout = Layout::Default(DefaultLayout::Rows);
+        workspace.invalidate_slot_geometry();
+
+        // A container leaves while that is outstanding. Its slot is not absorbed, because there
+        // is no arrangement to absorb it into, so what is left covers half the work area.
+        workspace.destroy_container(1).unwrap();
+
+        // A new window arrives. Halving a stale slot is fine; adopting the result as the
+        // arrangement is not, because the recalculation the layout change asked for would be
+        // dropped and the workspace would tile half its work area from then on.
+        workspace.place_new_window(Window::from(9));
+
+        assert!(
+            workspace.relayout_pending,
+            "the pending recalculation survived the new window"
+        );
+
+        workspace.record_logical_slots(area);
+
+        assert!(
+            workspace
+                .logical_slots
+                .validate_coverage(LogicalRect::from(area))
+                .is_ok()
+        );
     }
 
     #[test]

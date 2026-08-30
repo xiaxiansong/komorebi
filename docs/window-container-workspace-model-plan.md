@@ -1810,7 +1810,7 @@ question.
   komorebi, idempotently and without changing placement or ownership.
 - [x] 14C: complete the state output with the derived fields a consumer cannot compute, and version
   it so an older state document is recognised rather than silently misread.
-- [ ] 14D: add a deterministic seeded operation harness which drives long random operation
+- [x] 14D: add a deterministic seeded operation harness which drives long random operation
   sequences against the invariants.
 - [ ] 14E: map all 16 invariants to their implementation and tests, regenerate the schemas, run
   every available check and write the final delivery summary.
@@ -1966,8 +1966,47 @@ Verification: `komorebi` lib tests 517 -> 522 passing, full workspace suite seri
 
 #### Phase 14D - Seeded operation harness
 
-Expected handwritten change: 250-350 lines. Likely files: new
-`komorebi/src/model_operations.rs` or a colocated test module.
+- [x] Add a deterministic seeded harness which drives random workspace operations and checks the
+  invariants after every one.
+- [x] Check the rules which only hold for a recorded arrangement against a settled copy, so both
+  "in flight" and "at rest" are covered.
+- [x] Assert that a refusal changes nothing, for the operations whose refusals are the model's own.
+- [x] Assert that the harness reaches hidden containers, stacks, floating and minimized windows and
+  an empty workspace, so a green run means something.
+- [x] Fix what it found and add a named regression test for it.
+- [x] Commit as `feat: drive the model with seeded random operations`.
+
+Actual files: new `komorebi/src/model_harness.rs`, `komorebi/src/lib.rs`,
+`komorebi/src/workspace.rs`.
+
+No property-testing dependency was added. `proptest` is not in the tree, the plan allows a
+deterministic harness instead, and a plain xorshift generator gives the one thing shrinking would
+have given here: a failure names a seed and a step which reproduce it exactly.
+
+The harness found a real defect on its second run, which is the entire justification for writing
+it. `split_for_new_window`, `create_container_from_donor` and `adopt_container` planned a split
+against the current slots and then called `adopt_slot_geometry` unconditionally. When the workspace
+already owed a full recalculation - after a layout change, a merge, a monitor move - the slots it
+halved were the *old* arrangement, and adopting them cleared the pending recalculation. The
+sequence the harness found was: change the layout, destroy a container while the recalculation is
+outstanding so the survivor keeps its old half, then open a window. From that point the workspace
+tiled half of its work area and nothing ever put it back. `plan_authoritative_split` now refuses to
+plan against slots which are not the arrangement, so those callers take their existing fallback and
+the recalculation survives.
+
+Two harness assumptions were wrong rather than the model, and both are recorded in the harness
+itself. A container becomes Hidden the moment its last visible stored window does but gives its
+slot up when the arrangement is next recorded, so "a hidden container holds no slot" is a rule
+about a recorded arrangement. And the window lifecycle operations end by asking Windows to focus or
+position a window and report *that* failure after the model has committed, so in a harness whose
+handles name no real window their errors say nothing about whether the model changed; the
+no-change-on-refusal property is asserted for the operations which decide entirely within the
+model.
+
+Verification: `komorebi` lib tests 522 -> 527 passing, full workspace suite serial and green. The
+regression test was confirmed to fail against the unfixed code before being kept. `cargo fmt
+--check` and `cargo clippy --workspace --all-targets` clean apart from the pre-existing `items
+after a test module` warning.
 
 #### Phase 14E - Invariant map, schemas, documentation and final verification
 

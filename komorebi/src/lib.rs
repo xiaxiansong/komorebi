@@ -16,6 +16,8 @@ pub mod invariants;
 pub mod lockable_sequence;
 pub mod managed_window;
 pub mod model;
+#[cfg(test)]
+mod model_harness;
 pub mod monitor;
 pub mod monitor_reconciliator;
 pub mod process_command;
