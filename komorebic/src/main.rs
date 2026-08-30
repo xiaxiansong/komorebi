@@ -1394,6 +1394,8 @@ enum SubCommand {
     ToggleMonocle,
     /// Toggle native maximization for the focused window
     ToggleMaximize,
+    /// Toggle borderless fullscreen for the focused window
+    ToggleFullscreen,
     /// Toggle a lock for the focused container, ensuring it will not be displaced by any new windows
     ToggleLock,
     /// Restore all hidden windows (debugging command)
@@ -2271,6 +2273,9 @@ fn main() -> eyre::Result<()> {
         }
         SubCommand::ToggleMaximize => {
             send_message(&SocketMessage::ToggleMaximize)?;
+        }
+        SubCommand::ToggleFullscreen => {
+            send_message(&SocketMessage::ToggleFullscreen)?;
         }
         SubCommand::ToggleLock => {
             send_message(&SocketMessage::ToggleLock)?;

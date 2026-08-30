@@ -12,6 +12,7 @@ use crate::Lockable;
 use crate::focus_history::Mru;
 use crate::managed_window::ManagedPlacement;
 use crate::managed_window::ManagedWindow;
+use crate::managed_window::Presentation;
 use crate::managed_window::Visibility;
 use crate::model::ContainerId;
 use crate::ring::Ring;
@@ -348,9 +349,27 @@ impl Container {
     /// A maximized window is an ordinary member of its container: it keeps its stack position and
     /// its history entries, and only the presentation it is drawn with differs.
     pub fn maximized_managed_window(&self) -> Option<&ManagedWindow> {
+        self.managed_window_presented_as(Presentation::Maximized)
+    }
+
+    /// The window this container currently presents fullscreen, if it has one.
+    pub fn fullscreened_managed_window(&self) -> Option<&ManagedWindow> {
+        self.managed_window_presented_as(Presentation::Fullscreen)
+    }
+
+    /// The window this container draws over the arrangement, in either presentation.
+    pub fn presented_managed_window(&self) -> Option<&ManagedWindow> {
         self.windows()
             .iter()
-            .find(|window| window.is_maximized() && window.visibility == Visibility::Visible)
+            .find(|window| window.is_presented() && window.visibility == Visibility::Visible)
+    }
+
+    /// A minimized window is never a subject here: its presentation is remembered for the restore
+    /// but nothing is drawing it, so it must not claim to be what the container is presenting.
+    fn managed_window_presented_as(&self, presentation: Presentation) -> Option<&ManagedWindow> {
+        self.windows().iter().find(|window| {
+            window.presentation == presentation && window.visibility == Visibility::Visible
+        })
     }
 
     pub fn visible_floating_windows(&self) -> impl Iterator<Item = &ManagedWindow> {
@@ -537,7 +556,6 @@ impl Container {
 mod tests {
     use super::*;
     use crate::core::Rect;
-    use crate::managed_window::Presentation;
     use serde_json;
 
     fn container_with_windows(count: isize) -> Container {
@@ -606,6 +624,38 @@ mod tests {
 
             assert!(container.is_active(), "{presentation:?} must stay active");
         }
+    }
+
+    #[test]
+    fn the_two_presentations_are_reported_separately() {
+        let mut container = container_with_windows(2);
+        container.windows_mut()[0].set_maximized(Rect::default());
+        container.windows_mut()[1].set_fullscreen(Rect::default());
+
+        assert_eq!(
+            container.maximized_managed_window().map(|w| w.hwnd),
+            Some(0)
+        );
+        assert_eq!(
+            container.fullscreened_managed_window().map(|w| w.hwnd),
+            Some(1)
+        );
+        assert_eq!(
+            container.presented_managed_window().map(|w| w.hwnd),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn a_minimized_window_presents_nothing() {
+        let mut container = container_with_windows(1);
+        container.windows_mut()[0].set_fullscreen(Rect::default());
+        container.windows_mut()[0].set_minimized();
+
+        assert!(container.fullscreened_managed_window().is_none());
+        assert!(container.presented_managed_window().is_none());
+        // The presentation itself is kept, so restoring the window brings it back fullscreen.
+        assert!(container.windows()[0].is_fullscreen());
     }
 
     #[test]

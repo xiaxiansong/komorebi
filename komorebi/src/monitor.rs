@@ -201,6 +201,7 @@ impl Monitor {
             }
         };
         let work_area = self.work_area_size;
+        let monitor_size = self.size;
         let work_area_offset = self.work_area_offset.or(offset);
         let window_based_work_area_offset = self.window_based_work_area_offset;
         let window_based_work_area_offset_limit = self.window_based_work_area_offset_limit;
@@ -213,6 +214,7 @@ impl Monitor {
                 border_width,
                 border_offset,
                 work_area,
+                monitor_size,
                 work_area_offset,
                 window_based_work_area_offset,
                 window_based_work_area_offset_limit,
@@ -240,6 +242,7 @@ impl Monitor {
             }
         };
         let work_area = self.work_area_size;
+        let monitor_size = self.size;
         let work_area_offset = self.work_area_offset.or(offset);
         let window_based_work_area_offset = self.window_based_work_area_offset;
         let window_based_work_area_offset_limit = self.window_based_work_area_offset_limit;
@@ -252,6 +255,7 @@ impl Monitor {
                 border_width,
                 border_offset,
                 work_area,
+                monitor_size,
                 work_area_offset,
                 window_based_work_area_offset,
                 window_based_work_area_offset_limit,
@@ -391,8 +395,8 @@ impl Monitor {
             .focused_workspace_mut()
             .ok_or_eyre("there is no workspace")?;
 
-        if workspace.focused_container_has_maximized_window() {
-            bail!("cannot move native maximized window to another monitor or workspace");
+        if workspace.focused_container_has_presented_window() {
+            bail!("cannot move a maximized or fullscreen window to another monitor or workspace");
         }
 
         // The foreground window is only used to decide whether a floating window is being moved.

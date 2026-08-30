@@ -627,13 +627,60 @@ passed.
 
 #### Phase 5D-3 - Fullscreen distinct from maximize
 
-- [ ] Add fullscreen enter/exit as its own presentation transition with its own restore rectangle.
-- [ ] Keep fullscreen, maximize and minimize independent and idempotent in both directions.
-- [ ] Add fullscreen/maximize independence and restore-rectangle tests.
-- [ ] Commit as `feat: separate fullscreen from maximized presentation`.
+- [x] Add fullscreen enter/exit as its own presentation transition with its own restore rectangle.
+- [x] Keep fullscreen, maximize and minimize independent and idempotent in both directions.
+- [x] Add fullscreen/maximize independence and restore-rectangle tests.
+- [x] Commit as `feat: separate fullscreen from maximized presentation`.
 
 Expected handwritten change: 200-350 lines. Likely files: `managed_window.rs`, `workspace.rs`,
 `window_manager.rs`, `process_command.rs`, `core/mod.rs`.
+
+Actual files: every predicted file plus `container.rs`, `monitor.rs`, `process_event.rs`,
+`komorebic/src/main.rs`, `komorebic.lib.ahk` and `docs/cli/`. Actual Rust change: 549 added, 68
+removed, roughly half of it tests. The four unpredicted source files are all consequences of the
+same thing: the model gained a second presentation, so every place which asked "is a window
+covering the arrangement" had to stop asking "is a window maximized".
+
+`Presentation::Fullscreen` already existed as observed state from Phase 2A; this phase is what
+gives it transitions, a Win32 application, a slot-authority decision and a command. The two
+presentations are never applied through the same Win32 call: maximizing is `ShowWindow`, and
+fullscreen is `SetWindowPos` onto the monitor bounds, which is exactly the rectangle
+`WindowsApi::is_fullscreen` recognises when an application enters borderless fullscreen without
+being asked. `WorkspaceGlobals::monitor_size` carries those bounds from `Monitor::size`, so the
+fullscreen rectangle needs no Win32 query and is therefore testable; it is the monitor bounds and
+not the work area because a fullscreen window covers the taskbar.
+
+`presented_window()` is the new name for "a window drawn over the arrangement instead of in its
+slot", at container and workspace level. Ten call sites which meant that but said `maximized_window`
+now say so: workspace entry Z order, `is_focused_window_monocle_or_maximized`, both directional
+`new_idx_for_direction` guards, both cross-monitor focus paths, the follow-focus and stack-focus
+paths in `update_focused_workspace`, and the two `process_event` foreground branches. The sites
+which really do mean maximize -- `toggle_maximize`, `unmaximize_window` -- keep asking for it.
+`focused_container_has_maximized_window` was renamed to `focused_container_has_presented_window`
+for the same reason: a fullscreen window is no more movable to another monitor than a maximized one.
+
+`enter_presentation` and `leave_presentation` are the whole mutation surface, and both presentations
+share them, so neither can acquire a transition rule the other lacks. Entering is idempotent because
+the Win32 state is reapplied whether or not the model changed. Switching between the two keeps the
+restore rectangle captured when the window left Normal, rather than recording the monitor-sized
+rectangle the previous presentation had given it. Leaving is presentation-aware in one place only:
+a maximized window has Win32 window state to drop, and a fullscreen window has none and must be
+repositioned instead, because nothing else would move it off the monitor bounds.
+
+`focus_container_in_cycle_direction` carried a maximized presentation to the container focus moved
+to. It now carries whichever presentation was there, because reapplying the wrong one would silently
+convert a fullscreen window into a maximized one.
+
+`komorebic toggle-fullscreen` and `SocketMessage::ToggleFullscreen` are the command surface, with a
+matching `komorebic.lib.ahk` wrapper. Existing commands are untouched. Runtime state and static
+configuration are unaffected: `Presentation` already serialized all three variants, and
+`monitor_size` is `#[serde(default)]` so old runtime state still deserializes.
+
+Verification: `cargo test --workspace -- --test-threads=1` passed with komorebi 257 passed/1 ignored
+(up from 245), layouts 128, bar 3, all other targets and doc-tests passed. `cargo fmt --all --check`
+clean; `cargo clippy --workspace --all-targets` reported only the pre-existing upstream
+`items after a test module` warning in `window.rs`; `cargo check --workspace --all-targets` and
+`cargo check -p komorebi --features schemars` passed.
 
 ### Phase 6 - Hidden slot absorption and restoration
 
@@ -825,7 +872,21 @@ This list is updated from actual diffs, not treated as permission to change ever
 - 2026-08-30: `komorebic static-config-schema` overflows its stack in a debug build on this
   machine, on the pre-change commit as well. Schema regeneration therefore needs a release build
   and is deferred to Phases 12 and 14.
+- 2026-08-30: The same debug-build stack overflow affects every `komorebic` invocation, `--help`
+  included, because clap builds the whole command tree first. A release build runs fine.
+- 2026-08-30: `komorebic docgen` must not be run to add a page. Its current output disagrees with
+  the 177 checked-in `docs/cli/` pages in three ways (no `#` heading, `Usage: <cmd>` instead of
+  `Usage: komorebic.exe <cmd>`, no trailing newline), so regenerating rewrites every page. The new
+  page was written by hand in the checked-in format instead, and reconciling the generator with the
+  checked-in docs is deferred to Phase 14.
 
+- 2026-08-30: Fullscreen is applied as the monitor rectangle through `SetWindowPos`, and maximize
+  stays `ShowWindow`. Neither presentation is ever applied through the other's call, which is what
+  makes the model's distinction survive a round trip through Win32 observation.
+- 2026-08-30: `WorkspaceGlobals::monitor_size` carries `Monitor::size` rather than having the
+  workspace query Win32 for the fullscreen rectangle. The fullscreen target is therefore available
+  in tests, and it is the monitor bounds rather than the work area because a fullscreen window
+  covers the taskbar.
 - 2026-08-30: `Container::state()` is derived on every read instead of being stored. A stored
   flag would need updating at every place a window's placement or visibility changes, and one
   missed site would leave a container claiming a slot it must not have.
@@ -910,6 +971,17 @@ This list is updated from actual diffs, not treated as permission to change ever
   (komorebi 190 -> 204 -> 213 -> 226 passing); fmt and Clippy clean apart from the pre-existing
   upstream warning. Next phase: 5D, replacing maximized and monocle ownership with window
   presentation, which is the last alternate ownership path in the model.
+- 2026-08-30: Phase 5D-3 turn. The plan was re-read and the worktree confirmed clean at `b5a5b6ef`
+  before editing, and `cargo check --workspace --all-targets` was re-run as the turn's baseline.
+  5D-3 gave the already-observed `Presentation::Fullscreen` its transitions, its Win32 application,
+  its slot-authority decision and its command, which closes the presentation model: maximize,
+  fullscreen, minimize and floating are now four independent dimensions with no shared Win32 call
+  between any two of them. The phase's real weight was not the fullscreen path but the ten call
+  sites which had been asking `maximized_window` when they meant "a window is covering the
+  arrangement"; those now ask `presented_window`, and the sites which really mean maximize were left
+  alone. Full serial workspace suite passed (komorebi 245 -> 257 passing); fmt and Clippy clean apart
+  from the pre-existing upstream warning. Phase 5 is now complete: there is no alternate ownership
+  path left in the model. Next phase: 6, hidden slot absorption and restoration.
 - 2026-08-29: Phase 3 was split into 3A identity and 3B histories/invariants after call-site review
   showed that doing both together would exceed the phase review-size limit. Phase 3A added
   transparent typed workspace/container IDs, migrated managed ownership and UI integration

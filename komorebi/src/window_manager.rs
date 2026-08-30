@@ -57,6 +57,7 @@ use crate::border_manager::BORDER_WIDTH;
 use crate::container::Container;
 use crate::current_virtual_desktop;
 use crate::load_configuration;
+use crate::managed_window::Presentation;
 use crate::monitor::Monitor;
 use crate::ring::Ring;
 use crate::should_act;
@@ -1209,7 +1210,7 @@ impl WindowManager {
             .update_focused_workspace(offset)?;
 
         if follow_focus {
-            if let Some(window) = self.focused_workspace()?.maximized_window() {
+            if let Some(window) = self.focused_workspace()?.presented_window() {
                 if trigger_focus {
                     window.focus(self.mouse_follows_focus)?;
                 }
@@ -1252,8 +1253,8 @@ impl WindowManager {
             if self.focused_container_mut().is_ok() {
                 // and we have a stack with >1 windows
                 if self.focused_container_mut()?.windows().len() > 1
-                    // and we don't have a maxed window
-                    && self.focused_workspace()?.maximized_window().is_none()
+                    // and we don't have a maximized or fullscreen window
+                    && self.focused_workspace()?.presented_window().is_none()
                     // and we don't have a monocle container
                     && self.focused_workspace()?.monocle_container().is_none()
                     // and we don't have any floating windows that should show on top
@@ -1714,8 +1715,8 @@ impl WindowManager {
             .focused_workspace_mut()
             .ok_or_eyre("there is no workspace")?;
 
-        if workspace.focused_container_has_maximized_window() {
-            bail!("cannot move native maximized window to another monitor or workspace");
+        if workspace.focused_container_has_presented_window() {
+            bail!("cannot move a maximized or fullscreen window to another monitor or workspace");
         }
 
         let foreground_hwnd = WindowsApi::foreground_window()?;
@@ -2070,7 +2071,7 @@ impl WindowManager {
         let mouse_follows_focus = self.mouse_follows_focus;
 
         if let Ok(focused_workspace) = self.focused_workspace_mut() {
-            if let Some(window) = focused_workspace.maximized_window() {
+            if let Some(window) = focused_workspace.presented_window() {
                 window.focus(mouse_follows_focus)?;
                 cross_monitor_monocle_or_max = true;
             } else if let Some(monocle) = focused_workspace.monocle_container() {
@@ -2156,7 +2157,7 @@ impl WindowManager {
         tracing::info!("preselecting container");
 
         let new_idx =
-            if workspace.maximized_window().is_some() || workspace.monocle_container().is_some() {
+            if workspace.presented_window().is_some() || workspace.monocle_container().is_some() {
                 None
             } else {
                 workspace.new_idx_for_direction(direction)
@@ -2210,7 +2211,7 @@ impl WindowManager {
         }
 
         let new_idx =
-            if workspace.maximized_window().is_some() || workspace.monocle_container().is_some() {
+            if workspace.presented_window().is_some() || workspace.monocle_container().is_some() {
                 None
             } else {
                 workspace.new_idx_for_direction(direction)
@@ -2299,7 +2300,7 @@ impl WindowManager {
                 let mouse_follows_focus = self.mouse_follows_focus;
 
                 if let Ok(focused_workspace) = self.focused_workspace_mut() {
-                    if let Some(window) = focused_workspace.maximized_window() {
+                    if let Some(window) = focused_workspace.presented_window() {
                         window.focus(mouse_follows_focus)?;
                         cross_monitor_monocle_or_max = true;
                     } else if let Some(monocle) = focused_workspace.monocle_container() {
@@ -2685,12 +2686,24 @@ impl WindowManager {
         self.handle_unmanaged_window_behaviour()?;
 
         tracing::info!("focusing container");
-        let mut maximize_next = false;
+        // The presentation is carried to the container focus moves to, so cycling out of a
+        // maximized window does not leave the next container drawn behind it. Which presentation
+        // it was has to be remembered, because reapplying the wrong one would silently convert a
+        // fullscreen window into a maximized one.
+        let mut presentation_next = None;
         let mut monocle_next = false;
 
-        if self.focused_workspace_mut()?.maximized_window().is_some() {
-            maximize_next = true;
-            self.unmaximize_window()?;
+        if let Some(presented) = self.focused_workspace()?.presented_managed_window() {
+            presentation_next = Some(presented.presentation);
+            let hwnd = presented.hwnd;
+
+            match presented.presentation {
+                Presentation::Maximized => self.focused_workspace_mut()?.unmaximize_window()?,
+                Presentation::Fullscreen => self.focused_workspace_mut()?.unfullscreen_window()?,
+                Presentation::Normal => unreachable!("a presented window is never normal"),
+            }
+
+            tracing::debug!("carrying the presentation of window {hwnd} to the next container");
         }
 
         if self.focused_workspace_mut()?.monocle_container().is_some() {
@@ -2706,12 +2719,11 @@ impl WindowManager {
 
         workspace.focus_container(new_idx);
 
-        if maximize_next {
-            self.toggle_maximize()?;
-        } else if monocle_next {
-            self.toggle_monocle()?;
-        } else {
-            self.focused_window_mut()?.focus(self.mouse_follows_focus)?;
+        match presentation_next {
+            Some(Presentation::Maximized) => self.toggle_maximize()?,
+            Some(Presentation::Fullscreen) => self.toggle_fullscreen()?,
+            _ if monocle_next => self.toggle_monocle()?,
+            _ => self.focused_window_mut()?.focus(self.mouse_follows_focus)?,
         }
 
         Ok(())
@@ -3257,6 +3269,41 @@ impl WindowManager {
 
         let workspace = self.focused_workspace_mut()?;
         workspace.unmaximize_window()
+    }
+
+    /// Toggle borderless fullscreen for the focused window.
+    ///
+    /// Fullscreen is a separate presentation from maximize, so a maximized window does not answer
+    /// this toggle: it enters fullscreen, keeping the rectangle it had before it was maximized as
+    /// the one a later return to Normal restores.
+    #[tracing::instrument(skip(self))]
+    pub fn toggle_fullscreen(&mut self) -> eyre::Result<()> {
+        self.handle_unmanaged_window_behaviour()?;
+
+        let workspace = self.focused_workspace_mut()?;
+
+        match workspace.fullscreened_window() {
+            None => self.fullscreen_window()?,
+            Some(_) => self.unfullscreen_window()?,
+        }
+
+        self.update_focused_workspace(true, false)
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub fn fullscreen_window(&mut self) -> eyre::Result<()> {
+        tracing::info!("making window fullscreen");
+
+        let workspace = self.focused_workspace_mut()?;
+        workspace.fullscreen_focused_window()
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub fn unfullscreen_window(&mut self) -> eyre::Result<()> {
+        tracing::info!("leaving fullscreen");
+
+        let workspace = self.focused_workspace_mut()?;
+        workspace.unfullscreen_window()
     }
 
     #[tracing::instrument(skip(self))]
@@ -5849,6 +5896,62 @@ mod tests {
             let workspace = wm.focused_workspace().unwrap();
             let maximized_window = workspace.maximized_window();
             assert_eq!(maximized_window, None);
+        }
+    }
+
+    #[test]
+    fn test_toggle_fullscreen_is_independent_of_maximize() {
+        let (mut wm, _context) = setup_window_manager();
+
+        {
+            let mut m = monitor::new(
+                0,
+                Rect::default(),
+                Rect::default(),
+                "TestMonitor".to_string(),
+                "TestDevice".to_string(),
+                "TestDeviceID".to_string(),
+                Some("TestMonitorID".to_string()),
+            );
+
+            let mut container = Container::default();
+            for i in 0..3 {
+                container.windows_mut().push_back(Window::from(i));
+            }
+
+            let workspace = m.focused_workspace_mut().unwrap();
+            workspace.add_container_to_back(container);
+
+            wm.monitors_mut().push_back(m);
+        }
+
+        wm.toggle_fullscreen().ok();
+
+        {
+            let workspace = wm.focused_workspace().unwrap();
+            assert_eq!(workspace.fullscreened_window(), Some(Window::from(0)));
+            // Fullscreen must not register as maximize, and the container must be intact.
+            assert_eq!(workspace.maximized_window(), None);
+            assert_eq!(workspace.containers().len(), 1);
+            assert_eq!(workspace.containers()[0].windows().len(), 3);
+        }
+
+        // The maximize toggle does not answer for the fullscreen window: it presents the same
+        // window maximized instead of leaving fullscreen.
+        wm.toggle_maximize().ok();
+
+        {
+            let workspace = wm.focused_workspace().unwrap();
+            assert_eq!(workspace.maximized_window(), Some(Window::from(0)));
+            assert_eq!(workspace.fullscreened_window(), None);
+        }
+
+        wm.toggle_maximize().ok();
+
+        {
+            let workspace = wm.focused_workspace().unwrap();
+            assert_eq!(workspace.presented_window(), None);
+            assert_eq!(workspace.containers()[0].windows().len(), 3);
         }
     }
 

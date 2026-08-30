@@ -420,6 +420,7 @@ impl WindowManager {
             SocketMessage::ToggleFloat => self.toggle_float(false)?,
             SocketMessage::ToggleMonocle => self.toggle_monocle()?,
             SocketMessage::ToggleMaximize => self.toggle_maximize()?,
+            SocketMessage::ToggleFullscreen => self.toggle_fullscreen()?,
             SocketMessage::ContainerPadding(monitor_idx, workspace_idx, size) => {
                 self.set_container_padding(monitor_idx, workspace_idx, size)?;
             }

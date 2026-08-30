@@ -549,7 +549,7 @@ impl WindowManager {
 
                 match floating_window_idx {
                     None => {
-                        if workspace.is_maximized_window(window.hwnd) {
+                        if workspace.is_presented_window(window.hwnd) {
                             return Ok(());
                         }
 
@@ -1140,8 +1140,8 @@ impl WindowManager {
                     .any(|w| w.hwnd == window.hwnd)
                 {
                     layer = WorkspaceLayer::Floating;
-                } else if !workspace.is_maximized_window(window.hwnd) {
-                    // If the window is the maximized window do nothing, else we
+                } else if !workspace.is_presented_window(window.hwnd) {
+                    // If the window is the presented window do nothing, else we
                     // reintegrate the monocle if it exists and then focus the
                     // container
                     if workspace.monocle_container().is_some() {

@@ -169,11 +169,28 @@ impl ManagedWindow {
         self.presentation == Presentation::Maximized
     }
 
+    #[must_use]
+    pub fn is_fullscreen(&self) -> bool {
+        self.presentation == Presentation::Fullscreen
+    }
+
+    /// Whether this window is drawn over the arrangement instead of inside its container's slot.
+    ///
+    /// Maximized and fullscreen are separate presentations which are applied through separate
+    /// Win32 calls, but they answer this question the same way: the container still owns its slot
+    /// and the window is still its member, and neither is positioned into that slot.
+    #[must_use]
+    pub fn is_presented(&self) -> bool {
+        self.presentation != Presentation::Normal
+    }
+
     /// Bring this window back on screen the way its recorded presentation requires.
     ///
     /// A plain restore is `SW_RESTORE`, which also unmaximizes. Showing a maximized window that
     /// way would leave Win32 and the model disagreeing about a presentation the model owns, so a
-    /// maximized window is shown by maximizing it instead.
+    /// maximized window is shown by maximizing it instead. A fullscreen window is restored, not
+    /// maximized: its presentation is a rectangle rather than a Win32 window state, and the
+    /// retile which follows is what puts it back on the monitor bounds.
     pub fn show(&self, with_border: bool) {
         match self.presentation {
             Presentation::Maximized => {
@@ -234,6 +251,12 @@ impl ManagedWindow {
         self.set_presentation(Presentation::Fullscreen, current_rect)
     }
 
+    /// Enter a presentation, remembering the rectangle a return to Normal has to restore.
+    ///
+    /// The restore rectangle is captured only when leaving Normal. Going straight from one
+    /// presentation to the other therefore keeps the rectangle the window had before any of this
+    /// started, instead of recording the monitor-sized rectangle the previous presentation had
+    /// given it and restoring to that.
     fn set_presentation(&mut self, presentation: Presentation, current_rect: Rect) -> bool {
         if self.presentation == presentation {
             return false;
@@ -326,6 +349,52 @@ mod tests {
         assert_eq!(window.presentation, Presentation::Maximized);
         assert!(window.set_visible());
         assert_eq!(window.presentation, Presentation::Maximized);
+    }
+
+    #[test]
+    fn entering_a_presentation_is_idempotent_in_both_directions() {
+        let mut window = managed();
+
+        assert!(window.set_maximized(rect(1)));
+        assert!(!window.set_maximized(rect(9)));
+        assert_eq!(window.restore_rect, Some(rect(1)));
+
+        assert_eq!(window.set_normal(rect(3)), Some(rect(3)));
+        assert_eq!(window.set_normal(rect(3)), None);
+
+        assert!(window.set_fullscreen(rect(1)));
+        assert!(!window.set_fullscreen(rect(9)));
+        assert_eq!(window.restore_rect, Some(rect(1)));
+    }
+
+    #[test]
+    fn switching_between_presentations_keeps_the_normal_restore_rect() {
+        let mut window = managed();
+        window.set_maximized(rect(1));
+
+        assert!(window.set_fullscreen(rect(5)));
+        assert_eq!(window.presentation, Presentation::Fullscreen);
+        assert!(!window.is_maximized());
+        assert_eq!(window.restore_rect, Some(rect(1)));
+
+        assert!(window.set_maximized(rect(7)));
+        assert_eq!(window.presentation, Presentation::Maximized);
+        assert!(!window.is_fullscreen());
+        assert_eq!(window.restore_rect, Some(rect(1)));
+    }
+
+    #[test]
+    fn fullscreen_is_independent_of_minimizing_and_placement() {
+        let mut window = managed();
+        window.set_fullscreen(rect(1));
+
+        assert!(window.set_minimized());
+        assert_eq!(window.presentation, Presentation::Fullscreen);
+        assert!(window.set_floating(rect(2)));
+        assert_eq!(window.presentation, Presentation::Fullscreen);
+        assert!(window.set_visible());
+        assert_eq!(window.presentation, Presentation::Fullscreen);
+        assert!(window.is_presented());
     }
 
     #[test]

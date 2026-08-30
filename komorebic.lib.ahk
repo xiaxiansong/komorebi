@@ -328,6 +328,10 @@ ToggleMaximize() {
     RunWait("komorebic.exe toggle-maximize", , "Hide")
 }
 
+ToggleFullscreen() {
+    RunWait("komorebic.exe toggle-fullscreen", , "Hide")
+}
+
 RestoreWindows() {
     RunWait("komorebic.exe restore-windows", , "Hide")
 }

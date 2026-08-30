@@ -42,6 +42,7 @@ use crate::geometry::RenderInsets;
 use crate::lockable_sequence::LockableSequence;
 use crate::managed_window::ManagedPlacement;
 use crate::managed_window::ManagedWindow;
+use crate::managed_window::Presentation;
 use crate::managed_window::Visibility;
 use crate::model::ContainerId;
 use crate::model::WorkspaceId;
@@ -218,6 +219,13 @@ pub struct WorkspaceGlobals {
     pub border_width: i32,
     pub border_offset: i32,
     pub work_area: Rect,
+    /// The parent monitor's full bounds, which is the rectangle a fullscreen window is drawn into.
+    ///
+    /// This is deliberately not the work area: a fullscreen window covers the taskbar, and this is
+    /// also the rectangle `WindowsApi::is_fullscreen` recognises when an application puts itself
+    /// into borderless fullscreen without being asked.
+    #[serde(default)]
+    pub monitor_size: Rect,
     pub work_area_offset: Option<Rect>,
     pub window_based_work_area_offset: Option<Rect>,
     pub window_based_work_area_offset_limit: isize,
@@ -584,21 +592,21 @@ impl Workspace {
         }
 
         // Do this here to make sure that an error doesn't stop the restoration of other windows.
-        // Maximised windows and floating windows should always be drawn at the top of the Z order
-        // when switching to a workspace. A maximized window has already been shown maximized by
-        // the container which owns it, so only the Z order is still left to settle here.
-        let maximized_window = self.maximized_window();
+        // Presented windows and floating windows should always be drawn at the top of the Z order
+        // when switching to a workspace. A presented window has already been shown by the
+        // container which owns it, so only the Z order is still left to settle here.
+        let presented_window = self.presented_window();
 
         if let Some(window) = to_focus {
-            if maximized_window.is_none() && matches!(self.layer, WorkspaceLayer::Tiling) {
+            if presented_window.is_none() && matches!(self.layer, WorkspaceLayer::Tiling) {
                 window.focus(mouse_follows_focus)?;
-            } else if let Some(maximized_window) = maximized_window {
-                maximized_window.focus(mouse_follows_focus)?;
+            } else if let Some(presented_window) = presented_window {
+                presented_window.focus(mouse_follows_focus)?;
             } else if let Some(floating_window) = self.focused_floating_window() {
                 floating_window.focus(mouse_follows_focus)?;
             }
-        } else if let Some(maximized_window) = maximized_window {
-            maximized_window.focus(mouse_follows_focus)?;
+        } else if let Some(presented_window) = presented_window {
+            presented_window.focus(mouse_follows_focus)?;
         } else if let Some(floating_window) = self.focused_floating_window() {
             floating_window.focus(mouse_follows_focus)?;
         }
@@ -627,6 +635,7 @@ impl Workspace {
         let border_width = self.globals.border_width;
         let border_offset = self.globals.border_offset;
         let work_area = self.globals.work_area;
+        let fullscreen_rect = self.fullscreen_rect();
         let window_based_work_area_offset = self.globals.window_based_work_area_offset;
         let window_based_work_area_offset_limit = self.globals.window_based_work_area_offset_limit;
         let mut rules_work_area_offset = None;
@@ -808,12 +817,15 @@ impl Workspace {
                                 }
                             }
 
-                            // A maximized window keeps its container's slot but is not drawn in
-                            // it; drawing it into the slot would silently unmaximize it.
-                            if window.is_maximized() {
-                                window.window.maximize();
-                            } else {
-                                window.set_position(layout, false)?;
+                            // A presented window keeps its container's slot but is not drawn in
+                            // it; drawing it into the slot would silently drop its presentation.
+                            // Each presentation is reapplied by its own call, never by the other.
+                            match window.presentation {
+                                Presentation::Maximized => window.window.maximize(),
+                                Presentation::Fullscreen => {
+                                    window.set_position(&fullscreen_rect, false)?;
+                                }
+                                Presentation::Normal => window.set_position(layout, false)?,
                             }
                         }
                     }
@@ -962,15 +974,53 @@ impl Workspace {
             .is_some_and(|window| window.hwnd == hwnd)
     }
 
-    /// Whether the container a move would take away currently presents a maximized window.
+    /// The window this workspace currently presents fullscreen, if it has one.
+    #[must_use]
+    pub fn fullscreened_managed_window(&self) -> Option<&ManagedWindow> {
+        self.containers()
+            .iter()
+            .find_map(Container::fullscreened_managed_window)
+    }
+
+    #[must_use]
+    pub fn fullscreened_window(&self) -> Option<Window> {
+        self.fullscreened_managed_window()
+            .map(|window| window.window)
+    }
+
+    /// The window this workspace draws over the arrangement, in either presentation.
+    ///
+    /// Maximized and fullscreen are separate presentations, but every caller which asks "is a
+    /// window covering the arrangement right now" — Z order on workspace entry, directional
+    /// selection, cross-monitor focus — means both of them and must not have to name them
+    /// individually.
+    #[must_use]
+    pub fn presented_managed_window(&self) -> Option<&ManagedWindow> {
+        self.containers()
+            .iter()
+            .find_map(Container::presented_managed_window)
+    }
+
+    #[must_use]
+    pub fn presented_window(&self) -> Option<Window> {
+        self.presented_managed_window().map(|window| window.window)
+    }
+
+    #[must_use]
+    pub fn is_presented_window(&self, hwnd: isize) -> bool {
+        self.presented_managed_window()
+            .is_some_and(|window| window.hwnd == hwnd)
+    }
+
+    /// Whether the container a move would take away currently presents one of its windows.
     ///
     /// A maximized window used to be held outside every container, so any maximized window in the
     /// workspace blocked a container move. Now that it stays where it belongs, only the container
     /// actually being moved can block one.
     #[must_use]
-    pub fn focused_container_has_maximized_window(&self) -> bool {
+    pub fn focused_container_has_presented_window(&self) -> bool {
         self.focused_container()
-            .and_then(Container::maximized_managed_window)
+            .and_then(Container::presented_managed_window)
             .is_some()
     }
 
@@ -998,12 +1048,12 @@ impl Workspace {
         }))
     }
 
-    /// The window a maximize request acts on.
+    /// The window a presentation request acts on.
     ///
     /// The floating layer acts on the floating window it is cycling; otherwise the focused
     /// container's focused window is the subject. A minimized window is never a subject, because
-    /// maximizing it would make the model claim a presentation nothing is drawing.
-    fn maximize_subject(&self) -> Option<isize> {
+    /// presenting it would make the model claim a presentation nothing is drawing.
+    fn presentation_subject(&self) -> Option<isize> {
         if matches!(self.layer, WorkspaceLayer::Floating)
             && let Some(window) = self.focused_floating_window()
         {
@@ -1017,26 +1067,59 @@ impl Workspace {
     }
 
     /// Maximize the window this workspace currently acts on, in place.
-    ///
-    /// The window keeps its container, its position in that container's stack and both of its
-    /// history entries. Only its presentation changes, which is why a maximize toggle no longer
-    /// destroys a container and rebuilds a different one in its place.
     pub fn maximize_focused_window(&mut self) -> eyre::Result<()> {
         let hwnd = self
-            .maximize_subject()
+            .presentation_subject()
             .ok_or_eyre("there is no window to maximize")?;
 
         self.maximize_window(hwnd)
     }
 
     pub fn maximize_window(&mut self, hwnd: isize) -> eyre::Result<()> {
+        self.enter_presentation(hwnd, Presentation::Maximized)
+    }
+
+    /// Present the window this workspace currently acts on fullscreen, in place.
+    pub fn fullscreen_focused_window(&mut self) -> eyre::Result<()> {
+        let hwnd = self
+            .presentation_subject()
+            .ok_or_eyre("there is no window to make fullscreen")?;
+
+        self.fullscreen_window(hwnd)
+    }
+
+    pub fn fullscreen_window(&mut self, hwnd: isize) -> eyre::Result<()> {
+        self.enter_presentation(hwnd, Presentation::Fullscreen)
+    }
+
+    /// The rectangle a fullscreen window is drawn into: the parent monitor's whole bounds.
+    #[must_use]
+    pub const fn fullscreen_rect(&self) -> Rect {
+        self.globals.monitor_size
+    }
+
+    /// Move an owned window into `presentation`, in place.
+    ///
+    /// The window keeps its container, its position in that container's stack and both of its
+    /// history entries. Only its presentation changes, which is why a presentation toggle no
+    /// longer destroys a container and rebuilds a different one in its place.
+    ///
+    /// The two presentations are applied through different Win32 calls and never share one:
+    /// maximizing is a window state, and fullscreen is the monitor rectangle. That separation is
+    /// what stops one from being observed as the other.
+    fn enter_presentation(&mut self, hwnd: isize, presentation: Presentation) -> eyre::Result<()> {
+        if presentation == Presentation::Normal {
+            bail!("normal is left through unmaximize or unfullscreen, not entered");
+        }
+
         let container_idx = self
             .container_idx_for_window(hwnd)
             .ok_or_eyre("this workspace does not own that window")?;
 
         // Read before the mutable borrow: the rectangle the window has now is the one it should
-        // come back to when it stops being maximized.
+        // come back to when it stops being presented.
         let current_rect = WindowsApi::window_rect(hwnd).unwrap_or_default();
+        let fullscreen_rect = self.fullscreen_rect();
 
         let container = self
             .containers_mut()
@@ -1047,17 +1130,40 @@ impl Workspace {
             .idx_for_window(hwnd)
             .ok_or_eyre("that container does not own that window")?;
 
-        let changed = container.windows_mut()[window_idx].set_maximized(current_rect);
+        let managed = &mut container.windows_mut()[window_idx];
+        let previous = managed.presentation;
+        let changed = match presentation {
+            Presentation::Maximized => managed.set_maximized(current_rect),
+            Presentation::Fullscreen => managed.set_fullscreen(current_rect),
+            Presentation::Normal => unreachable!("refused above"),
+        };
+
         let window = container.windows()[window_idx].window;
         container.focus_window(window_idx);
         self.focus_container(container_idx);
 
-        // Reapplying the Win32 state of a window which is already maximized is what makes a
-        // duplicated command or event converge instead of toggling.
-        window.maximize();
+        // Reapplying the Win32 state of a window which is already presented this way is what makes
+        // a duplicated command or event converge instead of toggling.
+        match presentation {
+            Presentation::Maximized => window.maximize(),
+            Presentation::Fullscreen => {
+                // A window Win32 still has maximized cannot be positioned reliably, so the window
+                // state is dropped before the rectangle is applied. The model has already
+                // committed; a failed Win32 call is reported rather than rolled back, because the
+                // retile which follows reapplies the same rectangle from the same state.
+                if previous == Presentation::Maximized || window.is_maximized() {
+                    window.unmaximize();
+                }
+
+                if let Err(error) = window.set_position(&fullscreen_rect, true) {
+                    tracing::warn!("could not make window {hwnd} fullscreen: {error}");
+                }
+            }
+            Presentation::Normal => unreachable!("refused above"),
+        }
 
         if !changed {
-            tracing::debug!("window {hwnd} was already maximized");
+            tracing::debug!("window {hwnd} was already presented as {presentation:?}");
         }
 
         Ok(())
@@ -1070,6 +1176,20 @@ impl Workspace {
             .ok_or_eyre("there is no maximized window")?
             .hwnd;
 
+        self.leave_presentation(hwnd)
+    }
+
+    /// Return the fullscreen window to the presentation its placement implies.
+    pub fn unfullscreen_window(&mut self) -> eyre::Result<()> {
+        let hwnd = self
+            .fullscreened_window()
+            .ok_or_eyre("there is no fullscreen window")?
+            .hwnd;
+
+        self.leave_presentation(hwnd)
+    }
+
+    fn leave_presentation(&mut self, hwnd: isize) -> eyre::Result<()> {
         let container_idx = self
             .container_idx_for_window(hwnd)
             .ok_or_eyre("this workspace does not own that window")?;
@@ -1087,20 +1207,31 @@ impl Workspace {
 
         let managed = &mut container.windows_mut()[window_idx];
         let placement = managed.placement;
+        let previous = managed.presentation;
         let target = managed.set_normal(fallback);
         let window = container.windows()[window_idx].window;
 
-        window.unmaximize();
+        // Only a maximized window has Win32 window state to drop. Dropping it for a fullscreen
+        // window would be a no-op at best and would restore a rectangle the model does not own at
+        // worst; a fullscreen window leaves its presentation purely by being repositioned.
+        if previous == Presentation::Maximized {
+            window.unmaximize();
+        }
 
-        // A stored window is put back in its slot by the retile which follows; a floating window
-        // has no slot, so the rectangle it kept is applied directly. The model transition has
-        // already committed, so a failed Win32 call is reported rather than rolled back: the
-        // next retile reapplies the same rectangle from the same state.
-        if placement == ManagedPlacement::Floating
+        // A stored window which had been maximized is put back in its slot by `unmaximize` and the
+        // retile which follows. Everything else has to be positioned here: a floating window has
+        // no slot to be retiled into, and a window leaving fullscreen has had no Win32 state
+        // dropped and would otherwise stay on the monitor bounds until something else moved it.
+        // The model transition has already committed, so a failed Win32 call is reported rather
+        // than rolled back: the next retile reapplies the same rectangle from the same state.
+        let reposition =
+            placement == ManagedPlacement::Floating || previous == Presentation::Fullscreen;
+
+        if reposition
             && let Some(target) = target
             && let Err(error) = window.set_position(&target, false)
         {
-            tracing::warn!("could not restore the floating rectangle of window {hwnd}: {error}");
+            tracing::warn!("could not restore the rectangle of window {hwnd}: {error}");
         }
 
         Ok(())
@@ -1395,7 +1526,7 @@ impl Workspace {
 
     pub fn is_focused_window_monocle_or_maximized(&self) -> eyre::Result<bool> {
         let hwnd = WindowsApi::foreground_window()?;
-        if self.is_maximized_window(hwnd) {
+        if self.is_presented_window(hwnd) {
             return Ok(true);
         }
 
@@ -1995,13 +2126,13 @@ impl Workspace {
 
     /// Float the focused window, keeping it in the container which owns it.
     ///
-    /// A maximized window is returned to Normal first, and a window held by the transitional
+    /// A presented window is returned to Normal first, and a window held by the transitional
     /// monocle path is reintegrated first, so floating leaves ownership where the model requires
     /// it. Nothing is removed from a container here, which is why an emptied container can no
     /// longer appear as a side effect of floating a window.
     pub fn new_floating_window(&mut self) -> eyre::Result<()> {
-        if self.maximized_window().is_some() {
-            self.unmaximize_window()?;
+        if let Some(presented) = self.presented_window() {
+            self.leave_presentation(presented.hwnd)?;
         } else if self.is_monocle() {
             self.reintegrate_monocle_container()?;
         }
@@ -4290,6 +4421,115 @@ mod tests {
     }
 
     #[test]
+    fn fullscreen_keeps_the_window_in_its_container_and_is_idempotent() {
+        let mut workspace = workspace_with_stack(&[1, 2, 3]);
+        let container_id = workspace.containers()[0].id.clone();
+
+        workspace.fullscreen_focused_window().unwrap();
+        workspace.fullscreen_focused_window().unwrap();
+
+        assert_eq!(workspace.containers().len(), 1);
+        assert_eq!(workspace.containers()[0].id, container_id);
+        assert_eq!(workspace.containers()[0].windows().len(), 3);
+        assert_eq!(workspace.fullscreened_window(), Some(Window::from(1)));
+        assert_eq!(workspace.maximized_window(), None);
+        assert_eq!(workspace.presented_window(), Some(Window::from(1)));
+
+        workspace.unfullscreen_window().unwrap();
+
+        assert_eq!(workspace.fullscreened_window(), None);
+        assert_eq!(workspace.presented_window(), None);
+        assert_eq!(workspace.containers()[0].id, container_id);
+        assert_eq!(workspace.containers()[0].windows().len(), 3);
+        assert_eq!(
+            workspace.containers()[0].windows()[0].presentation,
+            Presentation::Normal
+        );
+    }
+
+    #[test]
+    fn the_two_presentations_do_not_answer_each_other() {
+        let mut workspace = workspace_with_stack(&[1]);
+
+        workspace.fullscreen_window(1).unwrap();
+        assert!(workspace.unmaximize_window().is_err());
+        assert_eq!(workspace.fullscreened_window(), Some(Window::from(1)));
+
+        workspace.unfullscreen_window().unwrap();
+
+        workspace.maximize_window(1).unwrap();
+        assert!(workspace.unfullscreen_window().is_err());
+        assert_eq!(workspace.maximized_window(), Some(Window::from(1)));
+    }
+
+    #[test]
+    fn switching_presentation_keeps_the_pre_presentation_restore_rect() {
+        let mut workspace = workspace_with_stack(&[1]);
+
+        workspace.maximize_window(1).unwrap();
+        let restore = workspace.containers()[0].windows()[0].restore_rect;
+
+        workspace.fullscreen_window(1).unwrap();
+
+        let window = &workspace.containers()[0].windows()[0];
+        assert_eq!(window.presentation, Presentation::Fullscreen);
+        assert_eq!(window.restore_rect, restore);
+        assert_eq!(workspace.maximized_window(), None);
+    }
+
+    #[test]
+    fn fullscreen_uses_the_monitor_bounds_not_the_work_area() {
+        let mut workspace = workspace_with_stack(&[1]);
+        workspace.globals.work_area = Rect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1000,
+        };
+        workspace.globals.monitor_size = Rect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+
+        assert_eq!(workspace.fullscreen_rect(), workspace.globals.monitor_size);
+    }
+
+    #[test]
+    fn a_fullscreen_window_blocks_a_move_of_its_own_container_only() {
+        let mut workspace = workspace_with_stack(&[1]);
+        let mut second = Container::default();
+        second.windows_mut().push_back(Window::from(2));
+        workspace.add_container_to_back(second);
+
+        workspace.fullscreen_window(1).unwrap();
+
+        workspace.focus_container(1);
+        assert!(!workspace.focused_container_has_presented_window());
+
+        workspace.focus_container(0);
+        assert!(workspace.focused_container_has_presented_window());
+    }
+
+    #[test]
+    fn floating_a_window_leaves_either_presentation_first() {
+        for presentation in [Presentation::Maximized, Presentation::Fullscreen] {
+            let mut workspace = workspace_with_stack(&[1, 2]);
+            workspace.enter_presentation(1, presentation).unwrap();
+
+            workspace.new_floating_window().unwrap();
+
+            assert_eq!(workspace.presented_window(), None);
+            assert_eq!(workspace.containers().len(), 1);
+            assert_eq!(
+                workspace.containers()[0].windows()[0].placement,
+                ManagedPlacement::Floating
+            );
+        }
+    }
+
+    #[test]
     fn a_minimized_window_is_never_a_maximize_subject() {
         let mut workspace = workspace_with_stack(&[1]);
         workspace.minimize_window(1).unwrap();
@@ -4312,10 +4552,10 @@ mod tests {
         workspace.maximize_window(1).unwrap();
 
         workspace.focus_container(1);
-        assert!(!workspace.focused_container_has_maximized_window());
+        assert!(!workspace.focused_container_has_presented_window());
 
         workspace.focus_container(0);
-        assert!(workspace.focused_container_has_maximized_window());
+        assert!(workspace.focused_container_has_presented_window());
     }
 
     #[test]

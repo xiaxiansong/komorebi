@@ -205,6 +205,7 @@ nav:
       - cli/toggle-float.md
       - cli/toggle-monocle.md
       - cli/toggle-maximize.md
+      - cli/toggle-fullscreen.md
       - cli/toggle-lock.md
       - cli/restore-windows.md
       - cli/manage.md
