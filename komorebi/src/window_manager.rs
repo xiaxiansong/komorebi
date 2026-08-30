@@ -61,6 +61,7 @@ use crate::current_virtual_desktop;
 use crate::floating_geometry::FloatingBounds;
 use crate::floating_geometry::FloatingLimits;
 use crate::floating_geometry::scale_delta;
+use crate::geometry::SplitAxis;
 use crate::load_configuration;
 use crate::managed_window::FloatingRejection;
 use crate::managed_window::Presentation;
@@ -76,6 +77,7 @@ use crate::window::Window;
 use crate::window_manager_event::WindowManagerEvent;
 use crate::windows_api::WindowsApi;
 use crate::winevent_listener;
+use crate::workspace::ContainerArrival;
 use crate::workspace::Workspace;
 use crate::workspace::WorkspaceLayer;
 
@@ -1665,17 +1667,44 @@ impl WindowManager {
             .ok_or_eyre("There is no monitor")?
             .remove_workspaces();
 
-        self.monitors_mut()
-            .get_mut(first_idx)
+        // Each list is arriving in a work area which is not the one it was arranged for, so the
+        // rectangles which describe the old one are dealt with on the way in: floating rectangles
+        // are carried across because nothing else will correct them, and the slots and manual
+        // boundaries are discarded so each monitor tiles for its own area and DPI.
+        let first_area = self
+            .monitors()
+            .get(first_idx)
             .ok_or_eyre("There is no monitor")?
-            .workspaces_mut()
-            .extend(second_workspaces);
+            .work_area_size;
 
-        self.monitors_mut()
-            .get_mut(second_idx)
+        let second_area = self
+            .monitors()
+            .get(second_idx)
             .ok_or_eyre("There is no monitor")?
-            .workspaces_mut()
-            .extend(first_workspaces);
+            .work_area_size;
+
+        for (monitor_idx, source_area, workspaces) in [
+            (first_idx, second_area, second_workspaces),
+            (second_idx, first_area, first_workspaces),
+        ] {
+            let target_area = self
+                .monitors()
+                .get(monitor_idx)
+                .ok_or_eyre("There is no monitor")?
+                .work_area_size;
+
+            for mut workspace in workspaces {
+                workspace.transfer_floating_rects(source_area, target_area);
+                workspace.resize_dimensions = vec![None; workspace.containers().len()];
+                workspace.invalidate_slot_geometry();
+
+                self.monitors_mut()
+                    .get_mut(monitor_idx)
+                    .ok_or_eyre("There is no monitor")?
+                    .workspaces_mut()
+                    .push_back(workspace);
+            }
+        }
 
         // Set the focused workspaces for the first and second monitors
         if let Some(first_monitor) = self.monitors_mut().get_mut(first_idx) {
@@ -1707,6 +1736,20 @@ impl WindowManager {
     }
 
     #[tracing::instrument(skip(self))]
+    /// Move the focused container to another monitor, whole.
+    ///
+    /// A container is the unit which moves, not a window: every window it holds travels with it,
+    /// floating and minimized ones included, and its stable ID, its stack order and its window
+    /// focus history come along because the container value itself does. The workspace it leaves
+    /// closes over its slot exactly as it would if the container had been destroyed, and the
+    /// workspace it joins places it by what it is - hidden containers take no slot there, active
+    /// ones halve the geometry-focused container's slot, or take the work area when there is none.
+    ///
+    /// `move_direction` forces the dividing line when it is given, so a container dragged across a
+    /// left or right boundary divides the target vertically whatever shape the slot is.
+    ///
+    /// Everything which can refuse is checked before the container leaves its workspace, so a
+    /// refusal cannot strand it between two monitors.
     pub fn move_container_to_monitor(
         &mut self,
         monitor_idx: usize,
@@ -1729,36 +1772,45 @@ impl WindowManager {
         let offset = self.work_area_offset;
         let mouse_follows_focus = self.mouse_follows_focus;
 
-        let monitor = self
-            .focused_monitor_mut()
-            .ok_or_eyre("there is no monitor")?;
+        // The target is validated first: a container which has already left its workspace has
+        // nowhere to go back to if the monitor it was addressed to turns out not to exist.
+        {
+            let target_monitor = self
+                .monitors()
+                .get(monitor_idx)
+                .ok_or_eyre("there is no monitor")?;
 
-        let current_area = monitor.work_area_size;
-
-        let workspace = monitor
-            .focused_workspace_mut()
-            .ok_or_eyre("there is no workspace")?;
-
-        if workspace.focused_container_has_presented_window() {
-            bail!("cannot move a maximized or fullscreen window to another monitor or workspace");
+            if let Some(idx) = workspace_idx
+                && target_monitor.workspaces().get(idx).is_none()
+            {
+                bail!("there is no workspace at index {idx} on that monitor");
+            }
         }
 
-        let foreground_hwnd = WindowsApi::foreground_window()?;
-        let floating_hwnd = workspace
-            .is_floating_window(foreground_hwnd)
-            .then_some(foreground_hwnd);
+        let (container, source_area) = {
+            let monitor = self
+                .focused_monitor_mut()
+                .ok_or_eyre("there is no monitor")?;
 
-        let floating_window = floating_hwnd.and_then(|hwnd| workspace.take_window(hwnd).ok());
-        let container = if floating_window.is_none() {
-            Some(
-                workspace
-                    .remove_focused_container()
-                    .ok_or_eyre("there is no container")?,
-            )
-        } else {
-            None
+            let source_area = monitor.work_area_size;
+
+            let workspace = monitor
+                .focused_workspace_mut()
+                .ok_or_eyre("there is no workspace")?;
+
+            // A presented window is sized to the monitor it is presented on, so it is asked to
+            // leave that presentation before it changes monitor rather than being carried across.
+            if workspace.focused_container_has_presented_window() {
+                bail!(
+                    "cannot move a maximized or fullscreen window to another monitor or workspace"
+                );
+            }
+
+            let container = monitor.release_focused_container()?;
+            monitor.update_focused_workspace(offset)?;
+
+            (container, source_area)
         };
-        monitor.update_focused_workspace(offset)?;
 
         let target_monitor = self
             .monitors_mut()
@@ -1772,11 +1824,10 @@ impl WindowManager {
             target_monitor.focus_workspace(workspace_idx)?;
             should_load_workspace = true;
         }
-        let target_workspace = target_monitor
-            .focused_workspace_mut()
-            .ok_or_eyre("there is no focused workspace on target monitor")?;
 
-        if target_workspace.monocle_container().is_some() {
+        if let Some(target_workspace) = target_monitor.focused_workspace_mut()
+            && target_workspace.monocle_container().is_some()
+        {
             for container in target_workspace.containers_mut() {
                 container.restore();
             }
@@ -1784,36 +1835,24 @@ impl WindowManager {
             target_workspace.reintegrate_monocle_container()?;
         }
 
-        if let Some(window) = floating_window {
-            let hwnd = window.hwnd;
-            target_workspace.adopt_managed_window(window);
-            target_workspace.layer = WorkspaceLayer::Floating;
-            Window::from(hwnd).move_to_area(&current_area, &target_monitor.work_area_size)?;
-        } else if let Some(container) = container {
-            let container_hwnds = container
-                .windows()
-                .iter()
-                .map(|w| w.hwnd)
-                .collect::<Vec<_>>();
+        let axis = move_direction.map(|direction| match direction {
+            OperationDirection::Left | OperationDirection::Right => SplitAxis::LeftRight,
+            OperationDirection::Up | OperationDirection::Down => SplitAxis::TopBottom,
+        });
 
-            target_workspace.layer = WorkspaceLayer::Tiling;
+        let arrival =
+            target_monitor.adopt_container(container, workspace_idx, source_area, axis)?;
 
-            if let Some(direction) = move_direction {
-                target_monitor.add_container_with_direction(container, workspace_idx, direction)?;
-            } else {
-                target_monitor.add_container(container, workspace_idx)?;
+        if let Some(target_workspace) = target_monitor.focused_workspace_mut() {
+            // A container which arrived hidden shows nothing in the tiling layer, so the layer the
+            // user is working in is only changed by one which did.
+            if !matches!(arrival, ContainerArrival::Hidden(_)) {
+                target_workspace.layer = WorkspaceLayer::Tiling;
             }
 
-            if let Some(workspace) = target_monitor.focused_workspace()
-                && !workspace.tile
-            {
-                for hwnd in container_hwnds {
-                    Window::from(hwnd)
-                        .move_to_area(&current_area, &target_monitor.work_area_size)?;
-                }
+            if let Some(idx) = target_workspace.container_idx_for_id(arrival.arrived()) {
+                target_workspace.focus_container(idx);
             }
-        } else {
-            bail!("failed to find a window to move");
         }
 
         if should_load_workspace {
@@ -1859,28 +1898,63 @@ impl WindowManager {
         Ok(())
     }
 
-    pub fn remove_focused_workspace(&mut self) -> Option<Workspace> {
-        let focused_monitor: &mut Monitor = self.focused_monitor_mut()?;
-        let focused_workspace_idx = focused_monitor.focused_workspace_idx();
-        let workspace = focused_monitor.remove_workspace_by_idx(focused_workspace_idx);
-        if let Err(error) = focused_monitor.focus_workspace(focused_workspace_idx.saturating_sub(1))
-        {
-            tracing::error!(
-                "Error focusing previous workspace while removing the focused workspace: {}",
-                error
-            );
-        }
-        workspace
-    }
-
+    /// Give the focused workspace to another monitor, keeping everything it is.
+    ///
+    /// The workspace keeps its stable ID, its name, its containers and every window state they
+    /// hold. Only the geometry which described the monitor it came from is rewritten: floating
+    /// rectangles are carried into the target's work area, and the slots and manual boundaries are
+    /// discarded so the target tiles the active containers for its own area and DPI. Hidden
+    /// containers arrive hidden and claim no slot there either.
+    ///
+    /// Refuses to leave a monitor with no workspaces, and refuses a monitor which does not exist.
+    /// Both are checked before anything is written, so a refusal leaves both monitors as they were.
     #[tracing::instrument(skip(self))]
     pub fn move_workspace_to_monitor(&mut self, idx: usize) -> eyre::Result<()> {
         tracing::info!("moving workspace");
+
         let mouse_follows_focus = self.mouse_follows_focus;
         let offset = self.work_area_offset;
-        let workspace = self
-            .remove_focused_workspace()
-            .ok_or_eyre("there is no workspace")?;
+        let monitor_idx = self.focused_monitor_idx();
+
+        if monitor_idx == idx {
+            return Ok(());
+        }
+
+        // Also the existence check: a workspace is received at the back of the target's list, so
+        // where it will land is known before it leaves, which is what lets the routing rules be
+        // readdressed while every index still describes the arrangement they were written for.
+        let target_workspace_idx = self
+            .monitors()
+            .get(idx)
+            .ok_or_eyre(format!("there is no monitor at index {idx}"))?
+            .workspaces()
+            .len();
+
+        let (workspace, source_area, source_workspace_idx, reorder) = {
+            let monitor = self
+                .focused_monitor_mut()
+                .ok_or_eyre("there is no monitor")?;
+
+            let source_area = monitor.work_area_size;
+            let workspace_idx = monitor.focused_workspace_idx();
+            let (workspace, reorder) = monitor.release_workspace(workspace_idx)?;
+
+            (workspace, source_area, workspace_idx, reorder)
+        };
+
+        // The routing rules are part of the model, so they settle with it and before anything
+        // which talks to the desktop. Order matters between these two passes: the departing
+        // workspace's rules are readdressed first, while the indices still describe the list they
+        // were written against, and only then do the rules which stayed behind follow their
+        // workspaces down. Remapping first would slide another workspace's rule onto the departing
+        // index and send it to the wrong monitor.
+        Self::readdress_workspace_rules(
+            monitor_idx,
+            source_workspace_idx,
+            idx,
+            target_workspace_idx,
+        );
+        Self::remap_workspace_rules(monitor_idx, &reorder);
 
         {
             let target_monitor: &mut Monitor = self
@@ -1888,11 +1962,18 @@ impl WindowManager {
                 .get_mut(idx)
                 .ok_or_eyre("there is no monitor")?;
 
-            target_monitor.workspaces_mut().push_back(workspace);
+            let landed = target_monitor.receive_workspace(workspace, source_area);
+            debug_assert_eq!(landed, target_workspace_idx);
+
             target_monitor.update_workspaces_globals(offset);
-            target_monitor.focus_workspace(target_monitor.workspaces().len().saturating_sub(1))?;
+            target_monitor.focus_workspace(landed)?;
             target_monitor.load_focused_workspace(mouse_follows_focus)?;
         }
+
+        // The monitor which gave the workspace away has one fewer, and is showing a different one.
+        self.focused_monitor_mut()
+            .ok_or_eyre("there is no monitor")?
+            .load_focused_workspace(mouse_follows_focus)?;
 
         self.focus_monitor(idx)?;
         self.update_focused_workspace(mouse_follows_focus, true)
@@ -4101,6 +4182,31 @@ impl WindowManager {
     /// workspace which absorbed it, which is where those applications' windows are. Each rule is
     /// remapped once, and a rule pointing past the end of the list is left alone because there is
     /// no workspace whose move could describe where it should go.
+    /// Send one workspace's application routing rules to the monitor its workspace moved to.
+    ///
+    /// A rule names a workspace by monitor index and workspace index, so a workspace which changes
+    /// monitor takes both halves of that address with it. This runs after
+    /// [`WindowManager::remap_workspace_rules`] has moved the rules which stayed behind, and the
+    /// two never touch the same rule: this one addresses the workspace which left, and that one
+    /// reports it as gone.
+    fn readdress_workspace_rules(
+        source_monitor_idx: usize,
+        source_workspace_idx: usize,
+        target_monitor_idx: usize,
+        target_workspace_idx: usize,
+    ) {
+        let mut rules = WORKSPACE_MATCHING_RULES.lock();
+
+        for rule in rules.iter_mut() {
+            if rule.monitor_index == source_monitor_idx
+                && rule.workspace_index == source_workspace_idx
+            {
+                rule.monitor_index = target_monitor_idx;
+                rule.workspace_index = target_workspace_idx;
+            }
+        }
+    }
+
     fn remap_workspace_rules(monitor_idx: usize, reorder: &WorkspaceReorder) {
         if reorder.is_identity() {
             return;
@@ -4244,7 +4350,9 @@ mod tests {
     use crate::IdWithIdentifier;
     use crate::MatchingRule;
     use crate::WorkspaceMatchingRule;
+    use crate::geometry::LogicalRect;
     use crate::managed_window::Visibility;
+    use crate::model::ContainerId;
     use crate::monitor;
     use crossbeam_channel::Sender;
     use crossbeam_channel::bounded;
@@ -4372,6 +4480,225 @@ mod tests {
         assert_eq!(rules[1].workspace_index, 1);
 
         WORKSPACE_MATCHING_RULES.lock().clear();
+    }
+
+    /// A monitor with `count` workspaces whose work area is `area`.
+    fn monitor_with_area(idx: isize, count: usize, area: Rect) -> Monitor {
+        let mut monitor = monitor_with_workspaces(idx, count);
+        monitor.work_area_size = area;
+        monitor
+    }
+
+    fn transfer_area(left: i32, width: i32, height: i32) -> Rect {
+        Rect {
+            left,
+            top: 0,
+            right: width,
+            bottom: height,
+        }
+    }
+
+    /// Put a container holding `hwnds` on `workspace_idx` of the monitor at `monitor_idx`.
+    fn place_container(
+        wm: &mut WindowManager,
+        monitor_idx: usize,
+        workspace_idx: usize,
+        hwnds: &[isize],
+    ) -> ContainerId {
+        let mut container = Container::default();
+        for hwnd in hwnds {
+            container.add_window(Window::from(*hwnd));
+        }
+        let id = container.id.clone();
+
+        wm.monitors_mut()[monitor_idx].workspaces_mut()[workspace_idx]
+            .add_container_to_back(container);
+
+        id
+    }
+
+    #[test]
+    fn a_monitor_is_never_left_without_a_workspace_to_give() {
+        let (mut wm, _test_context) = setup_window_manager();
+        wm.monitors_mut().push_back(monitor_with_workspaces(0, 1));
+        wm.monitors_mut().push_back(monitor_with_workspaces(1, 1));
+
+        let refusal = wm.move_workspace_to_monitor(1).unwrap_err().to_string();
+
+        assert!(refusal.contains("only workspace"), "{refusal}");
+        assert_eq!(wm.monitors()[0].workspaces().len(), 1);
+        assert_eq!(wm.monitors()[1].workspaces().len(), 1);
+    }
+
+    #[test]
+    fn moving_a_workspace_to_a_monitor_which_does_not_exist_changes_nothing() {
+        let (mut wm, _test_context) = setup_window_manager();
+        wm.monitors_mut().push_back(monitor_with_workspaces(0, 2));
+
+        assert!(wm.move_workspace_to_monitor(9).is_err());
+        assert_eq!(wm.monitors()[0].workspaces().len(), 2);
+    }
+
+    #[test]
+    fn a_moved_workspace_keeps_its_identity_and_its_containers() {
+        let (mut wm, _test_context) = setup_window_manager();
+        wm.monitors_mut().push_back(monitor_with_workspaces(0, 2));
+        wm.monitors_mut().push_back(monitor_with_workspaces(1, 1));
+
+        let container = place_container(&mut wm, 0, 0, &[42, 43]);
+        let workspace_id = wm.monitors()[0].workspaces()[0].id.clone();
+
+        // The desktop work can fail without a session; the model change is what is asserted.
+        wm.move_workspace_to_monitor(1).ok();
+
+        assert_eq!(wm.monitors()[0].workspaces().len(), 1);
+        assert_eq!(wm.monitors()[1].workspaces().len(), 2);
+
+        let moved = &wm.monitors()[1].workspaces()[1];
+        assert_eq!(moved.id, workspace_id);
+        assert_eq!(moved.container_idx_for_id(&container), Some(0));
+        assert_eq!(
+            moved.containers()[0]
+                .windows()
+                .iter()
+                .map(|window| window.hwnd)
+                .collect::<Vec<_>>(),
+            vec![42, 43]
+        );
+    }
+
+    #[test]
+    fn a_moved_workspace_takes_its_application_rules_to_the_monitor_it_went_to() {
+        let (mut wm, _test_context) = setup_window_manager();
+        wm.monitors_mut().push_back(monitor_with_workspaces(0, 3));
+        wm.monitors_mut().push_back(monitor_with_workspaces(1, 1));
+
+        {
+            let mut rules = WORKSPACE_MATCHING_RULES.lock();
+            rules.clear();
+            // A rule for the workspace which is about to move, and one for the workspace behind it
+            // which will slide down into the index it vacates.
+            rules.push(workspace_rule(0, 1, "moving"));
+            rules.push(workspace_rule(0, 2, "staying"));
+        }
+
+        wm.monitors_mut()[0].focus_workspace(1).unwrap();
+        wm.move_workspace_to_monitor(1).ok();
+
+        let rules = WORKSPACE_MATCHING_RULES.lock().clone();
+
+        assert_eq!(
+            (rules[0].monitor_index, rules[0].workspace_index),
+            (1, 1),
+            "the rule follows its workspace to the other monitor"
+        );
+        assert_eq!(
+            (rules[1].monitor_index, rules[1].workspace_index),
+            (0, 1),
+            "the rule which stayed follows its workspace down, not onto the vacated index"
+        );
+
+        WORKSPACE_MATCHING_RULES.lock().clear();
+    }
+
+    #[test]
+    fn a_container_moved_to_another_monitor_arrives_whole() {
+        let (mut wm, _test_context) = setup_window_manager();
+        wm.monitors_mut()
+            .push_back(monitor_with_area(0, 1, transfer_area(0, 1920, 1080)));
+        wm.monitors_mut()
+            .push_back(monitor_with_area(1, 1, transfer_area(1920, 2560, 1440)));
+
+        let moving = place_container(&mut wm, 0, 0, &[42, 43]);
+        place_container(&mut wm, 0, 0, &[44]);
+        place_container(&mut wm, 1, 0, &[45]);
+        wm.monitors_mut()[0].workspaces_mut()[0].focus_container(0);
+
+        wm.move_container_to_monitor(1, None, false, None).ok();
+
+        // Every window travelled with the container, and its identity came along.
+        let target = &wm.monitors()[1].workspaces()[0];
+        let idx = target.container_idx_for_id(&moving).unwrap();
+        assert_eq!(
+            target.containers()[idx]
+                .windows()
+                .iter()
+                .map(|window| window.hwnd)
+                .collect::<Vec<_>>(),
+            vec![42, 43]
+        );
+
+        // And the workspace it left kept only what was not moving.
+        let source = &wm.monitors()[0].workspaces()[0];
+        assert_eq!(source.containers().len(), 1);
+        assert!(source.container_idx_for_id(&moving).is_none());
+    }
+
+    #[test]
+    fn a_floating_window_moves_with_the_container_which_owns_it() {
+        let source_area = transfer_area(0, 1920, 1080);
+        let target_area = transfer_area(1920, 2560, 1440);
+
+        let (mut wm, _test_context) = setup_window_manager();
+        wm.monitors_mut()
+            .push_back(monitor_with_area(0, 1, source_area));
+        wm.monitors_mut()
+            .push_back(monitor_with_area(1, 1, target_area));
+
+        let moving = place_container(&mut wm, 0, 0, &[42, 43]);
+        wm.monitors_mut()[0].workspaces_mut()[0]
+            .float_window(
+                42,
+                Rect {
+                    left: 960,
+                    top: 540,
+                    right: 400,
+                    bottom: 300,
+                },
+            )
+            .unwrap();
+        wm.monitors_mut()[0].workspaces_mut()[0].focus_container(0);
+
+        wm.move_container_to_monitor(1, None, false, None).ok();
+
+        let target = &wm.monitors()[1].workspaces()[0];
+        let idx = target.container_idx_for_id(&moving).unwrap();
+        let carried = target.containers()[idx].windows()[0].floating_rect.unwrap();
+
+        // The floating window kept its container, and its rectangle is in the target coordinates.
+        assert_eq!(target.containers()[idx].windows()[0].hwnd, 42);
+        assert!(carried.left >= target_area.left);
+        assert!(carried.left + carried.right <= target_area.left + target_area.right);
+    }
+
+    #[test]
+    fn a_container_which_arrives_hidden_takes_no_slot_from_the_monitor_it_joins() {
+        let area = transfer_area(0, 1920, 1080);
+
+        let (mut wm, _test_context) = setup_window_manager();
+        wm.monitors_mut().push_back(monitor_with_area(0, 1, area));
+        wm.monitors_mut().push_back(monitor_with_area(1, 1, area));
+
+        let moving = place_container(&mut wm, 0, 0, &[42]);
+        let resident = place_container(&mut wm, 1, 0, &[45]);
+
+        // Minimizing its only window is what makes the container hidden.
+        wm.monitors_mut()[0].workspaces_mut()[0].containers_mut()[0].windows_mut()[0]
+            .set_minimized();
+        wm.monitors_mut()[0].workspaces_mut()[0].focus_container(0);
+
+        wm.monitors_mut()[1].workspaces_mut()[0].record_logical_slots(area);
+        wm.move_container_to_monitor(1, None, false, None).ok();
+
+        let target = wm.monitors_mut()[1].workspaces_mut().get_mut(0).unwrap();
+        let slots = target.record_logical_slots(area);
+
+        assert!(target.container_idx_for_id(&moving).is_some());
+        assert_eq!(
+            slots,
+            vec![(resident, LogicalRect::from(area))],
+            "a hidden container claims no slot, so the container already there kept the area"
+        );
     }
 
     #[test]
@@ -4643,57 +4970,6 @@ mod tests {
         // we should be able to successfully focus an existing workspace too
         wm.focus_workspace(0).unwrap();
         assert_eq!(wm.focused_workspace_idx().unwrap(), 0);
-    }
-
-    #[test]
-    fn test_remove_focused_workspace() {
-        let (mut wm, _context) = setup_window_manager();
-
-        let m = monitor::new(
-            0,
-            Rect::default(),
-            Rect::default(),
-            "TestMonitor".to_string(),
-            "TestDevice".to_string(),
-            "TestDeviceID".to_string(),
-            Some("TestMonitorID".to_string()),
-        );
-
-        // a new monitor should have a single workspace
-        assert_eq!(m.workspaces().len(), 1);
-
-        // the next index on the monitor should be the not-yet-created second workspace
-        let new_workspace_index = m.new_workspace_idx();
-        assert_eq!(new_workspace_index, 1);
-
-        // add the monitor to the window manager
-        wm.monitors_mut().push_back(m);
-
-        {
-            // focus a workspace which doesn't yet exist should create it
-            let monitor = wm.focused_monitor_mut().unwrap();
-            monitor.focus_workspace(new_workspace_index + 1).unwrap();
-
-            // Monitor focused workspace should be 2
-            assert_eq!(monitor.focused_workspace_idx(), 2);
-
-            // Should have 3 Workspaces
-            assert_eq!(monitor.workspaces().len(), 3);
-        }
-
-        // Remove the focused workspace
-        wm.remove_focused_workspace().unwrap();
-
-        {
-            let monitor = wm.focused_monitor_mut().unwrap();
-            monitor.focus_workspace(new_workspace_index).unwrap();
-
-            // Should be focused on workspace 1
-            assert_eq!(monitor.focused_workspace_idx(), 1);
-
-            // Should have 2 Workspaces
-            assert_eq!(monitor.workspaces().len(), 2);
-        }
     }
 
     #[test]

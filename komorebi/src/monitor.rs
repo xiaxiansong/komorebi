@@ -141,6 +141,25 @@ impl WorkspaceReorder {
         }
     }
 
+    /// The rearrangement produced by taking the workspace at `removed` off this monitor entirely.
+    ///
+    /// Unlike a merge, nothing here inherits what it held: its windows leave the monitor with it.
+    /// A table describing that workspace and a rule describing its windows therefore both stop
+    /// applying to this monitor, which is what both queries answering `None` means.
+    #[must_use]
+    fn from_removal(len: usize, removed: usize) -> Self {
+        Self {
+            positions: (0..len)
+                .map(|idx| match idx.cmp(&removed) {
+                    std::cmp::Ordering::Equal => None,
+                    std::cmp::Ordering::Less => Some(idx),
+                    std::cmp::Ordering::Greater => Some(idx - 1),
+                })
+                .collect(),
+            merged: None,
+        }
+    }
+
     /// The index the workspace which was at `old` now occupies, or `None` if it is gone.
     ///
     /// This is what a table describing the workspace itself follows - its configured name, or the
@@ -683,6 +702,78 @@ impl Monitor {
     }
 
     #[tracing::instrument(skip(self))]
+    /// Take a workspace off this monitor so another monitor can have it.
+    ///
+    /// A monitor must always own at least one workspace, so its last one is refused: a monitor
+    /// with nowhere to put a window is not a state this model has. The workspace comes out whole,
+    /// keeping its stable ID, its name, its containers and everything they hold, and it takes its
+    /// configured name with it rather than leaving it behind to describe whichever workspace
+    /// inherits the index.
+    ///
+    /// The returned rearrangement is what every index-keyed description of a workspace has to
+    /// follow. Both of its queries answer `None` for the workspace which left, because nothing on
+    /// this monitor inherited either the workspace or its windows.
+    ///
+    /// Nothing is written until both refusals have been checked.
+    pub fn release_workspace(&mut self, idx: usize) -> eyre::Result<(Workspace, WorkspaceReorder)> {
+        let len = self.workspaces().len();
+
+        if idx >= len {
+            bail!("there is no workspace at index {idx}");
+        }
+
+        if len < 2 {
+            bail!("a monitor cannot give away its only workspace");
+        }
+
+        // Nothing above this point has written anything, and nothing below it can fail.
+        let reorder = WorkspaceReorder::from_removal(len, idx);
+        let configured = self.workspace_names.get(&idx).cloned();
+
+        let mut workspace = self
+            .workspaces_mut()
+            .remove(idx)
+            .expect("the workspace index was checked against the length");
+
+        if workspace.name.is_none() {
+            workspace.name = configured;
+        }
+
+        self.apply_workspace_reorder(&reorder);
+
+        // The focused index is the one thing a removal can leave pointing past the end.
+        let remaining = self.workspaces().len();
+        if self.workspaces.focused_idx() >= remaining {
+            self.workspaces.focus(remaining.saturating_sub(1));
+        }
+
+        Ok((workspace, reorder))
+    }
+
+    /// Take in a workspace which came from another monitor, and report where it landed.
+    ///
+    /// The workspace keeps its stable ID, its name and everything it holds; only the geometry
+    /// which described the work area it came from is rewritten. Floating rectangles are carried
+    /// into this monitor's work area because nothing else will correct them, while the slots and
+    /// the manual boundaries are discarded so the next update tiles the active containers for this
+    /// monitor's area and DPI. Hidden containers stay hidden, because their state is derived from
+    /// their windows and none of those changed.
+    pub fn receive_workspace(&mut self, mut workspace: Workspace, source_area: Rect) -> usize {
+        let idx = self.workspaces().len();
+
+        workspace.transfer_floating_rects(source_area, self.work_area_size);
+        workspace.resize_dimensions = vec![None; workspace.containers().len()];
+        workspace.invalidate_slot_geometry();
+
+        if let Some(name) = workspace.name.clone() {
+            self.workspace_names.insert(idx, name);
+        }
+
+        self.workspaces_mut().push_back(workspace);
+
+        idx
+    }
+
     /// Take the focused container out of the focused workspace so it can go somewhere else.
     ///
     /// The arrangement closes over the space it leaves: the neighbours on one complete edge absorb
@@ -1138,6 +1229,123 @@ mod tests {
             right: width,
             bottom: height,
         }
+    }
+
+    #[test]
+    fn a_monitor_refuses_to_give_away_its_only_workspace() {
+        let mut monitor = monitor_with_workspaces(1);
+        let before = workspace_ids(&monitor);
+
+        let refusal = monitor.release_workspace(0).unwrap_err().to_string();
+
+        assert!(refusal.contains("only workspace"), "{refusal}");
+        assert_eq!(workspace_ids(&monitor), before);
+    }
+
+    #[test]
+    fn releasing_a_workspace_which_does_not_exist_changes_nothing() {
+        let mut monitor = monitor_with_workspaces(2);
+        let before = workspace_ids(&monitor);
+
+        assert!(monitor.release_workspace(9).is_err());
+        assert_eq!(workspace_ids(&monitor), before);
+    }
+
+    #[test]
+    fn a_released_workspace_leaves_with_its_identity_and_its_name() {
+        let mut monitor = monitor_with_workspaces(3);
+        monitor.workspace_names.insert(1, "middle".to_string());
+        monitor.workspace_names.insert(2, "last".to_string());
+        let before = workspace_ids(&monitor);
+
+        let (workspace, reorder) = monitor.release_workspace(1).unwrap();
+
+        assert_eq!(workspace.id, before[1]);
+        assert_eq!(workspace.name.as_deref(), Some("middle"));
+        assert_eq!(
+            workspace_ids(&monitor),
+            vec![before[0].clone(), before[2].clone()]
+        );
+        // The name of the workspace which left goes with it; the one behind it slides down.
+        assert_eq!(
+            monitor.workspace_names.get(&1).map(String::as_str),
+            Some("last")
+        );
+        assert_eq!(monitor.workspace_names.len(), 1);
+        // Nothing on this monitor inherited either the workspace or its windows.
+        assert_eq!(reorder.new_idx(1), None);
+        assert_eq!(reorder.content_idx(1), None);
+    }
+
+    #[test]
+    fn releasing_the_focused_workspace_leaves_the_focus_in_range() {
+        let mut monitor = monitor_with_workspaces(3);
+        monitor.focus_workspace(2).unwrap();
+
+        monitor.release_workspace(2).unwrap();
+
+        assert_eq!(monitor.workspaces().len(), 2);
+        assert_eq!(monitor.focused_workspace_idx(), 1);
+    }
+
+    #[test]
+    fn a_received_workspace_lands_at_the_back_with_everything_it_had() {
+        let mut source = monitor_with_workspaces(2);
+        let container = populate_workspace(&mut source, 1, 42);
+        source.workspaces_mut()[1].name = Some("carried".to_string());
+
+        let (workspace, _) = source.release_workspace(1).unwrap();
+        let id = workspace.id.clone();
+
+        let mut target = monitor_with_workspaces(2);
+        let idx = target.receive_workspace(workspace, Rect::default());
+
+        assert_eq!(idx, 2);
+        assert_eq!(target.workspaces()[2].id, id);
+        assert_eq!(target.workspaces()[2].name.as_deref(), Some("carried"));
+        assert!(
+            target.workspaces()[2]
+                .container_idx_for_id(&container)
+                .is_some()
+        );
+        // The configured name table on the receiving monitor describes it too.
+        assert_eq!(
+            target.workspace_names.get(&2).map(String::as_str),
+            Some("carried")
+        );
+    }
+
+    #[test]
+    fn a_received_workspace_brings_its_floating_rectangles_into_the_new_work_area() {
+        let source_area = work_area(0, 1920, 1080);
+        let target_area = work_area(1920, 2560, 1440);
+
+        let mut source = monitor_with_workspaces(2);
+        source.work_area_size = source_area;
+        populate_workspace(&mut source, 1, 42);
+        source.workspaces_mut()[1]
+            .float_window(
+                42,
+                Rect {
+                    left: 960,
+                    top: 540,
+                    right: 400,
+                    bottom: 300,
+                },
+            )
+            .unwrap();
+
+        let (workspace, _) = source.release_workspace(1).unwrap();
+
+        let mut target = monitor_with_work_area(target_area);
+        let idx = target.receive_workspace(workspace, source_area);
+
+        let carried = target.workspaces()[idx].containers()[0].windows()[0]
+            .floating_rect
+            .unwrap();
+
+        assert!(carried.left >= target_area.left);
+        assert!(carried.left + carried.right <= target_area.left + target_area.right);
     }
 
     #[test]
