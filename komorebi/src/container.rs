@@ -464,14 +464,52 @@ impl Container {
     }
 
     pub fn remove_window_by_idx(&mut self, idx: usize) -> Option<ManagedWindow> {
+        let focused_idx = self.focused_window_idx();
         let window = self.windows_mut().remove(idx);
 
         if let Some(window) = &window {
             self.focus_history.remove(&window.hwnd);
+            self.focus_window(self.focus_after_removal(idx, focused_idx));
         }
 
-        self.focus_window(idx.saturating_sub(1));
         window
+    }
+
+    /// The stack position to focus once the window at `idx` has been taken out.
+    ///
+    /// Removing a window which was not the one being shown must not change what the container is
+    /// showing, so the focused window keeps its identity and only its index moves. Removing the
+    /// window which *was* being shown - closing the top of a stack is the ordinary case - hands
+    /// focus to the next window which could actually take it, searching down the stack first and
+    /// then up, because a minimized window cannot be focused without being restored and restoring
+    /// it is a separate decision.
+    fn focus_after_removal(&self, idx: usize, focused_idx: usize) -> usize {
+        if self.windows().is_empty() {
+            return 0;
+        }
+
+        if focused_idx != idx {
+            return if focused_idx > idx {
+                focused_idx - 1
+            } else {
+                focused_idx
+            };
+        }
+
+        // Everything which was above the removed window has dropped one place, so the window
+        // directly below it is at `idx - 1` and the one directly above it is at `idx`.
+        let below = (0..idx)
+            .rev()
+            .find(|i| self.windows()[*i].visibility == Visibility::Visible);
+
+        let above = || {
+            (idx..self.windows().len())
+                .find(|i| self.windows()[*i].visibility == Visibility::Visible)
+        };
+
+        below
+            .or_else(above)
+            .unwrap_or_else(|| idx.min(self.windows().len() - 1))
     }
 
     pub fn remove_focused_window(&mut self) -> Option<ManagedWindow> {
@@ -567,6 +605,38 @@ impl Container {
         });
 
         true
+    }
+
+    /// The window one place below the top of this container's stack which could take focus.
+    ///
+    /// The top of the stack is what the container shows, so the "next" window is the one under it,
+    /// and minimized windows are passed over on the way down for the same reason they are passed
+    /// over everywhere else: focusing one would mean restoring it, which the caller did not ask
+    /// for. A container holding fewer than two windows, or none below the top which can be
+    /// focused, answers `None`.
+    #[must_use]
+    pub fn next_stack_window(&self) -> Option<isize> {
+        let top = self.windows().len().checked_sub(1)?;
+
+        (0..top)
+            .rev()
+            .map(|idx| &self.windows()[idx])
+            .find(|window| window.visibility == Visibility::Visible)
+            .map(|window| window.hwnd)
+    }
+
+    /// Raise the window under the top of the stack and show it.
+    ///
+    /// This is the whole of the "raise the next window" operation at container level: the depth
+    /// change and the focus change together, so no caller can perform one without the other. The
+    /// window's handle is returned when there was one to raise.
+    pub fn raise_next_stack_window(&mut self) -> Option<isize> {
+        let hwnd = self.next_stack_window()?;
+
+        self.raise_window(hwnd);
+        self.focus_window_by_hwnd(hwnd);
+
+        Some(hwnd)
     }
 
     #[tracing::instrument(skip(self))]
@@ -737,6 +807,101 @@ mod tests {
                 .map(|w| w.hwnd)
                 .collect::<Vec<_>>(),
             before
+        );
+    }
+
+    #[test]
+    fn the_next_stack_window_is_the_one_under_the_top() {
+        let container = container_with_windows(3);
+
+        assert_eq!(container.next_stack_window(), Some(1));
+    }
+
+    #[test]
+    fn the_next_stack_window_passes_over_minimized_windows() {
+        let mut container = container_with_windows(4);
+        container.windows_mut()[2].set_minimized();
+        container.windows_mut()[1].set_minimized();
+
+        assert_eq!(
+            container.next_stack_window(),
+            Some(0),
+            "a minimized window cannot be focused, so the search continues down the stack"
+        );
+    }
+
+    #[test]
+    fn a_stack_with_nothing_focusable_under_the_top_has_no_next_window() {
+        let mut container = container_with_windows(1);
+        assert_eq!(container.next_stack_window(), None);
+
+        container.add_window(Window::from(1));
+        container.windows_mut()[0].set_minimized();
+        assert_eq!(container.next_stack_window(), None);
+
+        assert_eq!(Container::default().next_stack_window(), None);
+    }
+
+    #[test]
+    fn raising_the_next_stack_window_shows_it_and_records_it() {
+        let mut container = container_with_windows(3);
+
+        assert_eq!(container.raise_next_stack_window(), Some(1));
+
+        assert_eq!(
+            container
+                .windows()
+                .iter()
+                .map(|w| w.hwnd)
+                .collect::<Vec<_>>(),
+            vec![0, 2, 1],
+            "the raised window is on top and the rest keep their relative depth"
+        );
+        assert_eq!(container.focused_window().map(|w| w.hwnd), Some(1));
+        assert_eq!(container.focus_history().iter().next(), Some(&1));
+    }
+
+    #[test]
+    fn closing_the_top_of_a_stack_focuses_the_next_window_which_can_take_focus() {
+        let mut container = container_with_windows(4);
+        container.windows_mut()[2].set_minimized();
+        container.focus_window(3);
+
+        container.remove_window_by_idx(3);
+
+        assert_eq!(
+            container.focused_window().map(|w| w.hwnd),
+            Some(1),
+            "the minimized window below the closed one is passed over"
+        );
+    }
+
+    #[test]
+    fn closing_the_bottom_of_a_stack_leaves_the_shown_window_shown() {
+        let mut container = container_with_windows(3);
+        container.focus_window(2);
+
+        container.remove_window_by_idx(0);
+
+        assert_eq!(
+            container.focused_window().map(|w| w.hwnd),
+            Some(2),
+            "removing a window which was not being shown must not change what is shown"
+        );
+    }
+
+    #[test]
+    fn closing_the_only_focusable_window_below_the_top_looks_back_up_the_stack() {
+        let mut container = container_with_windows(3);
+        container.windows_mut()[0].set_minimized();
+        container.focus_window(1);
+
+        container.remove_window_by_idx(1);
+
+        assert_eq!(
+            container.focused_window().map(|w| w.hwnd),
+            Some(2),
+            "with nothing focusable below it, the search continues up the stack"
         );
     }
 

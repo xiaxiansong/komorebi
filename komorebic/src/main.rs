@@ -1219,6 +1219,9 @@ enum SubCommand {
     /// Focus the specified window index in the focused stack
     #[clap(arg_required_else_help = true)]
     FocusStackWindow(FocusStackWindow),
+    /// Raise the window under the top of the focused container's stack and focus it
+    #[clap(alias = "raise-next")]
+    RaiseNextStackWindow,
     /// Stack all windows on the focused workspace
     StackAll,
     /// Unstack all windows in the focused container
@@ -3100,6 +3103,9 @@ if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
         }
         SubCommand::CycleStack(args) => {
             send_message(&SocketMessage::CycleStack(args.cycle_direction))?;
+        }
+        SubCommand::RaiseNextStackWindow => {
+            send_command(&SocketMessage::RaiseNextStackWindow)?;
         }
         SubCommand::CycleStackIndex(args) => {
             send_message(&SocketMessage::CycleStackIndex(args.cycle_direction))?;

@@ -126,6 +126,7 @@ nav:
       - cli/cycle-stack.md
       - cli/cycle-stack-index.md
       - cli/focus-stack-window.md
+      - cli/raise-next-stack-window.md
       - cli/stack-all.md
       - cli/unstack-all.md
       - cli/resize-edge.md

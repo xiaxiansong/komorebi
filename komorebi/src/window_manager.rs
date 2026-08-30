@@ -916,6 +916,31 @@ impl WindowManager {
         Ok(Some(hwnd))
     }
 
+    /// Raise the window under the top of the focused container's stack and focus it.
+    ///
+    /// Depth is the only thing this changes: no window joins or leaves a container, so there is no
+    /// candidate to validate and the model cannot be left inconsistent by it. `NoOp` means the
+    /// focused container has one window, or none under its top which could take focus without
+    /// being restored first.
+    pub fn raise_next_stack_window(&mut self) -> eyre::Result<CommandResponse> {
+        let monitor_idx = self.focused_monitor_idx();
+
+        let Some(hwnd) = self.focused_workspace_mut()?.raise_next_stack_window() else {
+            return Ok(CommandResponse::new(
+                CommandOutcome::NoOp,
+                "there is no window under the top of this stack to raise",
+            ));
+        };
+
+        self.update_focused_workspace_by_monitor_idx(monitor_idx)?;
+        Window::from(hwnd).focus(self.mouse_follows_focus)?;
+
+        Ok(CommandResponse::new(
+            CommandOutcome::Success,
+            format!("raised hwnd {hwnd}"),
+        ))
+    }
+
     /// Where the workspace with this stable ID lives, as (monitor, workspace) indices.
     ///
     /// An index is a position in a list which reordering, merging and monitor moves all change; an

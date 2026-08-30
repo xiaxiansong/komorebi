@@ -1689,6 +1689,42 @@ Not in this phase: no static configuration field changed, so `schema.json` and `
 need no regeneration. Reconciling `komorebic docgen` with the checked-in `docs/cli` format remains
 deferred to Phase 14.
 
+#### Phase 12F - Stack depth and post-close focus
+
+Added on 2026-08-30, when the Phase 13 shortcut audit found that the task's "raise the next window
+in the stack" command (task section 7) had no socket message and no CLI subcommand. Binding a
+hotkey to a command which does not exist is not an option, so the command is built before the
+shortcuts which call it.
+
+- [x] Add `Container::next_stack_window` and a workspace operation which raises it, focuses it and
+  updates both MRUs.
+- [x] Choose the window a removal leaves focused by validity rather than by index arithmetic: keep
+  the focused window when something else was removed, otherwise take the next visible window down
+  the stack and then up.
+- [x] Add `SocketMessage::RaiseNextStackWindow` and the `komorebic raise-next-stack-window`
+  subcommand, answering `NoOp` when the stack has nothing else to raise.
+- [x] Add selection, raise, focus-history and post-close focus tests.
+- [x] Commit as `feat: raise the next window in a stack`.
+
+Actual files: `komorebi/src/container.rs`, `komorebi/src/workspace.rs`,
+`komorebi/src/window_manager.rs`, `komorebi/src/core/mod.rs`, `komorebi/src/process_command.rs`,
+`komorebic/src/main.rs`, new `docs/cli/raise-next-stack-window.md`, `mkdocs.yml`.
+
+The command is deliberately not routed through `commit_workspace_change`. Raising changes depth and
+focus and nothing else - no window joins or leaves a container - so there is no compound state for a
+candidate to protect, and the validated-clone path exists for operations which move ownership.
+
+`remove_window_by_idx` was the phase's real defect rather than the missing command. It focused
+`idx - 1` whatever was there, which both moved focus off a window the caller had not touched and
+could land on a minimized window nothing had asked to restore. The replacement answers two
+different questions: a removal which did not take the shown window keeps showing the same window at
+its new index, and a removal which did takes the next window which can accept focus, down the stack
+first and then up. Every existing removal test passed unchanged.
+
+Verification: `komorebi` lib tests 478 -> 487 passing, full workspace suite serial and green.
+`cargo fmt --check` and `cargo clippy --workspace --all-targets` clean apart from the pre-existing
+`items after a test module` warning.
+
 ### Phase 13 - AutoHotkey v2 workflow
 
 - [ ] Add a directly runnable AHK v2 example using top-level executable/config/delta variables and

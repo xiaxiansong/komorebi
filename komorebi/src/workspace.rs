@@ -2673,6 +2673,26 @@ impl Workspace {
         Ok(changed)
     }
 
+    /// Raise the window under the top of the focused container's stack and focus it.
+    ///
+    /// This is the operator's way through a stack which does not disturb its order: the raised
+    /// window becomes what its container shows and every other window keeps its relative depth.
+    /// Both histories are updated, because the raise goes through the ordinary focus path rather
+    /// than around it. `None` means the focused container has nothing under its top window which
+    /// could be focused.
+    pub fn raise_next_stack_window(&mut self) -> Option<isize> {
+        let container_idx = self.focused_container_idx();
+
+        let hwnd = self
+            .containers_mut()
+            .get_mut(container_idx)?
+            .raise_next_stack_window()?;
+
+        self.focus_container_by_window(hwnd).ok()?;
+
+        Some(hwnd)
+    }
+
     /// Restore the most recently minimized window this workspace still owns, and focus it.
     ///
     /// The window returns with the placement and presentation it had, so a floating window comes
@@ -7232,6 +7252,34 @@ mod tests {
 
         workspace.add_container_to_back(container);
         workspace
+    }
+
+    #[test]
+    fn raising_the_next_stack_window_records_it_in_both_histories() {
+        let mut workspace = workspace_with_stack(&[1, 2, 3]);
+        let container_id = workspace.containers()[0].id.clone();
+
+        assert_eq!(workspace.raise_next_stack_window(), Some(2));
+
+        let container = &workspace.containers()[0];
+        let order: Vec<isize> = container.windows().iter().map(|w| w.hwnd).collect();
+
+        assert_eq!(order, vec![1, 3, 2], "only the depth of one window changed");
+        assert_eq!(container.id, container_id, "no container was created");
+        assert_eq!(container.focused_window().map(|w| w.hwnd), Some(2));
+        assert_eq!(container.focus_history().iter().next(), Some(&2));
+        assert_eq!(
+            workspace.container_focus_history.iter().next(),
+            Some(&container_id)
+        );
+    }
+
+    #[test]
+    fn raising_the_next_stack_window_needs_something_under_the_top() {
+        let mut workspace = workspace_with_stack(&[1]);
+
+        assert_eq!(workspace.raise_next_stack_window(), None);
+        assert_eq!(Workspace::default().raise_next_stack_window(), None);
     }
 
     #[test]

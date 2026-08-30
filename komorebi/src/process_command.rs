@@ -383,6 +383,10 @@ impl WindowManager {
             SocketMessage::CycleStack(direction) => {
                 self.cycle_container_window_in_direction(direction)?;
             }
+            SocketMessage::RaiseNextStackWindow => {
+                let response = self.raise_next_stack_window()?;
+                Self::respond(&mut reply, &response);
+            }
             SocketMessage::CycleStackIndex(direction) => {
                 self.cycle_container_window_index_in_direction(direction)?;
             }

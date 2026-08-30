@@ -74,6 +74,11 @@ pub enum SocketMessage {
     CycleStack(CycleDirection),
     CycleStackIndex(CycleDirection),
     FocusStackWindow(usize),
+    /// Raise the window under the top of the focused container's stack and focus it.
+    ///
+    /// Deliberately distinct from `CycleStack`, which moves focus around a stack without changing
+    /// the order of the windows in it.
+    RaiseNextStackWindow,
     StackAll,
     UnstackAll,
     ResizeWindowEdge(OperationDirection, Sizing),
@@ -932,6 +937,10 @@ mod tests {
             (
                 SocketMessage::MoveWindowToContainerId(String::from("xyz"), false),
                 r#"{"type":"MoveWindowToContainerId","content":["xyz",false]}"#,
+            ),
+            (
+                SocketMessage::RaiseNextStackWindow,
+                r#"{"type":"RaiseNextStackWindow"}"#,
             ),
         ];
 
