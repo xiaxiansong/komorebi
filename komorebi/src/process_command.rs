@@ -1916,6 +1916,22 @@ if (!(Get-Process komorebi-bar -ErrorAction SilentlyContinue))
                     }));
                 }
             }
+            SocketMessage::MoveWorkspaceToIndex(idx) => {
+                let response = self.move_workspace_to_index(idx)?;
+                Self::respond(&mut reply, &response);
+            }
+            SocketMessage::CycleMoveWorkspace(direction) => {
+                let response = self.cycle_workspace_position(direction)?;
+                Self::respond(&mut reply, &response);
+            }
+            SocketMessage::SwapWorkspaceWithIndex(idx) => {
+                let response = self.swap_workspace_with_index(idx)?;
+                Self::respond(&mut reply, &response);
+            }
+            SocketMessage::MergeFocusedWorkspace => {
+                let response = self.merge_focused_workspace_command()?;
+                Self::respond(&mut reply, &response);
+            }
             SocketMessage::CreateContainer(axis) => {
                 let response = self.create_container(axis)?;
                 Self::respond(&mut reply, &response);

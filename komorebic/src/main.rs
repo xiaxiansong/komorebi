@@ -164,6 +164,7 @@ gen_enum_subcommand_args! {
     CycleWorkspace: CycleDirection,
     CycleEmptyWorkspace: CycleDirection,
     CycleMoveWorkspaceToMonitor: CycleDirection,
+    CycleMoveWorkspace: CycleDirection,
     Stack: OperationDirection,
     CycleStack: CycleDirection,
     CycleStackIndex: CycleDirection,
@@ -201,7 +202,9 @@ gen_target_subcommand_args! {
     FocusWorkspace,
     FocusWorkspaces,
     MoveWorkspaceToMonitor,
+    MoveWorkspaceToIndex,
     SwapWorkspacesWithMonitor,
+    SwapWorkspaceWithIndex,
     FocusStackWindow,
 }
 
@@ -1296,6 +1299,17 @@ enum SubCommand {
     SwapWorkspacesWithMonitor(SwapWorkspacesWithMonitor),
     /// Create and append a new workspace on the focused monitor
     NewWorkspace,
+    /// Move the focused workspace to the specified position on its monitor
+    #[clap(arg_required_else_help = true)]
+    MoveWorkspaceToIndex(MoveWorkspaceToIndex),
+    /// Move the focused workspace one position along its monitor, wrapping at the ends
+    #[clap(arg_required_else_help = true)]
+    CycleMoveWorkspace(CycleMoveWorkspace),
+    /// Exchange the focused workspace's position with the workspace at the specified position
+    #[clap(arg_required_else_help = true)]
+    SwapWorkspaceWithIndex(SwapWorkspaceWithIndex),
+    /// Delete the focused workspace, merging everything it owns into a neighbour
+    MergeWorkspace,
     /// Set the resize delta (used by resize-edge and resize-axis)
     #[clap(arg_required_else_help = true)]
     ResizeDelta(ResizeDelta),
@@ -3272,6 +3286,18 @@ if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
         }
         SubCommand::ToggleTitleBars => {
             send_message(&SocketMessage::ToggleTitleBars)?;
+        }
+        SubCommand::MoveWorkspaceToIndex(args) => {
+            send_command(&SocketMessage::MoveWorkspaceToIndex(args.target))?;
+        }
+        SubCommand::CycleMoveWorkspace(args) => {
+            send_command(&SocketMessage::CycleMoveWorkspace(args.cycle_direction))?;
+        }
+        SubCommand::SwapWorkspaceWithIndex(args) => {
+            send_command(&SocketMessage::SwapWorkspaceWithIndex(args.target))?;
+        }
+        SubCommand::MergeWorkspace => {
+            send_command(&SocketMessage::MergeFocusedWorkspace)?;
         }
         SubCommand::CreateContainer(args) => {
             send_command(&SocketMessage::CreateContainer(args.axis))?;

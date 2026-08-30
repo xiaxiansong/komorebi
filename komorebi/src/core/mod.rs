@@ -172,6 +172,17 @@ pub enum SocketMessage {
     EnsureWorkspaces(usize, usize),
     EnsureNamedWorkspaces(usize, Vec<String>),
     NewWorkspace,
+    /// Move the focused workspace to a position on its monitor's list.
+    ///
+    /// Only the order changes: every workspace keeps its ID, its name, its windows and its layout.
+    MoveWorkspaceToIndex(usize),
+    /// Move the focused workspace one position along its monitor's list, wrapping at the ends.
+    CycleMoveWorkspace(CycleDirection),
+    /// Exchange the focused workspace's position with the workspace at an index.
+    SwapWorkspaceWithIndex(usize),
+    /// Delete the focused workspace, merging its containers, windows and histories into a
+    /// neighbour. A monitor's last workspace is refused.
+    MergeFocusedWorkspace,
     ToggleTiling,
     Stop,
     StopIgnoreRestore,

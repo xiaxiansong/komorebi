@@ -164,6 +164,10 @@ nav:
       - cli/cycle-move-workspace-to-monitor.md
       - cli/swap-workspaces-with-monitor.md
       - cli/new-workspace.md
+      - cli/move-workspace-to-index.md
+      - cli/cycle-move-workspace.md
+      - cli/swap-workspace-with-index.md
+      - cli/merge-workspace.md
       - cli/resize-delta.md
       - cli/invisible-borders.md
       - cli/global-work-area-offset.md

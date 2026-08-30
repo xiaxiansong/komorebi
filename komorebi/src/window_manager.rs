@@ -4290,6 +4290,114 @@ impl WindowManager {
         self.update_focused_workspace(false, true)
     }
 
+    /// How many workspaces the focused monitor has, and which of them is focused.
+    fn workspace_order(&self) -> eyre::Result<(usize, usize)> {
+        let monitor = self.focused_monitor().ok_or_eyre("there is no monitor")?;
+
+        Ok((monitor.workspaces().len(), monitor.focused_workspace_idx()))
+    }
+
+    /// Move the focused workspace to a position on its monitor's list.
+    ///
+    /// Reordering is a permutation of the list, so a position which does not exist is refused
+    /// rather than clamped: a hotkey which meant workspace 5 on a monitor with three of them has
+    /// not asked for the last one, it has asked for nothing.
+    pub fn move_workspace_to_index(&mut self, idx: usize) -> eyre::Result<CommandResponse> {
+        let (count, focused) = self.workspace_order()?;
+
+        if idx >= count {
+            return Ok(CommandResponse::new(
+                CommandOutcome::NoTarget,
+                format!("this monitor has {count} workspaces, so there is no position {idx}"),
+            ));
+        }
+
+        if idx == focused {
+            return Ok(CommandResponse::new(
+                CommandOutcome::NoOp,
+                format!("this workspace is already at position {idx}"),
+            ));
+        }
+
+        self.move_focused_workspace_to_idx(idx)?;
+
+        Ok(CommandResponse::new(
+            CommandOutcome::Success,
+            format!("moved this workspace to position {idx}"),
+        ))
+    }
+
+    /// Move the focused workspace one position along its monitor's list, wrapping at the ends.
+    pub fn cycle_workspace_position(
+        &mut self,
+        direction: CycleDirection,
+    ) -> eyre::Result<CommandResponse> {
+        let (count, _) = self.workspace_order()?;
+
+        if count < 2 {
+            return Ok(CommandResponse::new(
+                CommandOutcome::NoOp,
+                "this monitor has only one workspace to order",
+            ));
+        }
+
+        self.cycle_focused_workspace_position(direction)?;
+
+        Ok(CommandResponse::new(
+            CommandOutcome::Success,
+            format!("moved this workspace one position {direction:?}"),
+        ))
+    }
+
+    /// Exchange the focused workspace's position with the workspace at `idx`.
+    pub fn swap_workspace_with_index(&mut self, idx: usize) -> eyre::Result<CommandResponse> {
+        let (count, focused) = self.workspace_order()?;
+
+        if idx >= count {
+            return Ok(CommandResponse::new(
+                CommandOutcome::NoTarget,
+                format!("this monitor has {count} workspaces, so there is no position {idx}"),
+            ));
+        }
+
+        if idx == focused {
+            return Ok(CommandResponse::new(
+                CommandOutcome::NoOp,
+                "a workspace cannot be swapped with itself",
+            ));
+        }
+
+        self.swap_focused_workspace_with_idx(idx)?;
+
+        Ok(CommandResponse::new(
+            CommandOutcome::Success,
+            format!("swapped this workspace with position {idx}"),
+        ))
+    }
+
+    /// Delete the focused workspace, merging everything it owned into a neighbour.
+    ///
+    /// A monitor must keep a workspace, so the last one is refused. Unlike the older close
+    /// command, this does not require the workspace to be empty: its containers, windows,
+    /// histories and rules go to the neighbour the model's direction rule chooses.
+    pub fn merge_focused_workspace_command(&mut self) -> eyre::Result<CommandResponse> {
+        let (count, _) = self.workspace_order()?;
+
+        if count < 2 {
+            return Ok(CommandResponse::new(
+                CommandOutcome::NoTarget,
+                "a monitor must keep one workspace, so this one cannot be merged away",
+            ));
+        }
+
+        let target = self.merge_focused_workspace()?;
+
+        Ok(CommandResponse::new(
+            CommandOutcome::Success,
+            format!("merged this workspace into position {target}"),
+        ))
+    }
+
     /// Move the focused workspace to `idx` on its monitor.
     ///
     /// Nothing inside any workspace changes, so there is no retiling to do: the workspaces keep
@@ -5044,6 +5152,122 @@ mod tests {
 
         assert!(!wm.suspend_managed_window(42).unwrap());
         assert!(wm.temporarily_unmanaged_hwnds.contains(&42));
+    }
+
+    #[test]
+    fn moving_a_workspace_to_a_position_which_does_not_exist_refuses() {
+        let (mut wm, _test_context) = setup_window_manager();
+        wm.monitors_mut().push_back(monitor_with_workspaces(0, 3));
+
+        let before = workspace_ids(&wm);
+        let response = wm.move_workspace_to_index(9).unwrap();
+
+        assert_eq!(response.outcome, CommandOutcome::NoTarget);
+        assert_eq!(workspace_ids(&wm), before);
+    }
+
+    #[test]
+    fn moving_a_workspace_to_the_position_it_already_has_is_a_no_op() {
+        let (mut wm, _test_context) = setup_window_manager();
+        wm.monitors_mut().push_back(monitor_with_workspaces(0, 3));
+        wm.monitors_mut()[0].focus_workspace(1).unwrap();
+
+        let before = workspace_ids(&wm);
+        let response = wm.move_workspace_to_index(1).unwrap();
+
+        assert_eq!(response.outcome, CommandOutcome::NoOp);
+        assert_eq!(workspace_ids(&wm), before);
+    }
+
+    #[test]
+    fn moving_a_workspace_reorders_without_changing_identity() {
+        let (mut wm, _test_context) = setup_window_manager();
+        wm.monitors_mut().push_back(monitor_with_workspaces(0, 3));
+        wm.monitors_mut()[0].focus_workspace(0).unwrap();
+
+        let before = workspace_ids(&wm);
+        let response = wm.move_workspace_to_index(2).unwrap();
+
+        assert_eq!(response.outcome, CommandOutcome::Success);
+        assert_eq!(
+            workspace_ids(&wm),
+            vec![before[1].clone(), before[2].clone(), before[0].clone()]
+        );
+    }
+
+    #[test]
+    fn cycling_a_workspace_position_needs_a_second_workspace() {
+        let (mut wm, _test_context) = setup_window_manager();
+        wm.monitors_mut().push_back(monitor_with_workspaces(0, 1));
+
+        let response = wm.cycle_workspace_position(CycleDirection::Next).unwrap();
+
+        assert_eq!(response.outcome, CommandOutcome::NoOp);
+        assert_eq!(wm.monitors()[0].workspaces().len(), 1);
+    }
+
+    #[test]
+    fn swapping_a_workspace_with_itself_is_a_no_op() {
+        let (mut wm, _test_context) = setup_window_manager();
+        wm.monitors_mut().push_back(monitor_with_workspaces(0, 3));
+        wm.monitors_mut()[0].focus_workspace(2).unwrap();
+
+        let before = workspace_ids(&wm);
+        let response = wm.swap_workspace_with_index(2).unwrap();
+
+        assert_eq!(response.outcome, CommandOutcome::NoOp);
+        assert_eq!(workspace_ids(&wm), before);
+    }
+
+    #[test]
+    fn swapping_exchanges_two_positions_and_leaves_the_rest_alone() {
+        let (mut wm, _test_context) = setup_window_manager();
+        wm.monitors_mut().push_back(monitor_with_workspaces(0, 3));
+        wm.monitors_mut()[0].focus_workspace(0).unwrap();
+
+        let before = workspace_ids(&wm);
+        let response = wm.swap_workspace_with_index(2).unwrap();
+
+        assert_eq!(response.outcome, CommandOutcome::Success);
+        assert_eq!(
+            workspace_ids(&wm),
+            vec![before[2].clone(), before[1].clone(), before[0].clone()]
+        );
+    }
+
+    #[test]
+    fn a_monitor_refuses_to_merge_its_last_workspace_away() {
+        let (mut wm, _test_context) = setup_window_manager();
+        wm.monitors_mut().push_back(monitor_with_workspaces(0, 1));
+
+        let response = wm.merge_focused_workspace_command().unwrap();
+
+        assert_eq!(response.outcome, CommandOutcome::NoTarget);
+        assert_eq!(wm.monitors()[0].workspaces().len(), 1);
+    }
+
+    #[test]
+    fn merging_a_workspace_removes_it_and_keeps_the_survivors() {
+        let (mut wm, _test_context) = setup_window_manager();
+        wm.monitors_mut().push_back(monitor_with_workspaces(0, 3));
+        wm.monitors_mut()[0].focus_workspace(1).unwrap();
+
+        let before = workspace_ids(&wm);
+        // The desktop work can fail without a session; the model change is what is asserted.
+        wm.merge_focused_workspace_command().ok();
+
+        assert_eq!(
+            workspace_ids(&wm),
+            vec![before[0].clone(), before[2].clone()]
+        );
+    }
+
+    fn workspace_ids(wm: &WindowManager) -> Vec<crate::model::WorkspaceId> {
+        wm.monitors()[0]
+            .workspaces()
+            .iter()
+            .map(|workspace| workspace.id.clone())
+            .collect()
     }
 
     #[test]
