@@ -930,16 +930,54 @@ expansion the same way this phase reused `plan_split`.
 
 ### Phase 8 - Container deletion, distribution, and multi-neighbor resize
 
-- [ ] Reuse complete-edge groups for Active deletion expansion.
-- [ ] Implement Hidden explicit deletion recipient order and atomic refusal.
-- [ ] Distribute top-to-bottom source windows round-robin to recipient bottoms.
-- [ ] Implement shared-edge resize with multi-container opposite sides and clamped delta.
-- [ ] Invalidate impacted hidden restores; select post-delete focus from expansion recipients.
-- [ ] Add deletion/distribution/focus/resize/failure-rollback tests.
-- [ ] Commit as `feat: make container deletion and resize topology safe`.
+Split into 8A, 8B and 8C on 2026-08-30, before coding, for the same review-size reason as Phases 2,
+3, 5, 6 and 7. The three concerns are genuinely separable: 8A is what happens to the *area* a
+departing container leaves behind, 8B is what happens to the *windows* it was holding, and 8C is a
+boundary move which deletes nothing at all. Only 8A and 8B share a primitive, and 8B is written
+against the recipient ordering 8A establishes.
 
-Expected handwritten change: 350-500 lines. Likely files: `geometry.rs`, `workspace.rs`,
-`window_manager.rs`.
+Until this phase a deletion has always ended in a full recalculation: `forget_container` drops the
+slot outright, and the container list inside `SlotInputs` then differs from the fingerprint, so the
+next `record_logical_slots` recalculates the whole workspace. That is never *wrong* - it always
+tiles - but it discards every manual boundary the user had, which is exactly what the task's
+directional expansion rule exists to avoid.
+
+#### Phase 8A - Active deletion expansion and post-deletion focus
+
+- [ ] Plan the departing container's absorption while its slot is still in place, and apply it as a
+  local slot edit rather than falling through to a recalculation.
+- [ ] Fall back to invalidation, not to a hole, when no edge can absorb the slot.
+- [ ] Invalidate the hidden restore records whose absorbers the expansion moved.
+- [ ] Select post-deletion focus from the first expansion recipient in plan order.
+- [ ] Add expansion, multi-neighbour expansion, fallback, restore-invalidation and focus tests.
+- [ ] Commit as `feat: expand neighbours over a deleted container`.
+
+Expected handwritten change: 250-400 lines. Likely files: `workspace.rs`.
+
+#### Phase 8B - Explicit destruction and window distribution
+
+- [ ] Add explicit destruction of a container which still holds windows.
+- [ ] Order recipients: surviving absorbers, then active MRU, then hidden MRU, for a Hidden source;
+  the expansion group for an Active one.
+- [ ] Distribute source windows top-to-bottom, round-robin, to recipient stack bottoms, preserving
+  placement, visibility, presentation and floating rectangle.
+- [ ] Refuse atomically when a non-empty container has nowhere to send its windows.
+- [ ] Add distribution-order, state-preservation, hidden-source, refusal and focus tests.
+- [ ] Commit as `feat: distribute the windows of a destroyed container`.
+
+Expected handwritten change: 250-400 lines. Likely files: `workspace.rs`, `container.rs`.
+
+#### Phase 8C - Multi-neighbour shared-edge resize
+
+- [ ] Add a validated, not-yet-applied shared-edge resize plan to the slot map.
+- [ ] Move one shared boundary at a time, changing only the axis the edge belongs to.
+- [ ] Move every active container on both sides of the boundary together.
+- [ ] Clamp the delta to the legal range and refuse rather than overlap or open a hole.
+- [ ] Invalidate the hidden restore records the moved boundary touches.
+- [ ] Add axis, multi-neighbour, clamp, minimum-size, refusal and hidden-target tests.
+- [ ] Commit as `feat: resize an active container along a shared edge`.
+
+Expected handwritten change: 300-450 lines. Likely files: `geometry.rs`, `workspace.rs`.
 
 ### Phase 9 - Floating move and edge resize
 

@@ -40,6 +40,7 @@ use crate::geometry::LogicalRect;
 use crate::geometry::LogicalSlots;
 use crate::geometry::RenderInsets;
 use crate::geometry::SlotOrder;
+use crate::geometry::SlotShift;
 use crate::geometry::SplitAxis;
 use crate::lockable_sequence::LockableSequence;
 use crate::managed_window::ManagedPlacement;
@@ -222,6 +223,18 @@ pub enum NewWindowPlacement {
     },
     /// The window joined an existing active container's stack.
     Joined(ContainerId),
+}
+
+/// What a container's departure does to the arrangement it leaves behind.
+///
+/// Deliberately distinct from an absent plan: a hidden container leaving changes no geometry and
+/// must not cost the workspace its manual boundaries, while a slot no edge can absorb must.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SlotDeparture {
+    /// The departing container held no active slot, so the tiling is already correct.
+    Unaffected,
+    /// The freed slot is taken by the complete edge group in this shift.
+    Absorbed(SlotShift),
 }
 
 /// How to give one hidden container's logical slot back to it.
@@ -1577,10 +1590,7 @@ impl Workspace {
     /// Nothing is written unless every step of the transition is possible, so a refusal here
     /// leaves the previous slots exactly as they were for the recalculation to replace.
     fn try_local_slot_update(&mut self, area: LogicalRect, active: &[ContainerId]) -> bool {
-        if self.relayout_pending
-            || self.logical_work_area != Some(area)
-            || self.slot_inputs.as_ref() != Some(&self.slot_inputs())
-        {
+        if !self.slots_are_authoritative() || self.logical_work_area != Some(area) {
             return false;
         }
 
@@ -1691,6 +1701,139 @@ impl Workspace {
         }
 
         true
+    }
+
+    /// Whether the current slots are the arrangement this workspace is actually in.
+    ///
+    /// False means the layout has to be consulted again before anything is read from the slots, so
+    /// no local edit may be applied and none may be adopted. The work area is deliberately not part
+    /// of this: a caller which has one compares it, and a caller which is only editing the topology
+    /// does not need one.
+    #[must_use]
+    fn slots_are_authoritative(&self) -> bool {
+        !self.relayout_pending && self.slot_inputs.as_ref() == Some(&self.slot_inputs())
+    }
+
+    /// What happens to the arrangement when `id` leaves this workspace.
+    ///
+    /// Planned while the departing slot is still in the map, because that is the only moment the
+    /// group which can absorb it is knowable, and applied only once the container has actually left
+    /// the ring, because the arrangement fingerprint contains the container list.
+    #[must_use]
+    fn plan_departure(&self, id: &ContainerId) -> Option<SlotDeparture> {
+        if !self.slots_are_authoritative() {
+            return None;
+        }
+
+        // A hidden container holds no slot, so its departure changes nothing about the tiling and
+        // needs no expansion at all.
+        if !self.logical_slots.contains(id) {
+            return Some(SlotDeparture::Unaffected);
+        }
+
+        self.logical_slots
+            .plan_absorption(id)
+            .map(SlotDeparture::Absorbed)
+    }
+
+    /// Apply a planned departure and answer with the container focus should move to.
+    ///
+    /// `None` - no plan at all - is the signal that no single edge could take the freed slot, so
+    /// the whole workspace is rearranged rather than left with a hole in it.
+    fn apply_departure(
+        &mut self,
+        id: &ContainerId,
+        departure: Option<SlotDeparture>,
+    ) -> Option<ContainerId> {
+        match departure {
+            Some(SlotDeparture::Absorbed(shift)) => {
+                let mut changed: Vec<ContainerId> = shift
+                    .movers
+                    .iter()
+                    .map(|mover| mover.container.clone())
+                    .collect();
+                changed.push(id.clone());
+
+                self.logical_slots.apply_absorption(&shift);
+                self.invalidate_restores_touching(&changed);
+                self.adopt_slot_geometry();
+
+                shift.first_mover().cloned()
+            }
+            Some(SlotDeparture::Unaffected) => {
+                self.invalidate_restores_touching(std::slice::from_ref(id));
+                self.adopt_slot_geometry();
+
+                None
+            }
+            None => {
+                self.invalidate_slot_geometry();
+
+                None
+            }
+        }
+    }
+
+    /// Mark every hidden restore record which named one of `changed` as no longer exactly
+    /// reversible.
+    ///
+    /// A record is a promise that its absorbers still hold exactly the rectangles the absorption
+    /// gave them. Once one of them has grown again, or left the workspace altogether, that promise
+    /// is broken and the container it belongs to has to come back through a recalculation. The
+    /// record is kept rather than dropped because its `old_rect` is still the anchor the fallback
+    /// placement uses.
+    fn invalidate_restores_touching(&mut self, changed: &[ContainerId]) {
+        for record in self.hidden_slot_restores.values_mut() {
+            if record
+                .absorbers
+                .iter()
+                .any(|absorber| changed.contains(absorber))
+            {
+                record.exact_restore_valid = false;
+            }
+        }
+    }
+
+    /// The container focus moves to once the container at `idx` has been deleted.
+    ///
+    /// The first member of the group which expands over the freed slot, in the deterministic order
+    /// for the direction it expanded from: top to bottom along a vertical edge, left to right along
+    /// a horizontal one. `None` when nothing expands, which is a hidden container leaving, a
+    /// rearrangement, or the last active container of the workspace.
+    #[must_use]
+    pub fn expansion_focus_target(&self, idx: usize) -> Option<ContainerId> {
+        let id = &self.containers().get(idx)?.id;
+
+        match self.plan_departure(id)? {
+            SlotDeparture::Absorbed(shift) => shift.first_mover().cloned(),
+            SlotDeparture::Unaffected => None,
+        }
+    }
+
+    /// Move focus to the container an expansion chose, or to the previous one when it chose none.
+    ///
+    /// The recipient's own most recent focusable window is what gets focused, which is the window
+    /// it was already showing. A minimized window is never restored to satisfy this.
+    fn focus_after_removal(&mut self, target: Option<ContainerId>) {
+        let Some(idx) = target.and_then(|id| self.container_idx_for_id(&id)) else {
+            self.focus_previous_container();
+
+            return;
+        };
+
+        self.focus_container(idx);
+
+        let hwnd = self
+            .containers()
+            .get(idx)
+            .and_then(|container| container.first_focusable_window())
+            .map(|window| window.hwnd);
+
+        if let Some(hwnd) = hwnd
+            && let Some(container) = self.containers_mut().get_mut(idx)
+        {
+            container.focus_window_by_hwnd(hwnd);
+        }
     }
 
     /// The slots of `active`, in container order, for the renderer.
@@ -1918,6 +2061,14 @@ impl Workspace {
     // this fn respects locked container indexes - we should use it for pretty much everything
     // except monocle and maximize toggles
     pub fn remove_container_by_idx(&mut self, idx: usize) -> Option<Container> {
+        // Planned here, while the departing slot is still in the map and can still be seen by the
+        // neighbours which are going to take it.
+        let departure = self
+            .containers()
+            .get(idx)
+            .map(|container| container.id.clone())
+            .map(|id| (self.plan_departure(&id), id));
+
         let container = self.containers_mut().remove_respecting_locks(idx);
 
         if idx < self.resize_dimensions.len() {
@@ -1926,6 +2077,14 @@ impl Workspace {
 
         if let Some(container) = &container {
             self.forget_container(container);
+        }
+
+        // Applied only now: the arrangement fingerprint contains the container list, so adopting
+        // the edited slots before the container had left would adopt a list it is still in.
+        if container.is_some()
+            && let Some((departure, id)) = departure
+        {
+            self.apply_departure(&id, departure);
         }
 
         container
@@ -1938,6 +2097,7 @@ impl Workspace {
     fn forget_container(&mut self, container: &Container) {
         self.container_focus_history.remove(&container.id);
         self.logical_slots.remove(&container.id);
+        self.hidden_slot_restores.remove(&container.id);
 
         // The monocle reference points into the ring, so a container leaving the ring must take
         // the reference with it or the workspace would stay stuck in monocle mode with nothing
@@ -1970,6 +2130,11 @@ impl Workspace {
             .container_idx_for_window(hwnd)
             .ok_or_eyre("there is no window")?;
 
+        // Planned before the window is taken out. Removing a window cannot change which neighbours
+        // border this container's slot, so the answer is the same whether or not the container
+        // turns out to be emptied by it.
+        let expansion = self.expansion_focus_target(container_idx);
+
         let container = self
             .containers_mut()
             .get_mut(container_idx)
@@ -1987,7 +2152,7 @@ impl Workspace {
 
         if container.windows().is_empty() {
             self.remove_container_by_idx(container_idx);
-            self.focus_previous_container();
+            self.focus_after_removal(expansion);
         } else {
             container.load_focused_window();
             if let Some(window) = container.focused_window() {
@@ -2020,6 +2185,9 @@ impl Workspace {
         let container_idx = self
             .container_idx_for_window(hwnd)
             .ok_or_eyre("there is no window")?;
+
+        let expansion = self.expansion_focus_target(container_idx);
+
         let container = self
             .containers_mut()
             .get_mut(container_idx)
@@ -2034,7 +2202,7 @@ impl Workspace {
 
         if container.windows().is_empty() {
             self.remove_container_by_idx(container_idx);
-            self.focus_previous_container();
+            self.focus_after_removal(expansion);
         } else {
             container.load_focused_window();
         }
@@ -2067,15 +2235,17 @@ impl Workspace {
 
     pub fn remove_focused_container(&mut self) -> Option<Container> {
         let focused_idx = self.focused_container_idx();
+        let expansion = self.expansion_focus_target(focused_idx);
         let container = self.remove_container_by_idx(focused_idx);
-        self.focus_previous_container();
+        self.focus_after_removal(expansion);
 
         container
     }
 
     pub fn remove_container(&mut self, idx: usize) -> Option<Container> {
+        let expansion = self.expansion_focus_target(idx);
         let container = self.remove_container_by_idx(idx);
-        self.focus_previous_container();
+        self.focus_after_removal(expansion);
 
         container
     }
@@ -4241,6 +4411,246 @@ mod tests {
 
         assert_eq!(migrated.logical_slots, LogicalSlots::default());
         assert_eq!(migrated.logical_work_area, None);
+    }
+
+    fn slot_map(workspace: &Workspace) -> HashMap<ContainerId, LogicalRect> {
+        workspace
+            .logical_slots
+            .iter()
+            .map(|(id, slot)| (id.clone(), *slot))
+            .collect()
+    }
+
+    /// The number of edges which differ between two rectangles.
+    ///
+    /// An expansion may only ever move one of them: moving two would mean a container had changed
+    /// both its width and its height to take a rectangular slot, which it can only do by opening a
+    /// hole somewhere else.
+    fn edges_moved(before: LogicalRect, after: LogicalRect) -> usize {
+        usize::from(before.left != after.left)
+            + usize::from(before.top != after.top)
+            + usize::from(before.right() != after.right())
+            + usize::from(before.bottom() != after.bottom())
+    }
+
+    #[test]
+    fn deleting_a_container_gives_its_slot_to_its_neighbours() {
+        let mut workspace = workspace_with_containers(&[1, 1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        let before = slot_map(&workspace);
+        let deleted = workspace.containers()[1].id.clone();
+
+        workspace.remove_container(1);
+
+        assert!(!workspace.logical_slots.contains(&deleted));
+        assert!(
+            workspace
+                .logical_slots
+                .validate_coverage(LogicalRect::from(area))
+                .is_ok()
+        );
+
+        // The freed area went to neighbours rather than being redistributed by a fresh layout, so
+        // every container which changed at all changed exactly one of its edges.
+        let after = slot_map(&workspace);
+        let mut grew = 0;
+
+        for (id, slot) in &after {
+            let was = before[id];
+
+            if was != *slot {
+                assert_eq!(edges_moved(was, *slot), 1, "{id} moved more than one edge");
+                assert!(slot.area() > was.area(), "{id} did not grow");
+                grew += 1;
+            }
+        }
+
+        assert!(grew > 0, "nothing expanded over the deleted slot");
+    }
+
+    #[test]
+    fn every_neighbour_on_a_complete_edge_expands_together() {
+        let mut workspace = workspace_with_containers(&[1, 1, 1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        let before = slot_map(&workspace);
+        let deleted = workspace.containers()[1].id.clone();
+        let freed = before[&deleted];
+
+        workspace.remove_container(1);
+
+        let after = slot_map(&workspace);
+        let grown: Vec<_> = after
+            .iter()
+            .filter(|(id, slot)| before[*id] != **slot)
+            .collect();
+
+        // A four-container arrangement puts two containers on the complete edge of this one, so
+        // this exercises the multi-neighbour case rather than the single-neighbour one.
+        assert!(
+            grown.len() > 1,
+            "expected several neighbours to share the freed slot, got {}",
+            grown.len()
+        );
+
+        // Together they took exactly the freed slot: no more, and nothing from anyone else.
+        let gained: i64 = grown
+            .iter()
+            .map(|(id, slot)| slot.area() - before[*id].area())
+            .sum();
+
+        assert_eq!(gained, freed.area());
+
+        for (id, slot) in &grown {
+            assert_eq!(edges_moved(before[*id], **slot), 1, "{id}");
+        }
+
+        assert!(
+            workspace
+                .logical_slots
+                .validate_coverage(LogicalRect::from(area))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_deletion_leaves_the_containers_it_did_not_touch_alone() {
+        let mut workspace = workspace_with_containers(&[1, 1, 1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        let before = slot_map(&workspace);
+        let deleted = workspace.containers()[1].id.clone();
+
+        workspace.remove_container(1);
+
+        // A relayout would have moved every container. At least one which is not on the freed
+        // slot's absorbing edge must still hold precisely the rectangle it had.
+        let after = slot_map(&workspace);
+        let unchanged = before
+            .keys()
+            .filter(|id| **id != deleted)
+            .filter(|id| after.get(*id) == Some(&before[*id]))
+            .count();
+
+        assert!(unchanged > 0, "the whole workspace was relaid out");
+        assert!(!workspace.relayout_pending);
+    }
+
+    #[test]
+    fn deleting_the_last_active_container_leaves_no_active_slot() {
+        let mut workspace = workspace_with_containers(&[1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        workspace.remove_container(0);
+        workspace.record_logical_slots(area);
+
+        assert!(workspace.logical_slots.is_empty());
+        assert!(workspace.hidden_slot_restores.is_empty());
+    }
+
+    #[test]
+    fn deleting_a_hidden_container_does_not_disturb_the_arrangement() {
+        let mut workspace = workspace_with_containers(&[1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        hide_container(&mut workspace, 1);
+        workspace.record_logical_slots(area);
+
+        let hidden = workspace.containers()[1].id.clone();
+        let before = slot_map(&workspace);
+
+        assert!(workspace.hidden_slot_restores.contains_key(&hidden));
+
+        workspace.remove_container(1);
+
+        // A hidden container holds no slot, so there is nothing to expand over and nothing to
+        // recalculate; its restore record leaves with it.
+        assert_eq!(slot_map(&workspace), before);
+        assert!(!workspace.hidden_slot_restores.contains_key(&hidden));
+        assert!(!workspace.relayout_pending);
+    }
+
+    #[test]
+    fn deleting_an_absorber_makes_the_restore_it_holds_inexact() {
+        let mut workspace = workspace_with_containers(&[1, 1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        hide_container(&mut workspace, 2);
+        workspace.record_logical_slots(area);
+
+        let hidden = workspace.containers()[2].id.clone();
+        let absorber = workspace.hidden_slot_restores[&hidden].absorbers[0].clone();
+        let absorber_idx = workspace.container_idx_for_id(&absorber).unwrap();
+
+        assert!(workspace.hidden_slot_restores[&hidden].exact_restore_valid);
+
+        workspace.remove_container(absorber_idx);
+
+        // The record promised that this absorber still held exactly what the absorption gave it.
+        // It no longer holds anything at all, so the promise is broken and the hidden container has
+        // to come back through a recalculation instead of an exact reverse.
+        let record = &workspace.hidden_slot_restores[&hidden];
+        assert!(!record.exact_restore_valid);
+        assert!(record.old_rect.area() > 0);
+    }
+
+    #[test]
+    fn focus_moves_to_the_first_container_which_expanded() {
+        let mut workspace = workspace_with_containers(&[1, 1, 1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        let expected = workspace.expansion_focus_target(1).unwrap();
+        let before = slot_map(&workspace);
+
+        workspace.remove_container(1);
+
+        let focused = workspace.containers()[workspace.focused_container_idx()]
+            .id
+            .clone();
+
+        assert_eq!(focused, expected);
+        assert_ne!(
+            workspace.logical_slots.get(&expected),
+            Some(before[&expected])
+        );
+        assert_eq!(
+            workspace.container_focus_history.most_recent(),
+            Some(&expected)
+        );
+    }
+
+    #[test]
+    fn focus_after_a_deletion_never_lands_on_a_minimized_window() {
+        let mut workspace = workspace_with_containers(&[1, 2, 1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        let recipient = workspace.expansion_focus_target(0).unwrap();
+        let recipient_idx = workspace.container_idx_for_id(&recipient).unwrap();
+
+        // Minimize whichever window the recipient is currently showing.
+        let top = workspace.containers()[recipient_idx]
+            .focused_window()
+            .unwrap()
+            .hwnd;
+        workspace.minimize_window(top).unwrap();
+
+        workspace.remove_container(0);
+
+        let idx = workspace.focused_container_idx();
+        assert_eq!(workspace.containers()[idx].id, recipient);
+
+        if let Some(window) = workspace.containers()[idx].focused_managed_window() {
+            assert_eq!(window.visibility, Visibility::Visible);
+        }
     }
 
     fn workspace_with_containers(counts: &[usize]) -> Workspace {
