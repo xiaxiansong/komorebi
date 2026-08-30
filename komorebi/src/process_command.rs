@@ -1165,7 +1165,7 @@ impl WindowManager {
                         && monitor.workspaces().len() > 1
                         && workspace.containers().is_empty()
                         && workspace.floating_windows().is_empty()
-                        && workspace.monocle_container.is_none()
+                        && workspace.monocle_container().is_none()
                         && workspace.name.is_none()
                     {
                         can_close = true;
@@ -1306,22 +1306,17 @@ impl WindowManager {
                             focused_window.raise()?;
                         }
 
+                        // The monocle container is one of these, so it is lowered here too.
                         for container in workspace.containers() {
                             if let Some(window) = container.focused_window() {
                                 window.lower()?;
                             }
                         }
-
-                        if let Some(monocle) = &workspace.monocle_container
-                            && let Some(window) = monocle.focused_window()
-                        {
-                            window.lower()?;
-                        }
                     }
                     WorkspaceLayer::Floating => {
                         workspace.layer = WorkspaceLayer::Tiling;
 
-                        if let Some(monocle) = &workspace.monocle_container {
+                        if let Some(monocle) = workspace.monocle_container() {
                             if let Some(window) = monocle.focused_window() {
                                 to_focus = Some(*window);
                                 window.raise()?;

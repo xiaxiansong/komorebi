@@ -133,7 +133,7 @@ pub fn handle_notifications(wm: Arc<Mutex<WindowManager>>) -> color_eyre::Result
                     WindowsApi::is_zoomed(WindowsApi::foreground_window().unwrap_or_default());
 
                 // Handle the monocle container separately
-                if ws.monocle_container.is_some() || is_maximized {
+                if ws.monocle_container().is_some() || is_maximized {
                     // Destroy any stackbars associated with the focused workspace
                     let mut to_remove = vec![];
                     for (id, stackbar) in stackbars.iter() {

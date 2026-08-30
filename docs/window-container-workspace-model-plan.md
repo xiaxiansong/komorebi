@@ -567,18 +567,63 @@ passed.
 
 #### Phase 5D-2 - Monocle is a workspace reference, not workspace storage
 
-- [ ] Replace `monocle_container`/`monocle_container_restore_idx` with a `ContainerId` reference to
+- [x] Replace `monocle_container`/`monocle_container_restore_idx` with a `ContainerId` reference to
   a container which stays in the workspace ring.
-- [ ] Make monocle a slot-authority decision rather than a removal, preserving container ID, stack
+- [x] Make monocle a slot-authority decision rather than a removal, preserving container ID, stack
   order and both histories.
-- [ ] Remove the transitional debt clause from the validator.
-- [ ] Add monocle ownership, cycle, reintegration and idempotency tests.
-- [ ] Commit as `feat: make monocle a container reference`.
+- [x] Remove the transitional debt clause from the validator.
+- [x] Add monocle ownership, cycle, reintegration and idempotency tests.
+- [x] Commit as `feat: make monocle a container reference`.
 
 Expected handwritten change: 350-500 lines. Likely files: `workspace.rs`, `window_manager.rs`,
 `process_event.rs`, `process_command.rs`, `monitor.rs`, `monitor_reconciliator/mod.rs`,
 `border_manager/mod.rs`, `transparency_manager.rs`, `stackbar_manager/mod.rs`, `state.rs`,
 `komorebi-bar/src/widgets/komorebi.rs`.
+
+Actual files: every predicted file except `invariants.rs`, which was not predicted and had to
+change because this is the phase that removes the transitional debt clause. Actual Rust change:
+446 added, 372 removed, roughly half of it tests.
+
+`monocle_container_id: Option<ContainerId>` is the whole storage change. `monocle_container()`,
+`monocle_container_mut()`, `monocle_container_idx()` and `is_monocle()` resolve it against the
+ring, so a reference which no longer resolves degrades to "not in monocle mode" instead of
+producing a container the workspace does not own. `new_monocle_container` and
+`reintegrate_monocle_container` now only set and clear that reference and reload the container's
+focused window; neither moves a container in or out of the ring, so a monocle toggle can no longer
+change a container ID, lose a stack, drop a resize adjustment or renumber locked containers.
+
+Because the monocle container is an ordinary ring container, five places which had to handle it
+separately were handling it twice: the `exe()` sweep and the `known_hwnds` scan in
+`window_manager.rs`, the two accent sweeps, the three monitor-reconciliation sweeps, the lower
+pass in the tiling layer, and the bar's container listing. All of them were removed in favour of
+the container loop that already covers it. The monocle branch in `move_window_to_monitor` became
+unreachable for the same reason and was removed with the maximized branch Phase 5D-1 had already
+left dead; `transfer_container` moves the monocle container through the ordinary path, and
+`forget_container` takes the reference with it.
+
+Two behaviours are deliberately narrowed rather than preserved. `Workspace::visible_windows` and
+`visible_window_details` now return the monocle container alone while monocle is on, because the
+other containers are hidden; previously the monocle window was an extra entry in front of an
+arrangement that was not on screen. And `hide_containers_around_monocle` replaces "hide every
+container", which would now hide the container monocle is meant to be showing.
+
+`prune_monocle_reference` closes the one path where containers leave the ring in bulk rather than
+through `remove_container_by_idx`: the empty-container retain at the top of `Workspace::update`,
+and `prune_histories` for imported state.
+
+The validator no longer tolerates any alternate ownership. The clause is replaced by the rule
+that a monocle reference must resolve to a container the workspace owns, which is the only way
+the reference can now be wrong.
+
+Old runtime-state JSON carrying `monocle_container` and `monocle_container_restore_idx`
+deserializes with those fields ignored rather than migrated, matching the Phase 5B and 5D-1
+precedents. `StaticConfig` is unaffected.
+
+Verification: `cargo test --workspace -- --test-threads=1` passed with komorebi 245 passed/1
+ignored (up from 236), layouts 128, bar 3, all other targets and doc-tests passed. `cargo fmt
+--check` clean; `cargo clippy --workspace --all-targets` reported only the pre-existing upstream
+warning; `cargo check --workspace --all-targets` and `cargo check -p komorebi --features schemars`
+passed.
 
 #### Phase 5D-3 - Fullscreen distinct from maximize
 

@@ -240,7 +240,7 @@ pub fn handle_notifications(wm: Arc<Mutex<WindowManager>>) -> color_eyre::Result
                     // Only operate on the focused workspace of each monitor
                     if let Some(ws) = m.focused_workspace() {
                         // Handle the monocle container separately
-                        if let Some(monocle) = &ws.monocle_container {
+                        if let Some(monocle) = ws.monocle_container() {
                             let window_kind = if monitor_idx != focused_monitor_idx {
                                 WindowKind::Unfocused
                             } else {
@@ -408,7 +408,7 @@ pub fn handle_notifications(wm: Arc<Mutex<WindowManager>>) -> color_eyre::Result
                         }
 
                         // Handle the monocle container separately
-                        if let Some(monocle) = &ws.monocle_container {
+                        if let Some(monocle) = ws.monocle_container() {
                             let mut new_border = false;
                             let focused_window_hwnd =
                                 monocle.focused_window().map(|w| w.hwnd).unwrap_or_default();

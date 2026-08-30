@@ -553,7 +553,7 @@ impl WindowManager {
                             return Ok(());
                         }
 
-                        if let Some(monocle) = &workspace.monocle_container {
+                        if let Some(monocle) = workspace.monocle_container() {
                             if let Some(window) = monocle.focused_window() {
                                 window.focus(false)?;
                             }
@@ -659,7 +659,7 @@ impl WindowManager {
                         );
                         let workspace = self.focused_workspace_mut()?;
                         let workspace_contains_window = workspace.contains_window(window.hwnd);
-                        let monocle_container = workspace.monocle_container.clone();
+                        let monocle_container = workspace.monocle_container().cloned();
 
                         if !workspace_contains_window && needs_reconciliation.is_none() {
                             let floating_applications = FLOATING_APPLICATIONS.lock();
@@ -1075,7 +1075,7 @@ impl WindowManager {
                     .and_then(|m| m.workspaces().get(*ws_idx))
                 {
                     if let Some(monocle_with_window) = target_workspace
-                        .monocle_container
+                        .monocle_container()
                         .as_ref()
                         .and_then(|m| m.contains_window(window.hwnd).then_some(m))
                     {
@@ -1130,8 +1130,7 @@ impl WindowManager {
             if let Some(workspace) = monitor.focused_workspace_mut() {
                 let mut layer = WorkspaceLayer::Tiling;
                 if let Some((monocle, idx)) = workspace
-                    .monocle_container
-                    .as_mut()
+                    .monocle_container_mut()
                     .and_then(|m| m.idx_for_window(window.hwnd).map(|i| (m, i)))
                 {
                     monocle.focus_window(idx);
@@ -1145,7 +1144,7 @@ impl WindowManager {
                     // If the window is the maximized window do nothing, else we
                     // reintegrate the monocle if it exists and then focus the
                     // container
-                    if workspace.monocle_container.is_some() {
+                    if workspace.monocle_container().is_some() {
                         tracing::info!("disabling monocle");
                         for container in workspace.containers_mut() {
                             container.restore();

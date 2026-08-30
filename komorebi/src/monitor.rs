@@ -440,7 +440,7 @@ impl Monitor {
                 Some(workspace) => workspace,
             };
 
-            if target_workspace.monocle_container.is_some() {
+            if target_workspace.monocle_container().is_some() {
                 for container in target_workspace.containers_mut() {
                     container.restore();
                 }

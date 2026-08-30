@@ -210,23 +210,22 @@ impl ValidateInvariants for Workspace {
             ));
         }
 
-        // Alternate ownership through the monocle container is transitional: those windows are
-        // removed from the model while they are held there. Holding the same window in both
-        // places is still a defect. Floating and maximized windows are not listed here any more,
-        // because they are owned by a container like every other managed window.
-        let mut alternate = Vec::new();
-
-        if let Some(container) = &self.monocle_container {
-            alternate.extend(container.windows().iter().map(|window| window.hwnd));
-        }
-
-        for hwnd in alternate {
-            if owners.contains_key(&hwnd) {
-                violations.push(InvariantViolation::new(
-                    Invariant::WindowOwnership,
-                    format!("window {hwnd} is held by a container and by workspace {id}"),
-                ));
-            }
+        // There is no alternate ownership left to tolerate. Every managed window of this
+        // workspace is owned by a container in the ring, and monocle is a reference into that
+        // ring rather than a second place a container can live. A reference which no longer
+        // resolves is the remaining defect worth reporting.
+        if let Some(monocle_id) = &self.monocle_container_id
+            && !self
+                .containers()
+                .iter()
+                .any(|container| &container.id == monocle_id)
+        {
+            violations.push(InvariantViolation::new(
+                Invariant::HistoryIntegrity,
+                format!(
+                    "workspace {id} shows monocle container {monocle_id}, which it does not own"
+                ),
+            ));
         }
 
         let mut ids = HashSet::new();
@@ -395,6 +394,7 @@ mod tests {
     use crate::Window;
     use crate::core::Rect;
     use crate::managed_window::ManagedWindow;
+    use crate::model::ContainerId;
 
     fn container_with(hwnds: &[isize]) -> Container {
         let mut container = Container::default();
@@ -472,15 +472,24 @@ mod tests {
     }
 
     #[test]
-    fn a_window_held_by_a_container_and_by_the_workspace_is_reported() {
+    fn a_monocle_reference_to_a_container_the_workspace_lost_is_reported() {
         let mut workspace = workspace_with(vec![container_with(&[1])]);
-        // The monocle container is the remaining transitional ownership path.
-        workspace.monocle_container = Some(container_with(&[1]));
+        workspace.monocle_container_id = Some(ContainerId::from("gone"));
 
         assert_eq!(
             invariants(&workspace.validate_invariants()),
-            vec![Invariant::WindowOwnership]
+            vec![Invariant::HistoryIntegrity]
         );
+    }
+
+    #[test]
+    fn a_monocle_container_is_not_alternate_ownership() {
+        let mut workspace = workspace_with(vec![container_with(&[1]), container_with(&[2])]);
+        workspace.new_monocle_container().unwrap();
+
+        assert!(workspace.is_monocle());
+        assert_eq!(workspace.containers().len(), 2);
+        assert!(workspace.validate_invariants().is_empty());
     }
 
     #[test]

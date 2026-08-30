@@ -512,14 +512,6 @@ where
                                         }
                                     }
 
-                                    // Restore monocle container
-                                    if let Some(container) = &workspace.monocle_container
-                                        && let Some(window) = container.focused_window()
-                                        && WindowsApi::is_window(window.hwnd)
-                                    {
-                                        WindowsApi::restore_window(window.hwnd);
-                                    }
-
                                     // Restore floating windows
                                     for window in workspace.floating_windows() {
                                         if WindowsApi::is_window(window.hwnd) {
@@ -621,19 +613,6 @@ where
                                             if window.is_focused() {
                                                 window.minimize();
                                             }
-                                        }
-                                    }
-                                }
-
-                                if let Some(container) = &workspace.monocle_container {
-                                    for window in container.windows() {
-                                        windows_to_remove.push(window.hwnd);
-                                    }
-                                    if let Some(window) = container.focused_window() {
-                                        // Minimize the focused window since Windows might try
-                                        // to move it to another monitor if it was focused.
-                                        if window.is_focused() {
-                                            window.minimize();
                                         }
                                     }
                                 }
@@ -835,34 +814,6 @@ where
                                             workspace.remove_container(empty_idx);
                                         } else {
                                             workspace.remove_container_by_idx(empty_idx);
-                                        }
-                                    }
-
-                                    if let Some(container) = &mut workspace.monocle_container {
-                                        container.windows_mut().retain(|window| {
-                                            window.exe().is_ok()
-                                                && !known_hwnds.contains_key(&window.hwnd)
-                                        });
-
-                                        if container.windows().is_empty() {
-                                            workspace.monocle_container = None;
-                                        } else if is_focused_workspace {
-                                            if let Some(window) = container.focused_window()
-                                                && WindowsApi::is_window(window.hwnd)
-                                            {
-                                                WindowsApi::restore_window(window.hwnd);
-                                            } else {
-                                                // If the focused window was moved or removed by
-                                                // the user after the disconnect then focus the
-                                                // first window and show that one
-                                                container.focus_window(0);
-
-                                                if let Some(window) = container.focused_window()
-                                                    && WindowsApi::is_window(window.hwnd)
-                                                {
-                                                    WindowsApi::restore_window(window.hwnd);
-                                                }
-                                            }
                                         }
                                     }
 

@@ -214,15 +214,6 @@ impl WindowManager {
                     }
                 }
 
-                if let Some(container) = &workspace.monocle_container {
-                    for window in container.windows() {
-                        if window.exe().is_err() {
-                            can_apply = false;
-                            break;
-                        }
-                    }
-                }
-
                 for window in workspace.floating_windows() {
                     if window.exe().is_err() {
                         can_apply = false;
@@ -1084,49 +1075,11 @@ impl WindowManager {
 
                 target_workspace.adopt_managed_window(floating_window);
             }
-        } else if origin_workspace
-            .monocle_container
-            .as_ref()
-            .and_then(|monocle| monocle.focused_window().map(|w| w.hwnd == w_hwnd))
-            .unwrap_or_default()
-        {
-            // Moving monocle container
-            if let Some(monocle_idx) = origin_workspace.monocle_container_restore_idx {
-                let origin_workspace = self
-                    .monitors_mut()
-                    .get_mut(origin_monitor_idx)
-                    .ok_or_eyre("there is no monitor at this idx")?
-                    .workspaces_mut()
-                    .get_mut(origin_workspace_idx)
-                    .ok_or_eyre("there is no workspace for this monitor")?;
-                let mut uncloack_amount = 0;
-                for container in origin_workspace.containers_mut() {
-                    container.restore();
-                    uncloack_amount += 1;
-                }
-                origin_workspace.reintegrate_monocle_container()?;
-
-                self.transfer_container(
-                    (origin_monitor_idx, origin_workspace_idx, monocle_idx),
-                    (
-                        target_monitor_idx,
-                        target_workspace_idx,
-                        target_container_idx,
-                    ),
-                )?;
-                // After we restore the origin workspace, some windows that were cloacked
-                // by the monocle might now be uncloacked which would trigger a workspace
-                // reconciliation since the focused monitor would be different from origin.
-                // That workspace reconciliation would focus the window on the origin monitor.
-                // So we need to ignore the uncloak events produced by the origin workspace
-                // restore to avoid that issue.
-                self.uncloack_to_ignore = uncloack_amount;
-            }
         }
 
-        // There is no separate maximized-window branch any more. A maximized window is owned by a
-        // container like every other managed window, so the first branch above already moves it,
-        // and its presentation travels with it.
+        // There are no separate monocle and maximized branches any more. Both are owned by a
+        // container in the ring like every other managed window, so the first branch above
+        // already moves them, and the presentation travels with the window.
         Ok(())
     }
 
@@ -1260,7 +1213,7 @@ impl WindowManager {
                 if trigger_focus {
                     window.focus(self.mouse_follows_focus)?;
                 }
-            } else if let Some(container) = &self.focused_workspace()?.monocle_container {
+            } else if let Some(container) = self.focused_workspace()?.monocle_container() {
                 if let Some(window) = container.focused_window()
                     && trigger_focus
                 {
@@ -1302,7 +1255,7 @@ impl WindowManager {
                     // and we don't have a maxed window
                     && self.focused_workspace()?.maximized_window().is_none()
                     // and we don't have a monocle container
-                    && self.focused_workspace()?.monocle_container.is_none()
+                    && self.focused_workspace()?.monocle_container().is_none()
                     // and we don't have any floating windows that should show on top
                     && self.focused_workspace()?.floating_windows().is_empty()
                     && let Ok(window) = self.focused_window_mut()
@@ -1542,14 +1495,7 @@ impl WindowManager {
 
         for monitor in self.monitors_mut() {
             for workspace in monitor.workspaces_mut() {
-                if let Some(monocle) = &workspace.monocle_container {
-                    for window in monocle.windows() {
-                        if matches!(border_implementation, BorderImplementation::Windows) {
-                            window.remove_accent()?;
-                        }
-                    }
-                }
-
+                // The monocle container is one of these, so it is swept here too.
                 for containers in workspace.containers_mut() {
                     for window in containers.windows_mut() {
                         let should_remove_titlebar_for_window = should_act(
@@ -1591,12 +1537,7 @@ impl WindowManager {
 
         for monitor in self.monitors() {
             for workspace in monitor.workspaces() {
-                if let Some(monocle) = &workspace.monocle_container {
-                    for window in monocle.windows() {
-                        window.remove_accent()?
-                    }
-                }
-
+                // The monocle container is one of these, so it is swept here too.
                 for containers in workspace.containers() {
                     for window in containers.windows() {
                         window.remove_accent()?;
@@ -1810,7 +1751,7 @@ impl WindowManager {
             .focused_workspace_mut()
             .ok_or_eyre("there is no focused workspace on target monitor")?;
 
-        if target_workspace.monocle_container.is_some() {
+        if target_workspace.monocle_container().is_some() {
             for container in target_workspace.containers_mut() {
                 container.restore();
             }
@@ -2082,7 +2023,7 @@ impl WindowManager {
             self.focus_workspace(next_idx)?;
 
             if let Ok(focused_workspace) = self.focused_workspace_mut()
-                && focused_workspace.monocle_container.is_none()
+                && focused_workspace.monocle_container().is_none()
             {
                 match direction {
                     OperationDirection::Left => match focused_workspace.layout {
@@ -2132,7 +2073,7 @@ impl WindowManager {
             if let Some(window) = focused_workspace.maximized_window() {
                 window.focus(mouse_follows_focus)?;
                 cross_monitor_monocle_or_max = true;
-            } else if let Some(monocle) = &focused_workspace.monocle_container {
+            } else if let Some(monocle) = focused_workspace.monocle_container() {
                 if let Some(window) = monocle.focused_window() {
                     window.focus(mouse_follows_focus)?;
                     cross_monitor_monocle_or_max = true;
@@ -2215,7 +2156,7 @@ impl WindowManager {
         tracing::info!("preselecting container");
 
         let new_idx =
-            if workspace.maximized_window().is_some() || workspace.monocle_container.is_some() {
+            if workspace.maximized_window().is_some() || workspace.monocle_container().is_some() {
                 None
             } else {
                 workspace.new_idx_for_direction(direction)
@@ -2258,7 +2199,7 @@ impl WindowManager {
 
         tracing::info!("focusing container");
 
-        if workspace.monocle_container.is_some()
+        if workspace.monocle_container().is_some()
             && matches!(self.monocle_focus_behaviour, MonocleFocusBehaviour::Cycle)
         {
             let cycle_direction = match direction {
@@ -2269,7 +2210,7 @@ impl WindowManager {
         }
 
         let new_idx =
-            if workspace.maximized_window().is_some() || workspace.monocle_container.is_some() {
+            if workspace.maximized_window().is_some() || workspace.monocle_container().is_some() {
                 None
             } else {
                 workspace.new_idx_for_direction(direction)
@@ -2309,7 +2250,7 @@ impl WindowManager {
             self.focus_workspace(next_idx)?;
 
             if let Ok(focused_workspace) = self.focused_workspace_mut()
-                && focused_workspace.monocle_container.is_none()
+                && focused_workspace.monocle_container().is_none()
             {
                 match direction {
                     OperationDirection::Left => match focused_workspace.layout {
@@ -2361,7 +2302,7 @@ impl WindowManager {
                     if let Some(window) = focused_workspace.maximized_window() {
                         window.focus(mouse_follows_focus)?;
                         cross_monitor_monocle_or_max = true;
-                    } else if let Some(monocle) = &focused_workspace.monocle_container {
+                    } else if let Some(monocle) = focused_workspace.monocle_container() {
                         if let Some(window) = monocle.focused_window() {
                             window.focus(mouse_follows_focus)?;
                             cross_monitor_monocle_or_max = true;
@@ -2598,7 +2539,7 @@ impl WindowManager {
                     // unset monocle container on target workspace if there is one
                     let mut target_workspace_has_monocle = false;
                     if let Ok(target_workspace) = self.focused_workspace()
-                        && target_workspace.monocle_container.is_some()
+                        && target_workspace.monocle_container().is_some()
                     {
                         target_workspace_has_monocle = true;
                     }
@@ -2752,7 +2693,7 @@ impl WindowManager {
             self.unmaximize_window()?;
         }
 
-        if self.focused_workspace_mut()?.monocle_container.is_some() {
+        if self.focused_workspace_mut()?.monocle_container().is_some() {
             monocle_next = true;
             self.monocle_off()?;
         }
@@ -2809,12 +2750,13 @@ impl WindowManager {
 
         tracing::info!("cycling container windows");
 
-        let container =
-            if let Some(container) = &mut self.focused_workspace_mut()?.monocle_container {
-                container
-            } else {
-                self.focused_container_mut()?
-            };
+        let container = if self.focused_workspace()?.is_monocle() {
+            self.focused_workspace_mut()?
+                .monocle_container_mut()
+                .ok_or_eyre("there is no monocle container")?
+        } else {
+            self.focused_container_mut()?
+        };
 
         let len = NonZeroUsize::new(container.windows().len())
             .ok_or_eyre("there must be at least one window in a container")?;
@@ -2845,12 +2787,13 @@ impl WindowManager {
 
         tracing::info!("cycling container window index");
 
-        let container =
-            if let Some(container) = &mut self.focused_workspace_mut()?.monocle_container {
-                container
-            } else {
-                self.focused_container_mut()?
-            };
+        let container = if self.focused_workspace()?.is_monocle() {
+            self.focused_workspace_mut()?
+                .monocle_container_mut()
+                .ok_or_eyre("there is no monocle container")?
+        } else {
+            self.focused_container_mut()?
+        };
 
         let len = NonZeroUsize::new(container.windows().len())
             .ok_or_eyre("there must be at least one window in a container")?;
@@ -2878,12 +2821,13 @@ impl WindowManager {
 
         tracing::info!("focusing container window at index {idx}");
 
-        let container =
-            if let Some(container) = &mut self.focused_workspace_mut()?.monocle_container {
-                container
-            } else {
-                self.focused_container_mut()?
-            };
+        let container = if self.focused_workspace()?.is_monocle() {
+            self.focused_workspace_mut()?
+                .monocle_container_mut()
+                .ok_or_eyre("there is no monocle container")?
+        } else {
+            self.focused_container_mut()?
+        };
 
         let len = NonZeroUsize::new(container.windows().len())
             .ok_or_eyre("there must be at least one window in a container")?;
@@ -3155,7 +3099,7 @@ impl WindowManager {
     pub fn toggle_float(&mut self, force_float: bool) -> eyre::Result<()> {
         let hwnd = WindowsApi::foreground_window()?;
         let workspace = self.focused_workspace_mut()?;
-        if workspace.monocle_container.is_some() {
+        if workspace.monocle_container().is_some() {
             tracing::warn!("ignoring toggle-float command while workspace has a monocle container");
             return Ok(());
         }
@@ -3232,7 +3176,7 @@ impl WindowManager {
         self.handle_unmanaged_window_behaviour()?;
 
         let workspace = self.focused_workspace()?;
-        match workspace.monocle_container {
+        match workspace.monocle_container() {
             None => self.monocle_on()?,
             Some(_) => self.monocle_off()?,
         }
@@ -3248,11 +3192,7 @@ impl WindowManager {
 
         let workspace = self.focused_workspace_mut()?;
         workspace.new_monocle_container()?;
-
-        // A container hides every window it owns, floating ones included.
-        for container in workspace.containers_mut() {
-            container.hide(None);
-        }
+        workspace.hide_containers_around_monocle();
 
         Ok(())
     }
@@ -3262,12 +3202,13 @@ impl WindowManager {
         tracing::info!("disabling monocle");
 
         let workspace = self.focused_workspace_mut()?;
+        workspace.reintegrate_monocle_container()?;
 
         for container in workspace.containers_mut() {
             container.restore();
         }
 
-        workspace.reintegrate_monocle_container()
+        Ok(())
     }
 
     #[tracing::instrument(skip(self))]
@@ -3278,12 +3219,9 @@ impl WindowManager {
             return Ok(());
         }
 
-        self.focused_workspace_mut()?
-            .cycle_monocle_container(direction)?;
-
-        for container in self.focused_workspace_mut()?.containers_mut() {
-            container.hide(None);
-        }
+        let workspace = self.focused_workspace_mut()?;
+        workspace.cycle_monocle_container(direction)?;
+        workspace.hide_containers_around_monocle();
 
         // borders were getting funny during cycles, can't be bothered to root cause it
         border_manager::destroy_all_borders()?;
@@ -4033,12 +3971,6 @@ impl WindowManager {
 
                 for window in workspace.floating_windows() {
                     known_hwnds.insert(window.hwnd, (m_idx, w_idx));
-                }
-
-                if let Some(container) = &workspace.monocle_container {
-                    for window in container.windows() {
-                        known_hwnds.insert(window.hwnd, (m_idx, w_idx));
-                    }
                 }
             }
         }
@@ -5992,21 +5924,12 @@ mod tests {
         wm.monocle_on().ok();
 
         {
-            // Container should be a monocle container
-            let monocle_container = wm
-                .focused_workspace()
-                .unwrap()
-                .monocle_container
-                .as_ref()
-                .unwrap();
+            // Container should be the monocle container, and it stays in the ring
+            let workspace = wm.focused_workspace().unwrap();
+            let monocle_container = workspace.monocle_container().unwrap();
             assert_eq!(monocle_container.windows().len(), 1);
             assert_eq!(monocle_container.windows()[0].hwnd, 1);
-        }
-
-        {
-            // Should not have any containers
-            let container = wm.focused_workspace().unwrap();
-            assert_eq!(container.containers().len(), 0);
+            assert_eq!(workspace.containers().len(), 1);
         }
 
         // Move monocle container to regular container
@@ -6020,9 +5943,10 @@ mod tests {
         }
 
         {
-            // No windows should be in the monocle container
-            let monocle_container = &wm.focused_workspace().unwrap().monocle_container;
-            assert_eq!(*monocle_container, None);
+            // The workspace is no longer in monocle mode
+            let workspace = wm.focused_workspace().unwrap();
+            assert!(workspace.monocle_container().is_none());
+            assert!(!workspace.is_monocle());
         }
     }
 
@@ -6098,21 +6022,12 @@ mod tests {
         wm.toggle_monocle().ok();
 
         {
-            // Container should be a monocle container
-            let monocle_container = wm
-                .focused_workspace()
-                .unwrap()
-                .monocle_container
-                .as_ref()
-                .unwrap();
+            // Container should be the monocle container, and it stays in the ring
+            let workspace = wm.focused_workspace().unwrap();
+            let monocle_container = workspace.monocle_container().unwrap();
             assert_eq!(monocle_container.windows().len(), 1);
             assert_eq!(monocle_container.windows()[0].hwnd, 1);
-        }
-
-        {
-            // Should not have any containers
-            let container = wm.focused_workspace().unwrap();
-            assert_eq!(container.containers().len(), 0);
+            assert_eq!(workspace.containers().len(), 1);
         }
 
         // Toggle monocle off
@@ -6126,9 +6041,10 @@ mod tests {
         }
 
         {
-            // No windows should be in the monocle container
-            let monocle_container = &wm.focused_workspace().unwrap().monocle_container;
-            assert_eq!(*monocle_container, None);
+            // The workspace is no longer in monocle mode
+            let workspace = wm.focused_workspace().unwrap();
+            assert!(workspace.monocle_container().is_none());
+            assert!(!workspace.is_monocle());
         }
     }
 

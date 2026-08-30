@@ -881,7 +881,7 @@ impl MonitorInfo {
 
     /// Determines the current layout of the focused workspace
     fn resolve_layout(focused_ws: &Workspace, is_paused: bool) -> KomorebiLayout {
-        if focused_ws.monocle_container.is_some() {
+        if focused_ws.monocle_container().is_some() {
             KomorebiLayout::Monocle
         } else if !focused_ws.tile {
             KomorebiLayout::Floating
@@ -944,16 +944,15 @@ impl ContainerInfo {
     pub fn from_all_containers(ws: &Workspace) -> Vec<Self> {
         let has_focused_float = ws.floating_windows().iter().any(|w| w.is_focused());
 
-        // Monocle container first if present
-        let monocle = ws
-            .monocle_container
-            .as_ref()
-            .map(|c| Self::from_container(c, !has_focused_float));
+        // A monocle container is an ordinary container of the ring which is shown alone, so while
+        // monocle is on it is the whole list rather than an extra entry in front of it.
+        if let Some(monocle) = ws.monocle_container() {
+            return vec![Self::from_container(monocle, !has_focused_float)];
+        }
 
-        // All tiled containers, focus only if there's no monocle/focused float
-        let has_focused_monocle_or_float = has_focused_float || monocle.is_some();
+        // All tiled containers, focus only if there's no focused float
         let tiled = ws.containers().iter().enumerate().map(|(i, c)| {
-            let is_focused = !has_focused_monocle_or_float && i == ws.focused_container_idx();
+            let is_focused = !has_focused_float && i == ws.focused_container_idx();
             Self::from_container(c, is_focused)
         });
 
@@ -961,7 +960,7 @@ impl ContainerInfo {
         let floating_windows = ws.floating_windows();
         let floats = floating_windows.iter().map(Self::from_window);
         // All windows
-        monocle.into_iter().chain(tiled).chain(floats).collect()
+        tiled.chain(floats).collect()
     }
 
     /// Creates a `ContainerInfo` for the currently focused item in the workspace.
@@ -978,7 +977,7 @@ impl ContainerInfo {
         {
             return Some(Self::from_window(window));
         }
-        if let Some(container) = &ws.monocle_container {
+        if let Some(container) = ws.monocle_container() {
             Some(Self::from_container(container, true))
         } else {
             ws.focused_container()
