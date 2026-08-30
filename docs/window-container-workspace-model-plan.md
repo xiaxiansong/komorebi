@@ -1698,3 +1698,23 @@ This list is updated from actual diffs, not treated as permission to change ever
   several minutes mid-turn and refused three commit attempts before recovering; staging the
   finished phase in the index kept the two phases separable while it was down. Next phase: 10,
   workspace ordering, deletion, merge and minimized restore.
+- 2026-08-30: Phase 10 turn. The plan was re-read and the worktree confirmed clean at `e1d47e78`
+  before editing, and `cargo check --workspace --all-targets` was re-run as the turn's baseline.
+  Phase 10 was split into 10A ordering, 10B merge and 10C wiring before coding. The phase's quiet
+  hazard was not the merge but the index-keyed tables: a workspace's identity is its `WorkspaceId`,
+  yet the configured names, the focused and last-focused indices and the global application routing
+  rules all describe workspaces by position, so both reordering and deleting return a permutation
+  and every such table is moved with it. Deleting needs two answers rather than one, which is why
+  `WorkspaceReorder` distinguishes what follows the workspace - its name, the fact that it was
+  focused - from what follows its windows: a merged workspace's routing rules point at the
+  workspace which absorbed them. 10C found a real atomicity defect through a test with unreal
+  window handles: the rules were being remapped after the retile, so a Win32 focus failure returned
+  early and left them pointing at a workspace which no longer existed; the model's own tables now
+  settle together, and only the desktop work may fail afterwards. 10C also closed the one gap left
+  in the minimized-restore path, which had never raised a restored window to the top of its stack.
+  Full serial workspace suite passed at every step (komorebi 386 -> 400 -> 406 passing).
+  Environment change worth recording: unlike every earlier phase, `cargo fmt` and `cargo clippy`
+  both run in this environment now; fmt warns that `imports_granularity` is nightly-only and skips
+  that option alone, and Clippy is clean apart from the pre-existing `items after a test module`
+  warning. Three tests were corrected after failing, each recorded in its phase. Next phase: 11,
+  cross-monitor container and workspace migration.
