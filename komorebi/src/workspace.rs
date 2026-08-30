@@ -2849,6 +2849,85 @@ impl Workspace {
         }
     }
 
+    /// Fold every container on this workspace into the first one.
+    ///
+    /// This is the shape komorebi is asked to open in: the desktop enumeration gives each window
+    /// it finds a container of its own, and adoption then wants one container holding all of them.
+    /// Nothing about a window changes but which container owns it - placement, visibility,
+    /// presentation and floating rectangle are the window's own state, not its container's.
+    ///
+    /// The stack reads the way the ring did. Each container arrives underneath what is already
+    /// there and hands its windows over from the top of its own stack downwards, so the first
+    /// container's windows end up on top and the order inside every container survives; the
+    /// enumeration lists the desktop front to back, which is what makes that the foreground
+    /// window's stack position.
+    ///
+    /// A locked container is left where it is, because its position is a decision the user made
+    /// and folding it away would silently discard it. A preselect container is an insertion marker
+    /// rather than a place windows live, so it is left alone as well.
+    ///
+    /// The windows do not leave the workspace, only the containers holding them do, so the
+    /// minimize history outlives them. Returns the container everything was folded into.
+    pub fn consolidate_containers(&mut self) -> Option<ContainerId> {
+        let target_idx = self
+            .containers()
+            .iter()
+            .position(|container| !container.locked && !container.is_preselect())?;
+
+        let target_id = self.containers()[target_idx].id.clone();
+
+        // A container leaving a workspace normally means its windows left too, which is what drops
+        // their minimize entries. Here only the container goes.
+        let minimize_history = self.minimize_history.clone();
+
+        let mut idx = target_idx + 1;
+        while idx < self.containers().len() {
+            let container = &self.containers()[idx];
+
+            if container.locked || container.is_preselect() {
+                idx += 1;
+                continue;
+            }
+
+            let Some(container) = self.remove_container_by_idx(idx) else {
+                break;
+            };
+
+            // Resolved again after every removal: the ring re-anchors locked containers when one
+            // is taken out, so the target's position is only guaranteed by its identity.
+            let Some(target) = self
+                .container_idx_for_id(&target_id)
+                .and_then(|idx| self.containers_mut().get_mut(idx))
+            else {
+                break;
+            };
+
+            for window in container.windows().iter().rev() {
+                target.receive_window_at_bottom(window.clone());
+            }
+        }
+
+        self.minimize_history = minimize_history;
+
+        // Manual boundaries describe an arrangement of containers which no longer exists.
+        self.resize_dimensions = vec![None; self.containers().len()];
+        self.invalidate_slot_geometry();
+
+        let target_idx = self.container_idx_for_id(&target_id)?;
+        self.focus_container(target_idx);
+
+        if let Some(hwnd) = self
+            .containers()
+            .get(target_idx)
+            .and_then(Container::focused_managed_window)
+            .map(|window| window.hwnd)
+        {
+            self.record_focused_window(hwnd);
+        }
+
+        Some(target_id)
+    }
+
     /// Carry every floating rectangle in this workspace from one work area to another.
     ///
     /// A workspace which changes monitor changes coordinate system, and a floating rectangle is
@@ -8513,6 +8592,163 @@ mod tests {
                 .unwrap()
                 .hwnd,
             expected_hwnd
+        );
+    }
+
+    /// The stack a fold produces, bottom to top.
+    fn stack_hwnds(workspace: &Workspace, idx: usize) -> Vec<isize> {
+        workspace.containers()[idx]
+            .windows()
+            .iter()
+            .map(|window| window.hwnd)
+            .collect()
+    }
+
+    #[test]
+    fn consolidating_folds_every_container_into_the_first() {
+        let mut workspace = workspace_with_hwnds(&[&[1, 2], &[3], &[4, 5]]);
+        let expected = container_ids(&workspace)[0].clone();
+
+        let target = workspace.consolidate_containers().unwrap();
+
+        assert_eq!(target, expected);
+        assert_eq!(workspace.containers().len(), 1);
+        assert_eq!(container_ids(&workspace), vec![expected.clone()]);
+        // Bottom to top: the last container is underneath, the first one on top, and the order
+        // inside each of them is unchanged.
+        assert_eq!(stack_hwnds(&workspace, 0), vec![4, 5, 3, 1, 2]);
+
+        for window in workspace.containers()[0].windows() {
+            assert_eq!(window.container_id, expected);
+        }
+
+        assert_eq!(
+            crate::invariants::ValidateInvariants::validate_invariants(&workspace),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn consolidating_goes_on_showing_the_first_container_s_window() {
+        let mut workspace = workspace_with_hwnds(&[&[1, 2], &[3], &[4, 5]]);
+
+        workspace.consolidate_containers().unwrap();
+
+        assert_eq!(
+            workspace.containers()[0]
+                .focused_managed_window()
+                .unwrap()
+                .hwnd,
+            2
+        );
+        assert_eq!(workspace.focused_container_idx(), 0);
+        assert_eq!(
+            workspace.container_focus_history.iter().next(),
+            Some(&workspace.containers()[0].id)
+        );
+    }
+
+    #[test]
+    fn consolidating_keeps_every_window_whole() {
+        let mut workspace = workspace_with_hwnds(&[&[1], &[2], &[3]]);
+        let rect = floating_rect(120);
+
+        workspace.float_window(2, rect).unwrap();
+        workspace.minimize_window(3).unwrap();
+
+        workspace.consolidate_containers().unwrap();
+
+        let floating = workspace.containers()[0]
+            .windows()
+            .iter()
+            .find(|window| window.hwnd == 2)
+            .unwrap();
+        assert_eq!(floating.placement, ManagedPlacement::Floating);
+        assert_eq!(floating.floating_rect, Some(rect));
+
+        let minimized = workspace.containers()[0]
+            .windows()
+            .iter()
+            .find(|window| window.hwnd == 3)
+            .unwrap();
+        assert_eq!(minimized.visibility, Visibility::Minimized);
+
+        // The windows never left the workspace, so its minimize history did not lose them either.
+        assert_eq!(
+            workspace
+                .minimize_history
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+    }
+
+    #[test]
+    fn consolidating_leaves_a_locked_container_alone() {
+        let mut workspace = workspace_with_hwnds(&[&[1], &[2], &[3]]);
+        let locked = container_ids(&workspace)[1].clone();
+        workspace.containers_mut()[1].locked = true;
+
+        let target = workspace.consolidate_containers().unwrap();
+
+        assert_eq!(workspace.containers().len(), 2);
+        assert_eq!(workspace.container_idx_for_id(&locked), Some(1));
+        assert_eq!(
+            stack_hwnds(&workspace, workspace.container_idx_for_id(&target).unwrap()),
+            vec![3, 1]
+        );
+        assert_eq!(stack_hwnds(&workspace, 1), vec![2]);
+    }
+
+    #[test]
+    fn consolidating_one_container_changes_nothing() {
+        let mut workspace = workspace_with_hwnds(&[&[1, 2]]);
+        let before = workspace.clone();
+
+        let target = workspace.consolidate_containers().unwrap();
+
+        assert_eq!(target, before.containers()[0].id);
+        assert_eq!(workspace.containers().len(), 1);
+        assert_eq!(stack_hwnds(&workspace, 0), vec![1, 2]);
+    }
+
+    #[test]
+    fn consolidating_an_empty_workspace_answers_nothing() {
+        let mut workspace = Workspace::default();
+
+        assert_eq!(workspace.consolidate_containers(), None);
+        assert!(workspace.containers().is_empty());
+    }
+
+    #[test]
+    fn consolidating_invalidates_the_arrangement_and_forgets_the_folded_containers() {
+        let area = work_area(1920, 1080);
+        let mut workspace = workspace_with_hwnds(&[&[1], &[2], &[3]]);
+        workspace.record_logical_slots(area);
+        let folded = container_ids(&workspace)[1..].to_vec();
+
+        let target = workspace.consolidate_containers().unwrap();
+
+        assert!(workspace.relayout_pending);
+        assert!(workspace.hidden_slot_restores.is_empty());
+        assert_eq!(workspace.resize_dimensions, vec![None]);
+
+        for id in folded {
+            assert!(workspace.logical_slots.get(&id).is_none());
+            assert!(
+                !workspace
+                    .container_focus_history
+                    .iter()
+                    .any(|entry| *entry == id)
+            );
+        }
+
+        // One container, one slot, the whole work area.
+        workspace.record_logical_slots(area);
+        assert_eq!(
+            workspace.logical_slots.get(&target),
+            Some(LogicalRect::from(area))
         );
     }
 }

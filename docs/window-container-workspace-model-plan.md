@@ -2147,6 +2147,57 @@ survives intact. The Phase 13 rule - ask a command what it would do rather than 
 but it is not sufficient on its own: on this machine a command aimed at the live desktop must also
 be checked for shell rewriting before it is sent.
 
+### Phase 16 - Startup adoption: four workspaces and one container
+
+Added on 2026-08-31 after Phase 15 put the model into service. The request is about the state
+komorebi is in the moment it opens, which is a part of the model no earlier phase specified: every
+monitor is to come up with four workspaces, every window already on the desktop is to be adopted
+into the first workspace's first container, and the remaining workspaces are to hold nothing.
+
+What already holds: `WindowsApi::load_workspace_information` enumerates the desktop into the
+monitor's *first* workspace and prunes the windows which belong to another monitor, so initial
+adoption already targets workspace one and only workspace one. The cold-start script passes
+`--clean-state`, so `apply_state` does not run and this is genuinely the state komorebi opens in;
+the watchdog's recovery path deliberately does not pass it, and restoring a crashed session's
+arrangement must go on overriding this.
+
+What does not hold: the enumeration gives every window a container of its own
+(`windows_callbacks::enum_window` pushes one `Container` per window), and the workspace count comes
+only from `komorebi.json`, so a monitor the configuration does not name is born with one workspace.
+
+- [x] 16A: `Workspace::consolidate_containers`, folding every container into the first one with
+  each window's placement, visibility, presentation and floating rectangle intact, the stack order
+  of the ring preserved top to bottom, both histories left describing only what still exists, and
+  the arrangement invalidated. Unit tests in `workspace.rs`.
+- [ ] 16B: apply it to initial adoption, behind a `window_adoption_behaviour` configuration field
+  with a serde default, so the upstream one-container-per-window adoption stays reachable.
+- [ ] 16C: `default_workspace_count`, a configuration field with a serde default of four, applied
+  to every monitor as it is loaded and as it is connected, so the count does not depend on a
+  monitor being named in the configuration. Configuration which asks for more still gets more.
+- [ ] 16D: regenerate `schema.json`, document both fields, update this plan, rebuild, install and
+  verify against the live desktop.
+
+Planned files: `komorebi/src/workspace.rs`, `komorebi/src/windows_api.rs`,
+`komorebi/src/static_config.rs`, `komorebi/src/lib.rs`, `komorebi/src/monitor_reconciliator/mod.rs`,
+`komorebi/src/core/mod.rs`, `schema.json`, `docs/`, this plan.
+
+16A actual files: `komorebi/src/workspace.rs`.
+
+The fold is built out of `remove_container_by_idx` and `receive_window_at_bottom` rather than out
+of a new path, so it inherits what those already guarantee: the departing container leaves the slot
+map, the container focus history and the monocle reference behind it, and each arriving window is
+restamped, hidden if it was a visible stored window, and given the oldest place in its new
+container's focus history. Two things had to be added around them. The minimize history is
+snapshotted and put back, because dropping a container's minimize entries is right when its windows
+leave the workspace and wrong when only the container does. And the target is re-resolved by ID
+after every removal, because the ring re-anchors locked containers when one is taken out, so a
+position is not a stable reference across a removal - which is also why a locked container is
+folded around rather than into.
+
+Verification: komorebi 527 -> 534 passing, full serial suite green; `cargo fmt --check` clean;
+`cargo clippy --workspace --all-targets` clean apart from the pre-existing `items after a test
+module` warning.
+
 ## Provisional affected-file inventory
 
 This list is updated from actual diffs, not treated as permission to change every file.
