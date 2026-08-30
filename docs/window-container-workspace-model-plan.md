@@ -1261,16 +1261,77 @@ its stack building the clap command tree, as recorded in Phase 7.
 
 ### Phase 10 - Workspace ordering, deletion, merge, and minimized restore
 
-- [ ] Implement stable-ID reorder/swap APIs without changing names or rules.
-- [ ] Implement delete-direction selection and atomic source-to-target merge.
-- [ ] Merge all containers and histories, preserve states, invalidate hidden exact restores, relayout
-  only Active containers, and inherit source focus.
-- [ ] Implement current-workspace last-minimized restore through state transitions and MRUs.
-- [ ] Add only-workspace refusal, first/middle/last merge, history, focus, and rollback tests.
-- [ ] Commit as `feat: merge and reorder stable workspaces`.
+Split into 10A, 10B and 10C on 2026-08-30, before coding, for the same review-size reason as the
+earlier phases. The concerns separate cleanly: 10A moves a workspace within its monitor's list and
+changes nothing inside any workspace, 10B is the destructive operation - one workspace's entire
+contents entering another's model - and 10C is the window manager wiring which has to focus, load
+and retile the survivor, plus the last-minimized restore path this phase owns.
 
-Expected handwritten change: 350-500 lines. Likely files: `monitor.rs`, `workspace.rs`,
-`window_manager.rs`, `process_command.rs`, `state.rs`.
+Ordering is the phase's quiet hazard rather than its visible one. A workspace's identity is its
+`WorkspaceId`, but three index-keyed side tables describe workspaces by position: the monitor's
+configured `workspace_names`, the global `WORKSPACE_MATCHING_RULES` application routing, and the
+monitor's `last_focused_workspace`. Reordering without moving those would silently rename
+workspaces and re-route applications, which the task forbids, so a reorder returns the permutation
+it performed and every index-keyed table is moved with it.
+
+#### Phase 10A - Stable workspace identity and ordering
+
+- [x] Add stable-ID workspace lookup on `Monitor` to match the container-ID lookup on `Workspace`.
+- [x] Add reorder and swap which move the workspace and return the old-index-to-new-index
+  permutation, keeping focus on the same workspace by identity.
+- [x] Move the monitor's configured names and last-focused index with the permutation, and remap
+  the global workspace application rules for that monitor in the window manager.
+- [x] Add identity, name, rule, focus, no-op and out-of-range refusal tests.
+- [x] Commit as `feat: reorder workspaces by stable identity`.
+
+Actual files: `komorebi/src/monitor.rs`, `komorebi/src/window_manager.rs`.
+
+`WorkspaceReorder` reports the permutation rather than applying it, because the tables which
+describe a workspace by position do not all belong to the monitor: the configured names, the
+focused index and the last-focused index do, while the application routing rules are a global keyed
+by monitor index as well. A reorder is refused whole when either index is out of range, and
+reordering onto the same index is an identity permutation which writes nothing.
+
+Reordering deliberately invalidates no geometry. Workspaces are independent of each other and of
+their position, so no container, window, slot, history, ID or name changes when the list is
+rearranged, and there is nothing to retile.
+
+Cycling wraps, which keeps the operation total: the first workspace can always be moved left, and
+the last can always be moved right.
+
+Verification: `komorebi` lib tests 374 -> 386 passing, full workspace suite serial and green.
+`cargo fmt --check` and `cargo clippy --all-targets` are clean apart from the pre-existing
+`items after a test module` warning. Toolchain note: the stable rustfmt and Clippy in this
+environment now run, unlike the earlier phases which recorded rustfmt as unavailable; `cargo fmt`
+warns that `imports_granularity` is nightly-only and skips only that option.
+
+#### Phase 10B - Workspace deletion and merge
+
+- [ ] Add the merge: every container of the source workspace enters the target with its ID, stack,
+  window states and window focus history unchanged.
+- [ ] Merge both histories with deduplication, source order first, and inherit the source's focused
+  container and window when that window is still focusable.
+- [ ] Invalidate the target's exact hidden restores and manual resize dimensions, leaving Hidden
+  containers hidden and letting the next update relayout only the Active ones.
+- [ ] Add the delete-direction rule on `Monitor`: refuse the only workspace, merge the first into
+  its right neighbour and every other workspace into its left neighbour, atomically.
+- [ ] Add first/middle/last direction, only-workspace refusal, container/history/state preservation,
+  hidden-container, focus inheritance and rollback tests.
+- [ ] Commit as `feat: merge deleted workspaces into a neighbour`.
+
+Expected handwritten change: 300-400 lines. Likely files: `workspace.rs`, `monitor.rs`.
+
+#### Phase 10C - Window manager wiring and minimized restore
+
+- [ ] Add the window manager operation: merge, focus the survivor, load it and retile it.
+- [ ] Route the existing workspace-closing command through the merge so no workspace's windows can
+  be stranded by deleting the workspace they live on.
+- [ ] Confirm the last-minimized restore path drives placement, presentation, both MRUs and the
+  Hidden-to-Active transition, and add the tests this phase owes it.
+- [ ] Add end-to-end merge, focus-follow, and restore tests.
+- [ ] Commit as `feat: merge workspaces through the window manager`.
+
+Expected handwritten change: 200-300 lines. Likely files: `window_manager.rs`, `process_command.rs`.
 
 ### Phase 11 - Cross-monitor container/workspace migration
 

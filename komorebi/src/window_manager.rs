@@ -65,6 +65,7 @@ use crate::load_configuration;
 use crate::managed_window::FloatingRejection;
 use crate::managed_window::Presentation;
 use crate::monitor::Monitor;
+use crate::monitor::WorkspaceReorder;
 use crate::ring::Ring;
 use crate::should_act;
 use crate::should_act_individual;
@@ -3984,6 +3985,88 @@ impl WindowManager {
         self.update_focused_workspace(false, true)
     }
 
+    /// Move the focused workspace to `idx` on its monitor.
+    ///
+    /// Nothing inside any workspace changes, so there is no retiling to do: the workspaces keep
+    /// their IDs, names, contents, layouts and slots, and only their order changes.
+    #[tracing::instrument(skip(self))]
+    pub fn move_focused_workspace_to_idx(&mut self, idx: usize) -> eyre::Result<()> {
+        tracing::info!("moving workspace");
+
+        let monitor_idx = self.focused_monitor_idx();
+        let monitor = self
+            .focused_monitor_mut()
+            .ok_or_eyre("there is no monitor")?;
+
+        let from = monitor.focused_workspace_idx();
+        let reorder = monitor.reorder_workspace(from, idx)?;
+
+        Self::remap_workspace_rules(monitor_idx, &reorder);
+
+        Ok(())
+    }
+
+    /// Move the focused workspace one position along its monitor's list, wrapping at the ends.
+    #[tracing::instrument(skip(self))]
+    pub fn cycle_focused_workspace_position(
+        &mut self,
+        direction: CycleDirection,
+    ) -> eyre::Result<()> {
+        tracing::info!("moving workspace");
+
+        let monitor_idx = self.focused_monitor_idx();
+        let monitor = self
+            .focused_monitor_mut()
+            .ok_or_eyre("there is no monitor")?;
+
+        let from = monitor.focused_workspace_idx();
+        let reorder = monitor.cycle_workspace_position(from, direction)?;
+
+        Self::remap_workspace_rules(monitor_idx, &reorder);
+
+        Ok(())
+    }
+
+    /// Exchange the focused workspace's position with the workspace at `idx`.
+    #[tracing::instrument(skip(self))]
+    pub fn swap_focused_workspace_with_idx(&mut self, idx: usize) -> eyre::Result<()> {
+        tracing::info!("swapping workspaces");
+
+        let monitor_idx = self.focused_monitor_idx();
+        let monitor = self
+            .focused_monitor_mut()
+            .ok_or_eyre("there is no monitor")?;
+
+        let focused = monitor.focused_workspace_idx();
+        let reorder = monitor.swap_workspaces(focused, idx)?;
+
+        Self::remap_workspace_rules(monitor_idx, &reorder);
+
+        Ok(())
+    }
+
+    /// Move the application routing rules of one monitor to where their workspaces went.
+    ///
+    /// The rules address a workspace by position, so leaving them behind would silently re-route
+    /// applications to whichever workspace inherited the index. Each rule is remapped once, and a
+    /// rule pointing past the end of the list is left alone because there is no workspace whose
+    /// move could describe where it should go.
+    fn remap_workspace_rules(monitor_idx: usize, reorder: &WorkspaceReorder) {
+        if reorder.is_identity() {
+            return;
+        }
+
+        let mut rules = WORKSPACE_MATCHING_RULES.lock();
+
+        for rule in rules.iter_mut() {
+            if rule.monitor_index == monitor_idx
+                && let Some(new_idx) = reorder.new_idx(rule.workspace_index)
+            {
+                rule.workspace_index = new_idx;
+            }
+        }
+    }
+
     #[tracing::instrument(skip(self))]
     pub fn monitor_workspace_index_by_name(&mut self, name: &str) -> Option<(usize, usize)> {
         tracing::info!("looking up workspace by name");
@@ -4107,6 +4190,10 @@ impl WindowManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ApplicationIdentifier;
+    use crate::IdWithIdentifier;
+    use crate::MatchingRule;
+    use crate::WorkspaceMatchingRule;
     use crate::managed_window::Visibility;
     use crate::monitor;
     use crossbeam_channel::Sender;
@@ -4147,6 +4234,103 @@ mod tests {
                 socket_path: Some(socket_path),
             },
         )
+    }
+
+    /// A monitor with `count` workspaces, focused back on the first.
+    fn monitor_with_workspaces(idx: isize, count: usize) -> Monitor {
+        let mut monitor = monitor::new(
+            idx,
+            Rect::default(),
+            Rect::default(),
+            format!("TestMonitor{idx}"),
+            "TestDevice".to_string(),
+            "TestDeviceID".to_string(),
+            Some(format!("TestMonitorID{idx}")),
+        );
+
+        for workspace_idx in 0..count {
+            monitor.focus_workspace(workspace_idx).unwrap();
+        }
+
+        monitor.focus_workspace(0).unwrap();
+
+        monitor
+    }
+
+    fn workspace_rule(
+        monitor_index: usize,
+        workspace_index: usize,
+        id: &str,
+    ) -> WorkspaceMatchingRule {
+        WorkspaceMatchingRule {
+            monitor_index,
+            workspace_index,
+            matching_rule: MatchingRule::Simple(IdWithIdentifier {
+                kind: ApplicationIdentifier::Exe,
+                id: id.to_string(),
+                matching_strategy: None,
+            }),
+            initial_only: false,
+        }
+    }
+
+    #[test]
+    fn moving_a_workspace_takes_its_application_rules_with_it() {
+        let (mut wm, _test_context) = setup_window_manager();
+        wm.monitors_mut().push_back(monitor_with_workspaces(0, 3));
+
+        {
+            let mut rules = WORKSPACE_MATCHING_RULES.lock();
+            rules.clear();
+            rules.push(workspace_rule(0, 0, "moved.exe"));
+            rules.push(workspace_rule(0, 2, "shifted.exe"));
+            rules.push(workspace_rule(1, 0, "other-monitor.exe"));
+        }
+
+        wm.move_focused_workspace_to_idx(2).unwrap();
+
+        let rules = WORKSPACE_MATCHING_RULES.lock().clone();
+        assert_eq!(rules[0].workspace_index, 2);
+        assert_eq!(rules[1].workspace_index, 1);
+        // A rule for a monitor which was not reordered is untouched.
+        assert_eq!(rules[2].workspace_index, 0);
+
+        WORKSPACE_MATCHING_RULES.lock().clear();
+    }
+
+    #[test]
+    fn moving_a_workspace_keeps_focus_and_identity_and_refuses_a_bad_index() {
+        let (mut wm, _test_context) = setup_window_manager();
+        wm.monitors_mut().push_back(monitor_with_workspaces(0, 3));
+
+        let before = wm.monitors()[0]
+            .workspaces()
+            .iter()
+            .map(|workspace| workspace.id.clone())
+            .collect::<Vec<_>>();
+        let focused = before[0].clone();
+
+        wm.cycle_focused_workspace_position(CycleDirection::Previous)
+            .unwrap();
+
+        let monitor = &wm.monitors()[0];
+        assert_eq!(monitor.focused_workspace_idx(), 2);
+        assert_eq!(
+            monitor.focused_workspace().map(|w| w.id.clone()),
+            Some(focused)
+        );
+
+        assert!(wm.move_focused_workspace_to_idx(9).is_err());
+
+        let after = wm.monitors()[0]
+            .workspaces()
+            .iter()
+            .map(|workspace| workspace.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            after,
+            vec![before[1].clone(), before[2].clone(), before[0].clone()]
+        );
     }
 
     #[test]

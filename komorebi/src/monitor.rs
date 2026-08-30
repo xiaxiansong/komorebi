@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::num::NonZeroUsize;
 use std::sync::atomic::Ordering;
 
 use color_eyre::eyre;
@@ -13,6 +14,7 @@ use crate::border_manager::BORDER_OFFSET;
 use crate::border_manager::BORDER_WIDTH;
 use crate::core::Rect;
 
+use crate::CycleDirection;
 use crate::DEFAULT_CONTAINER_PADDING;
 use crate::DEFAULT_WORKSPACE_PADDING;
 use crate::DefaultLayout;
@@ -22,6 +24,7 @@ use crate::OperationDirection;
 use crate::Wallpaper;
 use crate::WindowsApi;
 use crate::container::Container;
+use crate::model::WorkspaceId;
 use crate::ring::Ring;
 use crate::workspace::Workspace;
 use crate::workspace::WorkspaceGlobals;
@@ -51,6 +54,87 @@ pub struct Monitor {
 }
 
 impl_ring_elements!(Monitor, Workspace);
+
+/// A rearrangement of one monitor's workspace list, as old index to new index.
+///
+/// A workspace's identity is its `WorkspaceId`, but several tables describe workspaces by
+/// position: the monitor's configured names, its focused and last-focused indices, and the global
+/// application routing rules. Reordering has to move all of them, and they do not all belong to
+/// the monitor, so the move is reported instead of being applied in one place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceReorder {
+    /// The new index of the workspace which was at each old index.
+    positions: Vec<usize>,
+}
+
+impl WorkspaceReorder {
+    /// The rearrangement produced by taking the workspace at `from` out of a list of `len`
+    /// workspaces and putting it back at `to`.
+    #[must_use]
+    fn from_move(len: usize, from: usize, to: usize) -> Self {
+        let positions = (0..len)
+            .map(|idx| {
+                if idx == from {
+                    to
+                } else if from < to && idx > from && idx <= to {
+                    idx - 1
+                } else if from > to && idx >= to && idx < from {
+                    idx + 1
+                } else {
+                    idx
+                }
+            })
+            .collect();
+
+        Self { positions }
+    }
+
+    /// The rearrangement produced by exchanging two workspaces and moving nothing else.
+    #[must_use]
+    fn from_swap(len: usize, i: usize, j: usize) -> Self {
+        let positions = (0..len)
+            .map(|idx| {
+                if idx == i {
+                    j
+                } else if idx == j {
+                    i
+                } else {
+                    idx
+                }
+            })
+            .collect();
+
+        Self { positions }
+    }
+
+    /// The index the workspace which was at `old` now occupies.
+    #[must_use]
+    pub fn new_idx(&self, old: usize) -> Option<usize> {
+        self.positions.get(old).copied()
+    }
+
+    /// Whether every workspace stayed where it was.
+    #[must_use]
+    pub fn is_identity(&self) -> bool {
+        self.positions
+            .iter()
+            .enumerate()
+            .all(|(old, new)| old == *new)
+    }
+
+    /// Rebuild an index-keyed table so each entry stays with the workspace it described.
+    ///
+    /// Entries whose index is outside the list are dropped rather than kept at a position they no
+    /// longer describe: a table which has fallen behind the workspace list is not made more
+    /// correct by moving part of it.
+    #[must_use]
+    pub fn remap_keys<T: Clone>(&self, table: &HashMap<usize, T>) -> HashMap<usize, T> {
+        table
+            .iter()
+            .filter_map(|(idx, value)| Some((self.new_idx(*idx)?, value.clone())))
+            .collect()
+    }
+}
 
 #[derive(Serialize)]
 pub struct MonitorInformation {
@@ -384,6 +468,117 @@ impl Monitor {
         std::mem::take(self.workspaces_mut())
     }
 
+    /// The index of the workspace with `id`, if this monitor owns it.
+    ///
+    /// The counterpart of `Workspace::container_idx_for_id`: a workspace's position is an ordering
+    /// decision the user can change at any time, so anything which has to name a particular
+    /// workspace across such a change names it by identity and resolves the index here.
+    #[must_use]
+    pub fn workspace_idx_for_id(&self, id: &WorkspaceId) -> Option<usize> {
+        self.workspaces()
+            .iter()
+            .position(|workspace| workspace.id == *id)
+    }
+
+    #[must_use]
+    pub fn workspace_for_id(&self, id: &WorkspaceId) -> Option<&Workspace> {
+        self.workspaces().get(self.workspace_idx_for_id(id)?)
+    }
+
+    pub fn workspace_for_id_mut(&mut self, id: &WorkspaceId) -> Option<&mut Workspace> {
+        let idx = self.workspace_idx_for_id(id)?;
+        self.workspaces_mut().get_mut(idx)
+    }
+
+    /// Move the workspace at `from` so that it sits at `to`, shifting the workspaces in between.
+    ///
+    /// Ordering is a presentation decision: no workspace's containers, windows, slots, histories,
+    /// ID or name change, so nothing here invalidates any geometry. Focus follows the workspace
+    /// which had it, by identity rather than by position.
+    ///
+    /// Returns the permutation it performed so the caller can move the index-keyed tables which
+    /// describe workspaces by position.
+    pub fn reorder_workspace(&mut self, from: usize, to: usize) -> eyre::Result<WorkspaceReorder> {
+        let len = self.workspaces().len();
+
+        if from >= len || to >= len {
+            bail!("this monitor has no workspace at index {from} or {to}");
+        }
+
+        let reorder = WorkspaceReorder::from_move(len, from, to);
+
+        // Nothing above this point has written anything, and nothing below it can fail.
+        if from != to {
+            let workspace = self
+                .workspaces_mut()
+                .remove(from)
+                .expect("the workspace index was checked against the length");
+
+            self.workspaces_mut().insert(to, workspace);
+        }
+
+        self.apply_workspace_reorder(&reorder);
+
+        Ok(reorder)
+    }
+
+    /// Exchange the positions of two workspaces, leaving every other workspace where it is.
+    ///
+    /// This is not two moves: moving A onto B's index and B onto A's would shift everything
+    /// between them twice.
+    pub fn swap_workspaces(&mut self, i: usize, j: usize) -> eyre::Result<WorkspaceReorder> {
+        let len = self.workspaces().len();
+
+        if i >= len || j >= len {
+            bail!("this monitor has no workspace at index {i} or {j}");
+        }
+
+        let reorder = WorkspaceReorder::from_swap(len, i, j);
+
+        // Nothing above this point has written anything, and nothing below it can fail.
+        self.workspaces_mut().swap(i, j);
+        self.apply_workspace_reorder(&reorder);
+
+        Ok(reorder)
+    }
+
+    /// Move the workspace at `from` one position in `direction`, wrapping around the list.
+    ///
+    /// Wrapping keeps the operation total: every workspace can always be moved either way, and the
+    /// first workspace moved left becomes the last.
+    pub fn cycle_workspace_position(
+        &mut self,
+        from: usize,
+        direction: CycleDirection,
+    ) -> eyre::Result<WorkspaceReorder> {
+        let len = NonZeroUsize::new(self.workspaces().len())
+            .ok_or_eyre("this monitor has no workspaces")?;
+
+        if from >= len.get() {
+            bail!("this monitor has no workspace at index {from}");
+        }
+
+        self.reorder_workspace(from, direction.next_idx(from, len))
+    }
+
+    /// Move every index-keyed description of a workspace to where its workspace went.
+    ///
+    /// The monitor's own tables are the configured names and the last-focused index; the focused
+    /// index is not a table but is index-keyed in exactly the same way. The global application
+    /// routing rules are keyed by monitor index as well, so they are remapped by the window
+    /// manager, which is what knows this monitor's index.
+    fn apply_workspace_reorder(&mut self, reorder: &WorkspaceReorder) {
+        self.workspace_names = reorder.remap_keys(&self.workspace_names);
+
+        if let Some(idx) = reorder.new_idx(self.workspaces.focused_idx()) {
+            self.workspaces.focus(idx);
+        }
+
+        self.last_focused_workspace = self
+            .last_focused_workspace
+            .and_then(|idx| reorder.new_idx(idx));
+    }
+
     #[tracing::instrument(skip(self))]
     pub fn move_container_to_workspace(
         &mut self,
@@ -524,6 +719,190 @@ impl Monitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A monitor with `count` workspaces, focused back on the first.
+    fn monitor_with_workspaces(count: usize) -> Monitor {
+        let mut monitor = Monitor::new(
+            0,
+            Rect::default(),
+            Rect::default(),
+            "TestMonitor".to_string(),
+            "TestDevice".to_string(),
+            "TestDeviceID".to_string(),
+            Some("TestMonitorID".to_string()),
+        );
+
+        for idx in 0..count {
+            monitor.focus_workspace(idx).unwrap();
+        }
+
+        monitor.focus_workspace(0).unwrap();
+        monitor.last_focused_workspace = None;
+
+        monitor
+    }
+
+    fn workspace_ids(monitor: &Monitor) -> Vec<WorkspaceId> {
+        monitor
+            .workspaces()
+            .iter()
+            .map(|workspace| workspace.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_workspace_is_found_by_its_stable_id_wherever_it_sits() {
+        let mut monitor = monitor_with_workspaces(3);
+        let id = monitor.workspaces()[2].id.clone();
+
+        assert_eq!(monitor.workspace_idx_for_id(&id), Some(2));
+
+        monitor.reorder_workspace(2, 0).unwrap();
+
+        assert_eq!(monitor.workspace_idx_for_id(&id), Some(0));
+        assert_eq!(
+            monitor.workspace_for_id(&id).map(|w| w.id.clone()),
+            Some(id)
+        );
+        assert_eq!(monitor.workspace_idx_for_id(&WorkspaceId::new()), None);
+    }
+
+    #[test]
+    fn reordering_moves_one_workspace_and_shifts_only_the_ones_it_passed() {
+        let mut monitor = monitor_with_workspaces(4);
+        let before = workspace_ids(&monitor);
+
+        let reorder = monitor.reorder_workspace(3, 1).unwrap();
+
+        assert_eq!(
+            workspace_ids(&monitor),
+            vec![
+                before[0].clone(),
+                before[3].clone(),
+                before[1].clone(),
+                before[2].clone()
+            ]
+        );
+        assert_eq!(reorder.new_idx(3), Some(1));
+        assert_eq!(reorder.new_idx(1), Some(2));
+        assert_eq!(reorder.new_idx(0), Some(0));
+    }
+
+    #[test]
+    fn reordering_keeps_focus_on_the_workspace_which_had_it() {
+        let mut monitor = monitor_with_workspaces(3);
+        monitor.focus_workspace(2).unwrap();
+        let focused = monitor.workspaces()[2].id.clone();
+
+        monitor.reorder_workspace(0, 2).unwrap();
+
+        assert_eq!(monitor.focused_workspace_idx(), 1);
+        assert_eq!(
+            monitor.focused_workspace().map(|w| w.id.clone()),
+            Some(focused)
+        );
+    }
+
+    #[test]
+    fn reordering_moves_the_configured_names_with_their_workspaces() {
+        let mut monitor = monitor_with_workspaces(3);
+        monitor.workspace_names.insert(0, "first".to_string());
+        monitor.workspace_names.insert(2, "third".to_string());
+
+        monitor.reorder_workspace(0, 2).unwrap();
+
+        assert_eq!(monitor.workspace_names.get(&2), Some(&"first".to_string()));
+        assert_eq!(monitor.workspace_names.get(&1), Some(&"third".to_string()));
+        assert_eq!(monitor.workspace_names.get(&0), None);
+    }
+
+    #[test]
+    fn the_last_focused_workspace_index_follows_its_workspace() {
+        let mut monitor = monitor_with_workspaces(3);
+        monitor.focus_workspace(1).unwrap();
+        monitor.focus_workspace(0).unwrap();
+        assert_eq!(monitor.last_focused_workspace, Some(1));
+
+        monitor.reorder_workspace(1, 2).unwrap();
+
+        assert_eq!(monitor.last_focused_workspace, Some(2));
+    }
+
+    #[test]
+    fn reordering_a_workspace_onto_its_own_index_changes_nothing() {
+        let mut monitor = monitor_with_workspaces(3);
+        let before = workspace_ids(&monitor);
+
+        let reorder = monitor.reorder_workspace(1, 1).unwrap();
+
+        assert!(reorder.is_identity());
+        assert_eq!(workspace_ids(&monitor), before);
+    }
+
+    #[test]
+    fn reordering_out_of_range_is_refused_without_moving_anything() {
+        let mut monitor = monitor_with_workspaces(2);
+        let before = workspace_ids(&monitor);
+
+        assert!(monitor.reorder_workspace(0, 2).is_err());
+        assert!(monitor.reorder_workspace(5, 0).is_err());
+        assert!(monitor.swap_workspaces(0, 9).is_err());
+
+        assert_eq!(workspace_ids(&monitor), before);
+        assert_eq!(monitor.focused_workspace_idx(), 0);
+    }
+
+    #[test]
+    fn swapping_exchanges_two_workspaces_and_leaves_the_rest_alone() {
+        let mut monitor = monitor_with_workspaces(4);
+        let before = workspace_ids(&monitor);
+
+        monitor.swap_workspaces(0, 3).unwrap();
+
+        assert_eq!(
+            workspace_ids(&monitor),
+            vec![
+                before[3].clone(),
+                before[1].clone(),
+                before[2].clone(),
+                before[0].clone()
+            ]
+        );
+    }
+
+    #[test]
+    fn cycling_a_workspace_position_wraps_at_both_ends() {
+        let mut monitor = monitor_with_workspaces(3);
+        let before = workspace_ids(&monitor);
+
+        monitor
+            .cycle_workspace_position(0, CycleDirection::Previous)
+            .unwrap();
+
+        assert_eq!(
+            workspace_ids(&monitor),
+            vec![before[1].clone(), before[2].clone(), before[0].clone()]
+        );
+
+        monitor
+            .cycle_workspace_position(2, CycleDirection::Next)
+            .unwrap();
+
+        assert_eq!(workspace_ids(&monitor), before);
+    }
+
+    #[test]
+    fn a_reorder_drops_table_entries_which_describe_no_workspace() {
+        let reorder = WorkspaceReorder::from_move(2, 0, 1);
+        let mut table = HashMap::new();
+        table.insert(0, "kept");
+        table.insert(7, "stale");
+
+        let remapped = reorder.remap_keys(&table);
+
+        assert_eq!(remapped.get(&1), Some(&"kept"));
+        assert_eq!(remapped.len(), 1);
+    }
 
     #[test]
     fn test_add_container() {
