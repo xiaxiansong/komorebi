@@ -396,10 +396,7 @@ pub struct SlotMove {
 /// shared out among `movers`; in a release it is taken back by `container` and the movers shrink to
 /// exactly the rectangles they had before. Nothing is written until the plan is applied, which is
 /// what lets a caller refuse a whole operation without having half-changed the geometry.
-///
-/// Not `PartialEq`: `OperationDirection` is an upstream type which does not implement it, and
-/// deriving it here would mean changing that crate for the sake of a test convenience.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotShift {
     /// The container giving up or taking back `slot`.
     pub container: ContainerId,

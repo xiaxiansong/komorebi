@@ -734,14 +734,60 @@ Verification: `cargo test --workspace -- --test-threads=1` passed with komorebi 
 
 #### Phase 6B - Hidden slot records, transitions and invalidation
 
-- [ ] Add `HiddenSlotRestore` snapshots keyed by container, carrying the geometry generation.
-- [ ] Drive absorption from Active -> Hidden and exact release from Hidden -> Active.
-- [ ] Invalidate restores on all named topology/geometry operations and fall back to full relayout.
-- [ ] Add only-active, consecutive hide/restore, exact/fallback and invalidation tests.
-- [ ] Commit as `feat: restore hidden container slots safely`.
+- [x] Add `HiddenSlotRestore` snapshots keyed by container, carrying the geometry generation.
+- [x] Drive absorption from Active -> Hidden and exact release from Hidden -> Active.
+- [x] Invalidate restores on all named topology/geometry operations and fall back to full relayout.
+- [x] Add only-active, consecutive hide/restore, exact/fallback and invalidation tests.
+- [x] Commit as `feat: restore hidden container slots safely`.
 
 Expected handwritten change: 300-450 lines. Likely files: `workspace.rs`, `window_manager.rs`,
 `state.rs`.
+
+Actual files: `workspace.rs`, `state.rs` and `komorebi-layouts/src/operation_direction.rs`.
+`window_manager.rs` did not need to change, which is the point of the fingerprint decision below.
+
+This is the phase where the slot map stopped being a cache of the layout. `record_logical_slots`
+now reconciles rather than recalculates: a container which just became hidden gives its slot to a
+complete edge group, one which just became active takes its slot back from exactly the containers
+which absorbed it, and anything else falls back to `recalculate_logical_slots`, which is the old
+behaviour under its own name.
+
+The hardest decision was how to know that a recalculation is needed. The alternative to a
+fingerprint was a dirty flag set by each of the twenty-odd places which assign a layout, a flip, a
+resize adjustment or a container order, spread across `workspace.rs`, `window_manager.rs` and
+`process_command.rs`. One forgotten call there leaves the arrangement stale with no test able to
+notice, so `SlotInputs` compares the arrangement inputs themselves instead. The focused container is
+deliberately not one of them: only `DefaultLayout::Scrolling` arranges around it, and including it
+would let an ordinary focus change discard a local absorption, so that one layout invalidates the
+geometry explicitly in `focus_container`.
+
+Both absorption and release plan every step against a running copy before writing any of it, so a
+group which becomes incomplete because of an earlier absorption in the same update is caught before
+the arrangement is half-collapsed. A container which departed because it was removed rather than
+hidden gets no restore record, because there is nothing left to restore it to.
+
+Container deletion still takes the recalculation path: `remove_container_by_idx` drops the slot
+itself, and the container list is part of the fingerprint. Deletion expansion is Phase 8, and it
+will reuse the same `plan_absorption`.
+
+`HiddenSlotRestore::geometry_generation` is recorded and serialized but is diagnostic rather than
+decisive. `plan_release` compares the absorbers' current rectangles against what the absorption gave
+them, which is strictly stronger than a generation comparison: a generation can be advanced by a
+change which does not affect these containers, and it cannot detect a change which happens to leave
+the counter where a stale record expects it.
+
+`OperationDirection` gained `PartialEq`/`Eq` in `komorebi-layouts`. `Workspace` derives `PartialEq`,
+so a restore record which names a direction cannot compile without it, and almost every other type
+in that crate already derives it. This is the first change this task has made outside `komorebi`
+itself and is recorded as an upstream conflict point.
+
+Verification: `cargo test --workspace -- --test-threads=1` passed with komorebi 278 passed/1 ignored
+(up from 268), layouts 128, bar 3. `cargo fmt --all --check` clean; `cargo clippy --workspace
+--all-targets` reported only the pre-existing upstream warning; `cargo check -p komorebi --features
+schemars` passed.
+
+Not in this phase: `ContainerState` and the restore records are not yet in the `state.rs` query
+output beyond what serializing `Workspace` already gives. The full state-output list is Phase 14.
 
 ### Phase 7 - New-window threshold placement and manual split
 
@@ -929,6 +975,16 @@ This list is updated from actual diffs, not treated as permission to change ever
   page was written by hand in the checked-in format instead, and reconciling the generator with the
   checked-in docs is deferred to Phase 14.
 
+- 2026-08-30: The logical slots are the geometry authority rather than a cache of the layout, so
+  they are reconciled and only recalculated when they cannot be edited into agreement. This is what
+  makes a local absorption survive the next update at all.
+- 2026-08-30: Whether a recalculation is needed is decided by comparing the arrangement inputs
+  (`SlotInputs`), not by a dirty flag set at each mutation site. A flag can be forgotten at one of
+  twenty-odd sites and leave the arrangement stale; a fingerprint cannot. The focused container is
+  excluded because only the scrolling layout uses it, and that layout invalidates explicitly.
+- 2026-08-30: `OperationDirection` gained `PartialEq`/`Eq` in `komorebi-layouts`, the first change
+  this task has made outside the `komorebi` crate. `Workspace` derives `PartialEq` and a hidden
+  restore record names a direction, so this is required rather than convenient.
 - 2026-08-30: Fullscreen is applied as the monitor rectangle through `SetWindowPos`, and maximize
   stays `ShowWindow`. Neither presentation is ever applied through the other's call, which is what
   makes the model's distinction survive a round trip through Win32 observation.
@@ -1031,6 +1087,15 @@ This list is updated from actual diffs, not treated as permission to change ever
   alone. Full serial workspace suite passed (komorebi 245 -> 257 passing); fmt and Clippy clean apart
   from the pre-existing upstream warning. Phase 5 is now complete: there is no alternate ownership
   path left in the model. Next phase: 6, hidden slot absorption and restoration.
+- 2026-08-30: Phase 6 turn. Split into 6A geometry and 6B wiring before coding. 6A added the
+  complete-edge group sweep and the absorption plan with its exact reverse, as values validated
+  before anything is written. 6B made those the workspace's slot behaviour: `record_logical_slots`
+  reconciles, `recalculate_logical_slots` is the fallback, and `SlotInputs` decides between them.
+  The phase's real risk was not the algebra but knowing when the layout has to be consulted again;
+  the fingerprint is what removes the possibility of a missed invalidation site. Full serial
+  workspace suite passed at every step (komorebi 257 -> 268 -> 278 passing); fmt and Clippy clean
+  apart from the pre-existing upstream warning. Next phase: 7, new-window threshold placement and
+  manual container splitting.
 - 2026-08-29: Phase 3 was split into 3A identity and 3B histories/invariants after call-site review
   showed that doing both together would exceed the phase review-size limit. Phase 3A added
   transparent typed workspace/container IDs, migrated managed ownership and UI integration

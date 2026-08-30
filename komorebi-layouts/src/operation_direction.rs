@@ -10,7 +10,9 @@ use serde::Serialize;
 use strum::Display;
 use strum::EnumString;
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Display, EnumString, ValueEnum)]
+#[derive(
+    Clone, Copy, Debug, Serialize, Deserialize, Display, EnumString, ValueEnum, Eq, PartialEq,
+)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub enum OperationDirection {
     Left,

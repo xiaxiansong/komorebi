@@ -39,6 +39,7 @@ use crate::focus_history::Mru;
 use crate::geometry::LogicalRect;
 use crate::geometry::LogicalSlots;
 use crate::geometry::RenderInsets;
+use crate::geometry::SlotOrder;
 use crate::lockable_sequence::LockableSequence;
 use crate::managed_window::ManagedPlacement;
 use crate::managed_window::ManagedWindow;
@@ -122,6 +123,23 @@ pub struct Workspace {
     /// The gap-free area the current logical slots were calculated against.
     #[serde(default)]
     pub logical_work_area: Option<LogicalRect>,
+    /// How to give a hidden container's slot back, keyed by the container which gave it up.
+    ///
+    /// A record only ever describes an absorption which actually happened, and it is consulted
+    /// rather than trusted: the release is planned against the current slots and refused if the
+    /// topology has moved underneath it.
+    #[serde(default)]
+    pub hidden_slot_restores: HashMap<ContainerId, HiddenSlotRestore>,
+    /// Set when something has happened that local slot editing cannot express, so the next update
+    /// recalculates the whole arrangement from the layout instead of reusing the current slots.
+    #[serde(default = "default_true")]
+    pub relayout_pending: bool,
+    /// The arrangement inputs the current slots were calculated from.
+    ///
+    /// Not serialized: state restored from disk must recalculate once before its slots can be
+    /// reused, which is the same thing `relayout_pending` defaulting to true says.
+    #[serde(skip)]
+    pub(crate) slot_inputs: Option<SlotInputs>,
     pub tile: bool,
     pub work_area_offset: Option<Rect>,
     pub apply_window_based_work_area_offset: bool,
@@ -163,6 +181,54 @@ impl Display for WorkspaceLayer {
 
 impl_ring_elements!(Workspace, Container);
 
+/// A workspace restored from state which predates `relayout_pending` has to recalculate once
+/// before its slots can be trusted, so the absent field means "pending" rather than "settled".
+const fn default_true() -> bool {
+    true
+}
+
+/// The arrangement inputs the current logical slots were produced from.
+///
+/// Compared, not interpreted: any difference means the layout would now arrange the workspace
+/// differently, so the slots have to be recalculated instead of edited.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SlotInputs {
+    layout: Layout,
+    layout_flip: Option<Axis>,
+    layout_options: Option<LayoutOptions>,
+    resize_dimensions: Vec<Option<Rect>>,
+    containers: Vec<ContainerId>,
+    monocle: Option<ContainerId>,
+}
+
+/// How to give one hidden container's logical slot back to it.
+///
+/// This is only ever written from an absorption which actually happened, so `absorbers` names the
+/// containers which grew and `absorber_rects_before` holds exactly what they held before they did.
+/// Restoration is planned against the current slots rather than replayed from here: the record says
+/// what was done, and the geometry says whether undoing it is still possible.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct HiddenSlotRestore {
+    /// The slot the container occupied before it was hidden.
+    pub old_rect: LogicalRect,
+    /// The side the absorbers were on, and therefore the edge they have to move back.
+    pub direction: OperationDirection,
+    pub absorbers: Vec<ContainerId>,
+    pub absorber_rects_before: Vec<(ContainerId, LogicalRect)>,
+    /// The geometry generation the absorption was applied at.
+    ///
+    /// Diagnostic rather than decisive: the release is validated by comparing the absorbers'
+    /// current rectangles against what the absorption gave them, which is strictly stronger than
+    /// a generation comparison and cannot be fooled by a change that happens to restore the count.
+    pub geometry_generation: u64,
+    /// Whether an exact reverse was possible at all when the container was hidden.
+    ///
+    /// False when no edge could absorb the slot and the workspace was fully relaid out instead, so
+    /// `old_rect` is only a position anchor for the fallback placement.
+    pub exact_restore_valid: bool,
+}
+
 impl Default for Workspace {
     fn default() -> Self {
         Self {
@@ -185,6 +251,9 @@ impl Default for Workspace {
             resize_dimensions: vec![],
             logical_slots: LogicalSlots::default(),
             logical_work_area: None,
+            hidden_slot_restores: HashMap::new(),
+            relayout_pending: true,
+            slot_inputs: None,
             tile: true,
             work_area_offset: None,
             apply_window_based_work_area_offset: true,
@@ -1401,10 +1470,219 @@ impl Workspace {
             .collect()
     }
 
-    /// Recalculate the logical slots, store them by container ID, and report any tiling violation.
+    /// The IDs of the containers which currently occupy an active logical slot, in container order.
+    #[must_use]
+    pub fn active_container_ids(&self) -> Vec<ContainerId> {
+        self.containers()
+            .iter()
+            .filter(|container| container.is_active())
+            .map(|container| container.id.clone())
+            .collect()
+    }
+
+    /// Everything except the work area which decides what the layout would arrange.
+    ///
+    /// The slots are compared against this rather than against a flag set by each of the twenty-odd
+    /// places which assign a layout, a flip, a resize adjustment or a container order. A flag can be
+    /// forgotten at one of them and leave the arrangement stale; a fingerprint cannot.
+    ///
+    /// The focused container is deliberately absent. Only the scrolling layout arranges differently
+    /// depending on it, and including it would let an ordinary focus change discard a local
+    /// absorption; that one layout invalidates the geometry explicitly instead.
+    #[must_use]
+    fn slot_inputs(&self) -> SlotInputs {
+        SlotInputs {
+            layout: self.layout.clone(),
+            layout_flip: self.layout_flip,
+            layout_options: self.effective_layout_options(),
+            resize_dimensions: self.resize_dimensions.clone(),
+            containers: self
+                .containers()
+                .iter()
+                .map(|container| container.id.clone())
+                .collect(),
+            monocle: self.monocle_container_id.clone(),
+        }
+    }
+
+    /// Whether this workspace's layout arranges differently depending on which container is focused.
+    #[must_use]
+    const fn layout_follows_focus(&self) -> bool {
+        matches!(self.layout, Layout::Default(DefaultLayout::Scrolling))
+    }
+
+    /// Declare that the current slots can no longer be edited locally.
+    ///
+    /// Every operation which changes the arrangement as a whole rather than one container's slot -
+    /// switching layout, flipping it, resizing a boundary, reordering containers, moving across
+    /// monitors, merging workspaces - calls this. The next update recalculates from the layout, and
+    /// the hidden restore records go with it, because none of them can still describe a reversible
+    /// absorption once the whole arrangement has been replaced.
+    pub fn invalidate_slot_geometry(&mut self) {
+        self.relayout_pending = true;
+        self.hidden_slot_restores.clear();
+        self.slot_inputs = None;
+    }
+
+    /// Bring the logical slots into agreement with the workspace's active containers.
+    ///
+    /// The slots are the geometry authority, not a cache of the layout, so they are only
+    /// recalculated when they cannot be edited into agreement. A container which just became
+    /// hidden gives its slot to a complete edge group; one which just became active takes its slot
+    /// back from exactly the containers which absorbed it. Anything else - a changed work area, a
+    /// container appearing without a restore record, an invalidated arrangement, or a mix of
+    /// arrivals and departures - falls back to a full recalculation, which is always a valid
+    /// tiling even when it is not the one the user had.
     ///
     /// Returns the active slots in container order so the caller can render them.
     pub fn record_logical_slots(
+        &mut self,
+        available_area: Rect,
+    ) -> Vec<(ContainerId, LogicalRect)> {
+        let area = LogicalRect::from(available_area);
+        let active = self.active_container_ids();
+
+        if self.try_local_slot_update(area, &active) {
+            return self.active_slots_in_order(&active);
+        }
+
+        self.recalculate_logical_slots(available_area)
+    }
+
+    /// Edit the current slots into agreement with `active`, or report that it cannot be done.
+    ///
+    /// Nothing is written unless every step of the transition is possible, so a refusal here
+    /// leaves the previous slots exactly as they were for the recalculation to replace.
+    fn try_local_slot_update(&mut self, area: LogicalRect, active: &[ContainerId]) -> bool {
+        if self.relayout_pending
+            || self.logical_work_area != Some(area)
+            || self.slot_inputs.as_ref() != Some(&self.slot_inputs())
+        {
+            return false;
+        }
+
+        let departed: Vec<ContainerId> = self
+            .logical_slots
+            .ordered(SlotOrder::TopToBottom)
+            .into_iter()
+            .map(|(id, _)| id)
+            .filter(|id| !active.contains(id))
+            .collect();
+
+        let arrived: Vec<ContainerId> = active
+            .iter()
+            .filter(|id| !self.logical_slots.contains(id))
+            .cloned()
+            .collect();
+
+        match (departed.is_empty(), arrived.is_empty()) {
+            (true, true) => true,
+            (false, true) => self.absorb_departed_slots(&departed),
+            (true, false) => self.release_arrived_slots(&arrived),
+            // A container leaving and another arriving in the same update is a rearrangement, not
+            // two independent local edits: absorbing first would give away area the arrival needs.
+            (false, false) => false,
+        }
+    }
+
+    /// Give each departed container's slot to a complete edge group.
+    ///
+    /// A container which is still owned by this workspace gets a restore record; one which has
+    /// been removed does not, because there is nothing left to restore it to.
+    fn absorb_departed_slots(&mut self, departed: &[ContainerId]) -> bool {
+        let mut shifts = Vec::with_capacity(departed.len());
+
+        // Plan every absorption against the running result before writing any of it, so a group
+        // which becomes incomplete because of an earlier absorption is caught here rather than
+        // leaving the arrangement half-collapsed.
+        let mut planned = self.logical_slots.clone();
+
+        for id in departed {
+            let Some(shift) = planned.plan_absorption(id) else {
+                return false;
+            };
+
+            planned.apply_absorption(&shift);
+            shifts.push(shift);
+        }
+
+        for shift in shifts {
+            let still_owned = self.containers().iter().any(|c| c.id == shift.container);
+
+            self.logical_slots.apply_absorption(&shift);
+
+            if still_owned {
+                self.hidden_slot_restores.insert(
+                    shift.container.clone(),
+                    HiddenSlotRestore {
+                        old_rect: shift.slot,
+                        direction: shift.direction,
+                        absorbers: shift
+                            .movers
+                            .iter()
+                            .map(|mover| mover.container.clone())
+                            .collect(),
+                        absorber_rects_before: shift.rects_before(),
+                        geometry_generation: self.logical_slots.generation(),
+                        exact_restore_valid: true,
+                    },
+                );
+            } else {
+                self.hidden_slot_restores.remove(&shift.container);
+            }
+        }
+
+        true
+    }
+
+    /// Give each arrived container the slot it had before it was hidden.
+    fn release_arrived_slots(&mut self, arrived: &[ContainerId]) -> bool {
+        let mut shifts = Vec::with_capacity(arrived.len());
+        let mut planned = self.logical_slots.clone();
+
+        for id in arrived {
+            let Some(record) = self.hidden_slot_restores.get(id) else {
+                return false;
+            };
+
+            if !record.exact_restore_valid {
+                return false;
+            }
+
+            let Some(shift) = planned.plan_release(
+                id,
+                record.old_rect,
+                record.direction,
+                &record.absorber_rects_before,
+            ) else {
+                return false;
+            };
+
+            planned.apply_release(&shift);
+            shifts.push(shift);
+        }
+
+        for shift in shifts {
+            self.logical_slots.apply_release(&shift);
+            self.hidden_slot_restores.remove(&shift.container);
+        }
+
+        true
+    }
+
+    /// The slots of `active`, in container order, for the renderer.
+    fn active_slots_in_order(&self, active: &[ContainerId]) -> Vec<(ContainerId, LogicalRect)> {
+        active
+            .iter()
+            .filter_map(|id| Some((id.clone(), self.logical_slots.get(id)?)))
+            .collect()
+    }
+
+    /// Replace every slot from the layout and report any tiling violation.
+    ///
+    /// This is the fallback, and it is what makes a hidden container's exact restore impossible:
+    /// the arrangement it was recorded against no longer exists, so every record is dropped.
+    pub fn recalculate_logical_slots(
         &mut self,
         available_area: Rect,
     ) -> Vec<(ContainerId, LogicalRect)> {
@@ -1413,6 +1691,9 @@ impl Workspace {
 
         self.logical_work_area = Some(area);
         self.logical_slots.replace_all(slots.clone());
+        self.hidden_slot_restores.clear();
+        self.relayout_pending = false;
+        self.slot_inputs = Some(self.slot_inputs());
 
         if let Err(violations) = self.logical_slots.validate_coverage(area) {
             for violation in violations {
@@ -2563,6 +2844,13 @@ impl Workspace {
     pub fn focus_container(&mut self, idx: usize) {
         tracing::info!("focusing container");
 
+        // The scrolling layout arranges around the focused container, so for it alone a focus
+        // change is an arrangement change. Every other layout must be able to move focus without
+        // discarding a hidden container's exact restore.
+        if self.layout_follows_focus() && self.containers.focused_idx() != idx {
+            self.invalidate_slot_geometry();
+        }
+
         self.containers.focus(idx);
 
         // A preselect container is a transient insertion marker with a fixed ID, so it must never
@@ -3247,6 +3535,295 @@ mod tests {
                 .validate_coverage(LogicalRect::from(area))
                 .is_ok()
         );
+    }
+
+    fn show_container(workspace: &mut Workspace, idx: usize) {
+        for window in workspace.containers_mut()[idx].windows_mut().iter_mut() {
+            window.set_visible();
+        }
+    }
+
+    #[test]
+    fn hiding_a_container_gives_its_slot_to_a_complete_edge_group() {
+        let mut workspace = workspace_with_containers(&[1, 1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        let hidden_id = workspace.containers()[1].id.clone();
+        let before: HashMap<_, _> = workspace
+            .logical_slots
+            .iter()
+            .map(|(id, slot)| (id.clone(), *slot))
+            .collect();
+
+        hide_container(&mut workspace, 1);
+        workspace.record_logical_slots(area);
+
+        // The hidden container's area went to neighbours; it was not redistributed by relaying the
+        // whole workspace out, so the container which is neither hidden nor an absorber is
+        // untouched.
+        let record = workspace.hidden_slot_restores.get(&hidden_id).unwrap();
+        assert_eq!(record.old_rect, before[&hidden_id]);
+        assert!(record.exact_restore_valid);
+        assert!(!record.absorbers.is_empty());
+
+        for (id, slot) in &before {
+            if id != &hidden_id && !record.absorbers.contains(id) {
+                assert_eq!(workspace.logical_slots.get(id), Some(*slot));
+            }
+        }
+
+        assert!(
+            workspace
+                .logical_slots
+                .validate_coverage(LogicalRect::from(area))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn restoring_a_container_shrinks_its_absorbers_back_exactly() {
+        let mut workspace = workspace_with_containers(&[1, 1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        let before: HashMap<_, _> = workspace
+            .logical_slots
+            .iter()
+            .map(|(id, slot)| (id.clone(), *slot))
+            .collect();
+
+        hide_container(&mut workspace, 1);
+        workspace.record_logical_slots(area);
+        show_container(&mut workspace, 1);
+        workspace.record_logical_slots(area);
+
+        for (id, slot) in &before {
+            assert_eq!(workspace.logical_slots.get(id), Some(*slot), "{id}");
+        }
+        assert!(workspace.hidden_slot_restores.is_empty());
+    }
+
+    #[test]
+    fn a_floating_window_hides_and_restores_its_container_slot() {
+        let mut workspace = workspace_with_containers(&[1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        let floated_id = workspace.containers()[0].id.clone();
+        let hwnd = workspace.containers()[0].windows()[0].hwnd;
+        let before = workspace.logical_slots.get(&floated_id).unwrap();
+
+        workspace.float_window(hwnd, Rect::default()).unwrap();
+        workspace.record_logical_slots(area);
+
+        assert!(!workspace.logical_slots.contains(&floated_id));
+        assert_eq!(
+            workspace.logical_slots.get(&workspace.containers()[1].id),
+            Some(LogicalRect::from(area))
+        );
+
+        workspace.unfloat_window(hwnd).unwrap();
+        workspace.record_logical_slots(area);
+
+        assert_eq!(workspace.logical_slots.get(&floated_id), Some(before));
+    }
+
+    #[test]
+    fn several_containers_hide_and_restore_one_after_another() {
+        let mut workspace = workspace_with_containers(&[1, 1, 1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        let before: HashMap<_, _> = workspace
+            .logical_slots
+            .iter()
+            .map(|(id, slot)| (id.clone(), *slot))
+            .collect();
+
+        for idx in [1, 2] {
+            hide_container(&mut workspace, idx);
+            workspace.record_logical_slots(area);
+            assert!(
+                workspace
+                    .logical_slots
+                    .validate_coverage(LogicalRect::from(area))
+                    .is_ok()
+            );
+        }
+
+        assert_eq!(workspace.logical_slots.len(), 2);
+        assert_eq!(workspace.hidden_slot_restores.len(), 2);
+
+        // Restoring in the reverse order undoes each absorption against the arrangement it was
+        // recorded on, which is what makes the round trip exact.
+        for idx in [2, 1] {
+            show_container(&mut workspace, idx);
+            workspace.record_logical_slots(area);
+        }
+
+        for (id, slot) in &before {
+            assert_eq!(workspace.logical_slots.get(id), Some(*slot), "{id}");
+        }
+        assert!(workspace.hidden_slot_restores.is_empty());
+    }
+
+    #[test]
+    fn a_layout_change_drops_the_restore_records_and_relays_out() {
+        let mut workspace = workspace_with_containers(&[1, 1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        hide_container(&mut workspace, 1);
+        workspace.record_logical_slots(area);
+        assert_eq!(workspace.hidden_slot_restores.len(), 1);
+
+        workspace.layout = Layout::Default(DefaultLayout::Columns);
+        workspace.record_logical_slots(area);
+
+        assert!(workspace.hidden_slot_restores.is_empty());
+        assert_eq!(workspace.logical_slots.len(), 2);
+        assert!(
+            workspace
+                .logical_slots
+                .validate_coverage(LogicalRect::from(area))
+                .is_ok()
+        );
+
+        // Without a record the restore falls back to a full recalculation rather than refusing.
+        show_container(&mut workspace, 1);
+        workspace.record_logical_slots(area);
+
+        assert_eq!(workspace.logical_slots.len(), 3);
+        assert!(
+            workspace
+                .logical_slots
+                .validate_coverage(LogicalRect::from(area))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_changed_work_area_relays_out_instead_of_editing_slots() {
+        let mut workspace = workspace_with_containers(&[1, 1, 1]);
+        workspace.record_logical_slots(work_area(1920, 1080));
+
+        hide_container(&mut workspace, 1);
+        workspace.record_logical_slots(work_area(1920, 1080));
+        assert_eq!(workspace.hidden_slot_restores.len(), 1);
+
+        let smaller = work_area(1280, 720);
+        workspace.record_logical_slots(smaller);
+
+        assert!(workspace.hidden_slot_restores.is_empty());
+        assert!(
+            workspace
+                .logical_slots
+                .validate_coverage(LogicalRect::from(smaller))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_manual_resize_makes_the_exact_restore_impossible() {
+        let mut workspace = workspace_with_containers(&[1, 1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        hide_container(&mut workspace, 1);
+        workspace.record_logical_slots(area);
+
+        // A resize adjustment is an arrangement input, so it is what the fingerprint notices.
+        workspace.resize_dimensions = vec![
+            Some(Rect {
+                left: 0,
+                top: 0,
+                right: 100,
+                bottom: 0,
+            }),
+            None,
+            None,
+        ];
+        workspace.record_logical_slots(area);
+
+        assert!(workspace.hidden_slot_restores.is_empty());
+
+        show_container(&mut workspace, 1);
+        workspace.record_logical_slots(area);
+
+        assert_eq!(workspace.logical_slots.len(), 3);
+        assert!(
+            workspace
+                .logical_slots
+                .validate_coverage(LogicalRect::from(area))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn hiding_the_only_active_container_leaves_no_active_slot() {
+        let mut workspace = workspace_with_containers(&[1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        hide_container(&mut workspace, 0);
+        workspace.record_logical_slots(area);
+
+        assert!(workspace.logical_slots.is_empty());
+        // Nothing absorbed it, so there is nothing to reverse and no record is kept.
+        assert!(workspace.hidden_slot_restores.is_empty());
+
+        show_container(&mut workspace, 0);
+        workspace.record_logical_slots(area);
+
+        assert_eq!(
+            workspace.logical_slots.get(&workspace.containers()[0].id),
+            Some(LogicalRect::from(area))
+        );
+    }
+
+    #[test]
+    fn moving_focus_does_not_discard_an_absorption() {
+        let mut workspace = workspace_with_containers(&[1, 1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        hide_container(&mut workspace, 1);
+        workspace.record_logical_slots(area);
+        let absorbed: HashMap<_, _> = workspace
+            .logical_slots
+            .iter()
+            .map(|(id, slot)| (id.clone(), *slot))
+            .collect();
+
+        assert_ne!(workspace.focused_container_idx(), 0);
+        workspace.focus_container(0);
+        workspace.record_logical_slots(area);
+
+        for (id, slot) in &absorbed {
+            assert_eq!(workspace.logical_slots.get(id), Some(*slot), "{id}");
+        }
+        assert_eq!(workspace.hidden_slot_restores.len(), 1);
+    }
+
+    #[test]
+    fn the_scrolling_layout_relays_out_when_focus_moves() {
+        let mut workspace = workspace_with_containers(&[1, 1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.layout = Layout::Default(DefaultLayout::Scrolling);
+        workspace.record_logical_slots(area);
+
+        hide_container(&mut workspace, 1);
+        workspace.record_logical_slots(area);
+        assert_eq!(workspace.hidden_slot_restores.len(), 1);
+
+        // This is the one layout which arranges around the focused container, so a focus change
+        // really is an arrangement change for it.
+        assert_ne!(workspace.focused_container_idx(), 0);
+        workspace.focus_container(0);
+
+        assert!(workspace.hidden_slot_restores.is_empty());
+        assert!(workspace.relayout_pending);
     }
 
     #[test]

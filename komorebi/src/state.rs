@@ -268,6 +268,9 @@ impl From<&WindowManager> for State {
                             resize_dimensions: workspace.resize_dimensions.clone(),
                             logical_slots: workspace.logical_slots.clone(),
                             logical_work_area: workspace.logical_work_area,
+                            hidden_slot_restores: workspace.hidden_slot_restores.clone(),
+                            relayout_pending: workspace.relayout_pending,
+                            slot_inputs: workspace.slot_inputs.clone(),
                             tile: workspace.tile,
                             work_area_offset: workspace.work_area_offset,
                             apply_window_based_work_area_offset: workspace
