@@ -4045,12 +4045,62 @@ impl WindowManager {
         Ok(())
     }
 
+    /// Delete the workspace at `idx` on the focused monitor, merging everything it owned into a
+    /// neighbour.
+    ///
+    /// The survivor becomes the focused workspace and is shown and retiled, because after this the
+    /// user is looking at the workspace their windows just moved to. Returns its index.
+    #[tracing::instrument(skip(self))]
+    pub fn merge_workspace(&mut self, idx: usize) -> eyre::Result<usize> {
+        tracing::info!("merging workspace");
+
+        let mouse_follows_focus = self.mouse_follows_focus;
+        let monitor_idx = self.focused_monitor_idx();
+
+        let (target, reorder) = {
+            let monitor = self
+                .focused_monitor_mut()
+                .ok_or_eyre("there is no monitor")?;
+
+            let reorder = monitor.merge_workspace(idx)?;
+            let target = reorder
+                .merged_into()
+                .ok_or_eyre("the merge did not report which workspace absorbed the other")?;
+
+            (target, reorder)
+        };
+
+        // The routing rules are part of the model, so they move with the merge and before anything
+        // which talks to the desktop. Showing and retiling the survivor can fail on a window which
+        // has gone away underneath us, and a failure there must not leave applications routed to a
+        // workspace which no longer exists.
+        Self::remap_workspace_rules(monitor_idx, &reorder);
+
+        self.focused_monitor_mut()
+            .ok_or_eyre("there is no monitor")?
+            .load_focused_workspace(mouse_follows_focus)?;
+
+        self.update_focused_workspace(mouse_follows_focus, true)?;
+
+        Ok(target)
+    }
+
+    /// Delete the focused workspace, merging everything it owned into a neighbour.
+    #[tracing::instrument(skip(self))]
+    pub fn merge_focused_workspace(&mut self) -> eyre::Result<usize> {
+        let idx = self.focused_workspace_idx()?;
+
+        self.merge_workspace(idx)
+    }
+
     /// Move the application routing rules of one monitor to where their workspaces went.
     ///
     /// The rules address a workspace by position, so leaving them behind would silently re-route
-    /// applications to whichever workspace inherited the index. Each rule is remapped once, and a
-    /// rule pointing past the end of the list is left alone because there is no workspace whose
-    /// move could describe where it should go.
+    /// applications to whichever workspace inherited the index. They follow the windows rather
+    /// than the workspace: a rule for a workspace which was merged away now points at the
+    /// workspace which absorbed it, which is where those applications' windows are. Each rule is
+    /// remapped once, and a rule pointing past the end of the list is left alone because there is
+    /// no workspace whose move could describe where it should go.
     fn remap_workspace_rules(monitor_idx: usize, reorder: &WorkspaceReorder) {
         if reorder.is_identity() {
             return;
@@ -4060,7 +4110,7 @@ impl WindowManager {
 
         for rule in rules.iter_mut() {
             if rule.monitor_index == monitor_idx
-                && let Some(new_idx) = reorder.new_idx(rule.workspace_index)
+                && let Some(new_idx) = reorder.content_idx(rule.workspace_index)
             {
                 rule.workspace_index = new_idx;
             }
@@ -4272,6 +4322,82 @@ mod tests {
             }),
             initial_only: false,
         }
+    }
+
+    #[test]
+    fn deleting_a_workspace_moves_its_windows_and_its_rules_to_the_survivor() {
+        let (mut wm, _test_context) = setup_window_manager();
+        let mut monitor = monitor_with_workspaces(0, 3);
+
+        for (idx, hwnd) in [(0, 1), (1, 2), (2, 3)] {
+            let mut container = Container::default();
+            container.windows_mut().push_back(Window::from(hwnd));
+            monitor.workspaces_mut()[idx].add_container_to_back(container);
+        }
+
+        monitor.focus_workspace(1).unwrap();
+        wm.monitors_mut().push_back(monitor);
+
+        {
+            let mut rules = WORKSPACE_MATCHING_RULES.lock();
+            rules.clear();
+            rules.push(workspace_rule(0, 1, "deleted.exe"));
+            rules.push(workspace_rule(0, 2, "shifted.exe"));
+        }
+
+        // The retile which ends the operation asks Win32 to focus the survivor's window, and the
+        // handles in this test are not real, so the outcome asserted here is the model rather than
+        // the call's result. Every assertion below is false unless the merge itself happened.
+        let _ = wm.merge_focused_workspace();
+
+        let monitor = &wm.monitors()[0];
+        assert_eq!(monitor.workspaces().len(), 2);
+        assert_eq!(monitor.focused_workspace_idx(), 0);
+        assert_eq!(
+            monitor.workspaces()[0]
+                .containers()
+                .iter()
+                .flat_map(|container| container.windows().iter().map(|window| window.hwnd))
+                .collect::<Vec<_>>(),
+            vec![1, 2],
+            "the deleted workspace's windows are on the survivor"
+        );
+        assert_eq!(monitor.workspaces()[1].containers()[0].windows()[0].hwnd, 3);
+
+        let rules = WORKSPACE_MATCHING_RULES.lock().clone();
+        assert_eq!(
+            rules[0].workspace_index, 0,
+            "a rule for a deleted workspace follows its windows"
+        );
+        assert_eq!(rules[1].workspace_index, 1);
+
+        WORKSPACE_MATCHING_RULES.lock().clear();
+    }
+
+    #[test]
+    fn deleting_the_only_workspace_of_a_monitor_is_refused_without_changing_anything() {
+        let (mut wm, _test_context) = setup_window_manager();
+        let mut monitor = monitor_with_workspaces(0, 1);
+        let mut container = Container::default();
+        container.windows_mut().push_back(Window::from(42));
+        monitor
+            .focused_workspace_mut()
+            .unwrap()
+            .add_container_to_back(container);
+        wm.monitors_mut().push_back(monitor);
+
+        let refusal = wm.merge_focused_workspace().unwrap_err().to_string();
+        assert!(
+            refusal.contains("only workspace"),
+            "refused for the wrong reason: {refusal}"
+        );
+
+        let monitor = &wm.monitors()[0];
+        assert_eq!(monitor.workspaces().len(), 1);
+        assert_eq!(
+            monitor.workspaces()[0].containers()[0].windows()[0].hwnd,
+            42
+        );
     }
 
     #[test]

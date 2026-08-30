@@ -1181,30 +1181,26 @@ impl WindowManager {
                     self.focus_monitor(monitor_idx)?;
                 }
 
-                let mut can_close = false;
+                // Deleting a workspace is merging it: this command keeps its long-standing
+                // condition that the workspace is empty and unnamed, but it no longer removes the
+                // workspace itself, so it cannot strand anything the condition failed to notice
+                // and it picks its neighbour by the model's direction rule rather than by
+                // decrementing the index.
+                let can_close = self
+                    .focused_monitor()
+                    .and_then(|monitor| {
+                        let workspace = monitor.focused_workspace()?;
 
-                if let Some(monitor) = self.focused_monitor_mut() {
-                    let focused_workspace_idx = monitor.focused_workspace_idx();
-                    let next_focused_workspace_idx = focused_workspace_idx.saturating_sub(1);
+                        Some(
+                            monitor.workspaces().len() > 1
+                                && workspace.containers().is_empty()
+                                && workspace.name.is_none(),
+                        )
+                    })
+                    .unwrap_or_default();
 
-                    if let Some(workspace) = monitor.focused_workspace()
-                        && monitor.workspaces().len() > 1
-                        && workspace.containers().is_empty()
-                        && workspace.floating_windows().is_empty()
-                        && workspace.monocle_container().is_none()
-                        && workspace.name.is_none()
-                    {
-                        can_close = true;
-                    }
-
-                    if can_close
-                        && monitor
-                            .workspaces_mut()
-                            .remove(focused_workspace_idx)
-                            .is_some()
-                    {
-                        self.focus_workspace(next_focused_workspace_idx)?;
-                    }
+                if can_close {
+                    self.merge_focused_workspace()?;
                 }
             }
             SocketMessage::FocusLastWorkspace => {

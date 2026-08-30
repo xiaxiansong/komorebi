@@ -507,6 +507,45 @@ impl Container {
         self.focus_history.record_oldest(hwnd);
     }
 
+    /// Move `hwnd` to the top of this container's stack.
+    ///
+    /// The top is the last element and it is what the container shows, so raising is a change of
+    /// depth rather than of membership: nothing is added, nothing is removed, and every other
+    /// window keeps its relative order. The ring focus moves with the windows it indexes so the
+    /// container goes on showing what it was showing, unless the raised window is the one being
+    /// shown, which stays shown at its new depth.
+    ///
+    /// Returns whether this container owns the window.
+    pub fn raise_window(&mut self, hwnd: isize) -> bool {
+        let Some(idx) = self.idx_for_window(hwnd) else {
+            return false;
+        };
+
+        let top = self.windows().len().saturating_sub(1);
+
+        if idx == top {
+            return true;
+        }
+
+        let focused_idx = self.focused_window_idx();
+
+        if let Some(window) = self.windows.elements_mut().remove(idx) {
+            self.windows.elements_mut().push_back(window);
+        }
+
+        // Everything above the raised window dropped one place, and the raised window itself is
+        // now on top.
+        self.windows.focus(if focused_idx == idx {
+            top
+        } else if focused_idx > idx {
+            focused_idx - 1
+        } else {
+            focused_idx
+        });
+
+        true
+    }
+
     #[tracing::instrument(skip(self))]
     pub fn focus_window(&mut self, idx: usize) {
         tracing::info!("focusing window");
@@ -616,6 +655,66 @@ mod tests {
         }
 
         container
+    }
+
+    #[test]
+    fn raising_a_window_puts_it_on_top_without_reordering_the_rest() {
+        let mut container = container_with_windows(4);
+
+        assert!(container.raise_window(1));
+
+        assert_eq!(
+            container
+                .windows()
+                .iter()
+                .map(|w| w.hwnd)
+                .collect::<Vec<_>>(),
+            vec![0, 2, 3, 1]
+        );
+    }
+
+    #[test]
+    fn raising_a_window_keeps_the_container_showing_what_it_was_showing() {
+        let mut container = container_with_windows(4);
+        container.focus_window(3);
+
+        container.raise_window(0);
+
+        assert_eq!(
+            container.focused_window().map(|window| window.hwnd),
+            Some(3),
+            "the window which was being shown moved down a place, not out of focus"
+        );
+
+        container.focus_window(1);
+        let shown = container.focused_window().map(|window| window.hwnd);
+
+        container.raise_window(shown.unwrap());
+
+        assert_eq!(container.focused_window().map(|window| window.hwnd), shown);
+        assert_eq!(container.windows().back().map(|w| w.hwnd), shown);
+    }
+
+    #[test]
+    fn raising_the_top_window_or_an_unowned_one_reports_ownership() {
+        let mut container = container_with_windows(2);
+        let before = container
+            .windows()
+            .iter()
+            .map(|w| w.hwnd)
+            .collect::<Vec<_>>();
+
+        assert!(container.raise_window(1));
+        assert!(!container.raise_window(9));
+
+        assert_eq!(
+            container
+                .windows()
+                .iter()
+                .map(|w| w.hwnd)
+                .collect::<Vec<_>>(),
+            before
+        );
     }
 
     #[test]

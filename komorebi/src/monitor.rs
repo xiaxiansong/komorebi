@@ -161,6 +161,12 @@ impl WorkspaceReorder {
         }
     }
 
+    /// The index of the workspace which absorbed a merged workspace, if this was a merge.
+    #[must_use]
+    pub fn merged_into(&self) -> Option<usize> {
+        self.merged.map(|(_, target)| target)
+    }
+
     /// Whether every workspace stayed where it was.
     #[must_use]
     pub fn is_identity(&self) -> bool {
@@ -630,11 +636,11 @@ impl Monitor {
     /// Delete the workspace at `idx`, merging everything it owned into a neighbour.
     ///
     /// The neighbour becomes this monitor's focused workspace, because after a delete the user is
-    /// looking at the workspace their windows just moved to. Returns its index, which is not
-    /// `merge_target_idx`'s answer once the deleted workspace has left the list.
+    /// looking at the workspace their windows just moved to. The returned rearrangement names it:
+    /// its index is not `merge_target_idx`'s answer once the deleted workspace has left the list.
     ///
     /// Refuses a monitor's only workspace without changing anything.
-    pub fn merge_workspace(&mut self, idx: usize) -> eyre::Result<usize> {
+    pub fn merge_workspace(&mut self, idx: usize) -> eyre::Result<WorkspaceReorder> {
         let target = self
             .merge_target_idx(idx)
             .ok_or_eyre("a monitor cannot delete its only workspace")?;
@@ -653,7 +659,7 @@ impl Monitor {
         self.apply_workspace_reorder(&reorder);
         self.workspaces.focus(target_idx);
 
-        Ok(target_idx)
+        Ok(reorder)
     }
 
     /// Move every index-keyed description of a workspace to where its workspace went.
@@ -868,7 +874,7 @@ mod tests {
         let survivor = monitor.workspaces()[0].id.clone();
 
         assert_eq!(monitor.merge_target_idx(1), Some(0));
-        assert_eq!(monitor.merge_workspace(1).unwrap(), 0);
+        assert_eq!(monitor.merge_workspace(1).unwrap().merged_into(), Some(0));
 
         assert_eq!(monitor.workspaces().len(), 2);
         assert_eq!(monitor.workspaces()[0].id, survivor);
@@ -892,7 +898,7 @@ mod tests {
         let survivor = monitor.workspaces()[1].id.clone();
 
         assert_eq!(monitor.merge_target_idx(0), Some(1));
-        assert_eq!(monitor.merge_workspace(0).unwrap(), 0);
+        assert_eq!(monitor.merge_workspace(0).unwrap().merged_into(), Some(0));
 
         assert_eq!(monitor.workspaces()[0].id, survivor);
         assert_eq!(
@@ -912,7 +918,7 @@ mod tests {
         populate_workspace(&mut monitor, 2, 1);
         let survivor = monitor.workspaces()[1].id.clone();
 
-        assert_eq!(monitor.merge_workspace(2).unwrap(), 1);
+        assert_eq!(monitor.merge_workspace(2).unwrap().merged_into(), Some(1));
 
         assert_eq!(monitor.workspaces().len(), 2);
         assert_eq!(monitor.workspaces()[1].id, survivor);

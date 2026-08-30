@@ -1346,15 +1346,47 @@ Verification: `komorebi` lib tests 386 -> 400 passing, full workspace suite seri
 
 #### Phase 10C - Window manager wiring and minimized restore
 
-- [ ] Add the window manager operation: merge, focus the survivor, load it and retile it.
-- [ ] Route the existing workspace-closing command through the merge so no workspace's windows can
-  be stranded by deleting the workspace they live on.
-- [ ] Confirm the last-minimized restore path drives placement, presentation, both MRUs and the
+- [x] Add the window manager operation: merge, focus the survivor, load it and retile it.
+- [x] Route the existing workspace-closing command through the merge so a workspace is never
+  removed by a path which could strand what it held.
+- [x] Confirm the last-minimized restore path drives placement, presentation, both MRUs and the
   Hidden-to-Active transition, and add the tests this phase owes it.
-- [ ] Add end-to-end merge, focus-follow, and restore tests.
-- [ ] Commit as `feat: merge workspaces through the window manager`.
+- [x] Raise a restored window to the top of its container's stack, which the model requires and the
+  restore path did not do.
+- [x] Add end-to-end merge, focus-follow, and restore tests.
+- [x] Commit as `feat: merge workspaces through the window manager`.
 
-Expected handwritten change: 200-300 lines. Likely files: `window_manager.rs`, `process_command.rs`.
+Actual files: `komorebi/src/window_manager.rs`, `komorebi/src/process_command.rs`,
+`komorebi/src/container.rs`, `komorebi/src/workspace.rs`, `komorebi/src/monitor.rs`.
+
+`Monitor::merge_workspace` returns the rearrangement rather than the target index, which makes it
+the same shape as reorder and swap and lets one caller answer both questions the permutation
+covers. The window manager remaps the routing rules immediately after the model changes and before
+it shows or retiles anything: a test with unreal window handles caught the first ordering, where a
+Win32 focus failure returned early and left the rules pointing at a workspace which no longer
+existed. That is an atomicity rule, not a test artefact - the model's own tables have to settle
+together, and only the desktop work may fail afterwards.
+
+`CloseWorkspace` keeps its long-standing condition that the workspace is empty and unnamed, but it
+now deletes through the merge, so it picks its neighbour by the model's direction rule instead of
+decrementing the index. Its floating-window and monocle conditions were dropped as redundant rather
+than relaxed: both are derived from container membership in this model, so an empty container ring
+already implies them. The unguarded delete-and-merge command is Phase 12's, with the rest of the
+command surface.
+
+The restore path needed one behaviour it did not have: a restored window returns to the top of its
+container's stack. `Container::raise_window` is a change of depth rather than of membership, and it
+moves the ring focus with the windows it indexes so a container goes on showing what it was
+showing.
+
+Two tests were corrected after they failed. `a_restored_window_keeps_the_placement_it_was_minimized_with`
+addressed its window by depth, which raising changed; it now addresses it by handle and asserts the
+depth separately. The new restore test asserted that the windows a raise passed came out reversed,
+which was simply wrong about correct behaviour: they keep their order.
+
+Verification: `komorebi` lib tests 400 -> 406 passing, full workspace suite serial and green.
+`cargo fmt --check` and `cargo clippy --all-targets` clean apart from the pre-existing
+`items after a test module` warning.
 
 ### Phase 11 - Cross-monitor container/workspace migration
 

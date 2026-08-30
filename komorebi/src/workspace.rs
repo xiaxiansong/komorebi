@@ -2552,12 +2552,19 @@ impl Workspace {
     /// Restore the most recently minimized window this workspace still owns, and focus it.
     ///
     /// The window returns with the placement and presentation it had, so a floating window comes
-    /// back floating and a maximized window comes back maximized. Both histories are updated
-    /// through the ordinary focus path.
+    /// back floating and a maximized window comes back maximized. It returns to the top of its
+    /// container's stack, because a window which is being restored is a window the user is asking
+    /// to see, and its container becomes active again by the ordinary derivation if it was the
+    /// only thing keeping it hidden. Both histories are updated through the ordinary focus path.
     pub fn restore_last_minimized_window(&mut self) -> Option<isize> {
         let hwnd = self.take_last_minimized_window()?;
 
         self.unminimize_window(hwnd).ok()?;
+
+        if let Some(idx) = self.container_idx_for_window(hwnd) {
+            self.containers_mut()[idx].raise_window(hwnd);
+        }
+
         self.focus_container_by_window(hwnd).ok()?;
 
         Some(hwnd)
@@ -4484,6 +4491,45 @@ mod tests {
     }
 
     #[test]
+    fn a_restored_window_returns_to_the_top_of_its_stack_and_reactivates_its_container() {
+        let mut workspace = workspace_with_containers(&[3]);
+        let area = work_area(1920, 1080);
+
+        // Every window of the container is minimized, so the container is hidden and holds no slot.
+        for hwnd in [2, 1, 0] {
+            workspace.minimize_window(hwnd).unwrap();
+        }
+        workspace.record_logical_slots(area);
+        assert!(workspace.containers()[0].is_hidden());
+        assert!(workspace.logical_slots.is_empty());
+
+        assert_eq!(workspace.restore_last_minimized_window(), Some(0));
+        workspace.record_logical_slots(area);
+
+        let container = &workspace.containers()[0];
+        assert_eq!(
+            container
+                .windows()
+                .iter()
+                .map(|w| w.hwnd)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 0],
+            "the restored window is on top and the others keep their order"
+        );
+        assert_eq!(container.focused_window().map(|w| w.hwnd), Some(0));
+        assert!(container.is_active());
+        assert!(workspace.logical_slots.contains(&container.id));
+        assert_eq!(
+            workspace
+                .minimize_history
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
     fn a_restored_window_keeps_the_placement_it_was_minimized_with() {
         let mut workspace = workspace_with_containers(&[2]);
         workspace.float_window(0, floating_rect(3)).unwrap();
@@ -4492,7 +4538,15 @@ mod tests {
 
         assert_eq!(workspace.restore_last_minimized_window(), Some(0));
 
-        let window = &workspace.containers()[0].windows()[0];
+        // Addressed by identity rather than by depth: a restored window returns to the top of its
+        // container's stack, which is the last element rather than the first.
+        let container = &workspace.containers()[0];
+        let window = container
+            .windows()
+            .iter()
+            .find(|window| window.hwnd == 0)
+            .unwrap();
+        assert_eq!(container.windows().back().map(|w| w.hwnd), Some(0));
         assert_eq!(window.visibility, Visibility::Visible);
         assert_eq!(window.placement, ManagedPlacement::Floating);
         assert_eq!(window.presentation, Presentation::Maximized);
