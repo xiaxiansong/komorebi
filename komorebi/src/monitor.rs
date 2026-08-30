@@ -24,8 +24,10 @@ use crate::OperationDirection;
 use crate::Wallpaper;
 use crate::WindowsApi;
 use crate::container::Container;
+use crate::geometry::SplitAxis;
 use crate::model::WorkspaceId;
 use crate::ring::Ring;
+use crate::workspace::ContainerArrival;
 use crate::workspace::Workspace;
 use crate::workspace::WorkspaceGlobals;
 use crate::workspace::WorkspaceLayer;
@@ -681,6 +683,60 @@ impl Monitor {
     }
 
     #[tracing::instrument(skip(self))]
+    /// Take the focused container out of the focused workspace so it can go somewhere else.
+    ///
+    /// The arrangement closes over the space it leaves: the neighbours on one complete edge absorb
+    /// its slot, exactly as they do when it is destroyed, and focus lands on the first of them.
+    /// The container itself comes out whole, with its ID, its stack and its windows' states, ready
+    /// to be adopted by another workspace on this monitor or on another one.
+    ///
+    /// Nothing is written until the container is actually found, so a refusal here leaves the
+    /// monitor as it was.
+    pub fn release_focused_container(&mut self) -> eyre::Result<Container> {
+        let workspace = self
+            .focused_workspace_mut()
+            .ok_or_eyre("there is no workspace")?;
+
+        // A preselect marker indexes a ring which is about to change, and it is not a container of
+        // the model, so it never travels.
+        workspace.cancel_preselect();
+
+        workspace
+            .remove_focused_container()
+            .ok_or_eyre("there is no container to move")
+    }
+
+    /// Take in a container which came from another work area.
+    ///
+    /// The container keeps everything it is - its ID, its stack, its window focus history and each
+    /// window's state - and only two things are decided here: which of this monitor's workspaces
+    /// receives it, and what happens to the rectangles which are still expressed in the coordinates
+    /// of the work area it came from. Floating rectangles are carried into this monitor's work
+    /// area, because nothing else will ever correct them; stored windows need nothing, because the
+    /// slot which places them is about to be recalculated here.
+    ///
+    /// The workspace is validated before the container is touched, so a bad index refuses without
+    /// changing anything and without stranding the container.
+    pub fn adopt_container(
+        &mut self,
+        mut container: Container,
+        workspace_idx: Option<usize>,
+        source_area: Rect,
+        axis: Option<SplitAxis>,
+    ) -> eyre::Result<ContainerArrival> {
+        let target_area = self.work_area_size;
+        let idx = workspace_idx.unwrap_or_else(|| self.focused_workspace_idx());
+
+        let workspace = self
+            .workspaces_mut()
+            .get_mut(idx)
+            .ok_or_eyre(format!("there is no workspace at index {idx}"))?;
+
+        container.transfer_floating_rects(source_area, target_area);
+
+        Ok(workspace.adopt_container(container, axis))
+    }
+
     pub fn move_container_to_workspace(
         &mut self,
         target_workspace_idx: usize,
@@ -1066,6 +1122,112 @@ mod tests {
 
         assert_eq!(workspace_ids(&monitor), before);
         assert_eq!(monitor.focused_workspace_idx(), 0);
+    }
+
+    /// A monitor whose work area is `area`, with one workspace holding one window.
+    fn monitor_with_work_area(area: Rect) -> Monitor {
+        let mut monitor = monitor_with_workspaces(1);
+        monitor.work_area_size = area;
+        monitor
+    }
+
+    fn work_area(left: i32, width: i32, height: i32) -> Rect {
+        Rect {
+            left,
+            top: 0,
+            right: width,
+            bottom: height,
+        }
+    }
+
+    #[test]
+    fn releasing_the_focused_container_hands_it_over_whole() {
+        let mut monitor = monitor_with_workspaces(1);
+        let id = populate_workspace(&mut monitor, 0, 10);
+        populate_workspace(&mut monitor, 0, 11);
+        monitor.workspaces_mut()[0].focus_container(0);
+
+        let released = monitor.release_focused_container().unwrap();
+
+        assert_eq!(released.id, id);
+        assert_eq!(released.windows()[0].hwnd, 10);
+        // And the workspace it left closed over the space.
+        assert_eq!(monitor.workspaces()[0].containers().len(), 1);
+        assert!(monitor.workspaces()[0].container_idx_for_id(&id).is_none());
+    }
+
+    #[test]
+    fn releasing_from_a_workspace_with_no_container_is_refused() {
+        let mut monitor = monitor_with_workspaces(1);
+
+        assert!(monitor.release_focused_container().is_err());
+        assert!(monitor.workspaces()[0].containers().is_empty());
+    }
+
+    #[test]
+    fn an_adopted_container_lands_on_the_workspace_it_is_addressed_to() {
+        let mut source = monitor_with_workspaces(1);
+        populate_workspace(&mut source, 0, 10);
+        let released = source.release_focused_container().unwrap();
+        let id = released.id.clone();
+
+        let mut target = monitor_with_workspaces(3);
+
+        target
+            .adopt_container(released, Some(2), Rect::default(), None)
+            .unwrap();
+
+        assert!(target.workspaces()[2].container_idx_for_id(&id).is_some());
+        assert!(target.workspaces()[0].containers().is_empty());
+    }
+
+    #[test]
+    fn adopting_onto_a_workspace_which_does_not_exist_is_refused() {
+        let mut monitor = monitor_with_workspaces(1);
+        let container = Container::default();
+
+        assert!(
+            monitor
+                .adopt_container(container, Some(9), Rect::default(), None)
+                .is_err()
+        );
+        assert!(monitor.workspaces()[0].containers().is_empty());
+    }
+
+    #[test]
+    fn an_adopted_container_brings_its_floating_rectangles_into_the_new_work_area() {
+        let source_area = work_area(0, 1920, 1080);
+        let target_area = work_area(1920, 2560, 1440);
+
+        let mut source = monitor_with_work_area(source_area);
+        populate_workspace(&mut source, 0, 10);
+        source.workspaces_mut()[0]
+            .float_window(
+                10,
+                Rect {
+                    left: 960,
+                    top: 540,
+                    right: 400,
+                    bottom: 300,
+                },
+            )
+            .unwrap();
+
+        let released = source.release_focused_container().unwrap();
+        let mut target = monitor_with_work_area(target_area);
+
+        target
+            .adopt_container(released, None, source_area, None)
+            .unwrap();
+
+        let carried = target.workspaces()[0].containers()[0].windows()[0]
+            .floating_rect
+            .unwrap();
+
+        // The rectangle is in the target monitor's coordinates and inside its work area.
+        assert!(carried.left >= target_area.left);
+        assert!(carried.left + carried.right <= target_area.left + target_area.right);
+        assert!(carried.top + carried.bottom <= target_area.top + target_area.bottom);
     }
 
     #[test]

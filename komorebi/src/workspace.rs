@@ -232,6 +232,42 @@ pub enum NewWindowPlacement {
     Joined(ContainerId),
 }
 
+/// Where a container which arrived from another workspace ended up.
+///
+/// Distinct from [`NewWindowPlacement`] because adoption has an outcome placing a new window does
+/// not: a container can arrive with nothing for the arrangement to place, and then it takes no
+/// slot from anyone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContainerArrival {
+    /// The container arrived hidden. It kept its windows and its identity and claimed no slot, so
+    /// the containers already here kept the whole area between them.
+    Hidden(ContainerId),
+    /// The workspace had no slot to divide, so the arrangement gives this container the work area.
+    ///
+    /// This is the empty-workspace case and the case of a workspace whose containers are all
+    /// hidden.
+    Alone(ContainerId),
+    /// The container took half of `donor`'s slot, divided along `axis`.
+    Split {
+        arrived: ContainerId,
+        donor: ContainerId,
+        axis: SplitAxis,
+    },
+    /// A donor's slot could not be halved, so the whole workspace is rearranged instead.
+    Rearranged(ContainerId),
+}
+
+impl ContainerArrival {
+    /// The container which arrived, whichever way it was placed.
+    #[must_use]
+    pub const fn arrived(&self) -> &ContainerId {
+        match self {
+            Self::Hidden(id) | Self::Alone(id) | Self::Rearranged(id) => id,
+            Self::Split { arrived, .. } => arrived,
+        }
+    }
+}
+
 /// What a container's departure does to the arrangement it leaves behind.
 ///
 /// Deliberately distinct from an absent plan: a hidden container leaving changes no geometry and
@@ -2251,6 +2287,94 @@ impl Workspace {
         self.add_container_to_back(container);
     }
 
+    /// Take in a container which belongs to another workspace, keeping everything it is.
+    ///
+    /// The container arrives whole: its stable ID, its stack order, its window focus history and
+    /// each window's placement, visibility, presentation and floating rectangle are the container
+    /// value itself, so they survive by being moved rather than by being copied across. Its
+    /// windows already name it as their container, so nothing is restamped either.
+    ///
+    /// Only where it goes is decided here, and the rule follows the container's own state. One
+    /// which arrives hidden has no visible stored window for the arrangement to place, so it takes
+    /// no slot and the containers already here keep the whole area. One which arrives active takes
+    /// half of the geometry-focused container's slot, divided along its longer edge unless `axis`
+    /// says otherwise - the same division a new window's container gets - and takes the work area
+    /// outright when there is no active slot to divide.
+    ///
+    /// The target's exact hidden restores are discarded. They describe which containers absorbed a
+    /// hidden slot and by how much, and a container arriving from elsewhere is exactly the
+    /// topology change that description cannot survive.
+    pub fn adopt_container(
+        &mut self,
+        container: Container,
+        axis: Option<SplitAxis>,
+    ) -> ContainerArrival {
+        let arrived = container.id.clone();
+
+        if container.is_hidden() {
+            // Focus is not moved by a hidden arrival: it has no focusable window to move to, and
+            // the container which was being shown goes on being shown.
+            let restore = self
+                .focused_container()
+                .map(|container| container.id.clone());
+            let idx = self.containers().len();
+
+            self.insert_container_at_idx(idx, container);
+            self.hidden_slot_restores.clear();
+
+            if let Some(idx) = restore.and_then(|id| self.container_idx_for_id(&id)) {
+                self.focus_container(idx);
+            }
+
+            return ContainerArrival::Hidden(arrived);
+        }
+
+        // The scrolling layout defines its own arrangement from the focused container, so a local
+        // edit to its slots would not survive its next recalculation; it gets the rearrangement.
+        let donor = if self.layout_follows_focus() {
+            None
+        } else {
+            self.active_container_idx_for_geometry()
+                .and_then(|idx| Some((idx, self.containers().get(idx)?.id.clone())))
+        };
+
+        let Some((donor_idx, donor_id)) = donor else {
+            let idx = self.containers().len();
+            self.insert_container_at_idx(idx, container);
+            self.invalidate_slot_geometry();
+
+            return ContainerArrival::Alone(arrived);
+        };
+
+        // Planned before anything is inserted, so a slot which cannot be halved costs nothing but
+        // the rearrangement.
+        let Some(split) = self.logical_slots.plan_split(&donor_id, &arrived, axis) else {
+            let idx = self.containers().len();
+            self.insert_container_at_idx(idx, container);
+            self.invalidate_slot_geometry();
+
+            return ContainerArrival::Rearranged(arrived);
+        };
+
+        // Container order is what the layout would arrange, so the arrival is inserted where its
+        // half actually is: to the left of the donor, or below it.
+        let insertion_idx = match split.axis {
+            SplitAxis::LeftRight => donor_idx,
+            SplitAxis::TopBottom => donor_idx + 1,
+        };
+
+        self.insert_container_at_idx(insertion_idx, container);
+        self.logical_slots.apply_split(&split);
+        self.hidden_slot_restores.clear();
+        self.adopt_slot_geometry();
+
+        ContainerArrival::Split {
+            arrived,
+            donor: donor_id,
+            axis: split.axis,
+        }
+    }
+
     pub fn remove_focused_container(&mut self) -> Option<Container> {
         let focused_idx = self.focused_container_idx();
         let expansion = self.expansion_focus_target(focused_idx);
@@ -4087,6 +4211,208 @@ mod tests {
         workspace.focus_container(0);
 
         workspace
+    }
+
+    /// A container of single-window stacks, built the way an arriving container would be.
+    fn container_with_hwnds(hwnds: &[isize]) -> Container {
+        let mut container = Container::default();
+
+        for hwnd in hwnds {
+            container.add_window(Window::from(*hwnd));
+        }
+
+        container
+    }
+
+    #[test]
+    fn a_container_arriving_at_an_empty_workspace_takes_the_work_area() {
+        let mut workspace = Workspace::default();
+        let area = work_area(1920, 1080);
+        let arriving = container_with_hwnds(&[10, 11]);
+        let id = arriving.id.clone();
+
+        let arrival = workspace.adopt_container(arriving, None);
+        workspace.record_logical_slots(area);
+
+        assert_eq!(arrival, ContainerArrival::Alone(id.clone()));
+        assert_eq!(
+            workspace.logical_slots.get(&id),
+            Some(LogicalRect::from(area))
+        );
+    }
+
+    #[test]
+    fn a_container_arriving_at_an_occupied_workspace_halves_the_focused_slot() {
+        let mut workspace = workspace_with_containers(&[1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        let donor = workspace.containers()[0].id.clone();
+        let arriving = container_with_hwnds(&[10]);
+        let id = arriving.id.clone();
+
+        let arrival = workspace.adopt_container(arriving, None);
+
+        assert_eq!(
+            arrival,
+            ContainerArrival::Split {
+                arrived: id.clone(),
+                donor: donor.clone(),
+                axis: SplitAxis::LeftRight,
+            }
+        );
+
+        // A left/right division puts the arrival on the left, and the two halves tile the area.
+        let arrived_slot = workspace.logical_slots.get(&id).unwrap();
+        let donor_slot = workspace.logical_slots.get(&donor).unwrap();
+
+        assert_eq!(arrived_slot.left, area.left);
+        assert_eq!(arrived_slot.width, 960);
+        assert_eq!(donor_slot.left, 960);
+        assert_eq!(donor_slot.width, 960);
+        assert!(
+            workspace
+                .logical_slots
+                .validate_coverage(area.into())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn an_arriving_container_keeps_its_identity_stack_and_window_state() {
+        let mut workspace = workspace_with_containers(&[1]);
+        workspace.record_logical_slots(work_area(1920, 1080));
+
+        let mut arriving = container_with_hwnds(&[10, 11, 12]);
+        arriving.windows_mut()[0].set_floating(floating_rect(50));
+        arriving.windows_mut()[1].set_minimized();
+        let before = arriving.clone();
+
+        workspace.adopt_container(arriving, None);
+
+        let adopted = workspace
+            .containers()
+            .iter()
+            .find(|container| container.id == before.id)
+            .unwrap();
+
+        assert_eq!(*adopted, before);
+        // The windows already named this container, so nothing had to be restamped.
+        for window in adopted.windows() {
+            assert_eq!(window.container_id, before.id);
+        }
+    }
+
+    #[test]
+    fn a_hidden_container_arrives_without_taking_a_slot() {
+        let mut workspace = workspace_with_containers(&[1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        let slots_before = workspace.logical_slots.ordered(SlotOrder::LeftToRight);
+        let focused_before = workspace.focused_container().unwrap().id.clone();
+
+        let mut arriving = container_with_hwnds(&[10]);
+        arriving.windows_mut()[0].set_minimized();
+        let id = arriving.id.clone();
+
+        let arrival = workspace.adopt_container(arriving, None);
+        workspace.record_logical_slots(area);
+
+        assert_eq!(arrival, ContainerArrival::Hidden(id.clone()));
+        assert!(workspace.containers().iter().any(|c| c.id == id));
+        assert!(!workspace.logical_slots.contains(&id));
+        // The containers already here kept the area, and the one being shown goes on being shown.
+        assert_eq!(
+            workspace.logical_slots.ordered(SlotOrder::LeftToRight),
+            slots_before
+        );
+        assert_eq!(workspace.focused_container().unwrap().id, focused_before);
+    }
+
+    #[test]
+    fn a_container_of_only_floating_windows_arrives_hidden() {
+        let mut workspace = workspace_with_containers(&[1]);
+        workspace.record_logical_slots(work_area(1920, 1080));
+
+        let mut arriving = container_with_hwnds(&[10]);
+        arriving.windows_mut()[0].set_floating(floating_rect(50));
+        let id = arriving.id.clone();
+
+        let arrival = workspace.adopt_container(arriving, None);
+
+        assert_eq!(arrival, ContainerArrival::Hidden(id));
+    }
+
+    #[test]
+    fn a_container_arriving_at_a_workspace_of_hidden_containers_takes_the_work_area() {
+        let mut workspace = workspace_with_containers(&[1]);
+        let area = work_area(1920, 1080);
+        workspace.containers_mut()[0].windows_mut()[0].set_minimized();
+        workspace.record_logical_slots(area);
+
+        let arriving = container_with_hwnds(&[10]);
+        let id = arriving.id.clone();
+
+        let arrival = workspace.adopt_container(arriving, None);
+        workspace.record_logical_slots(area);
+
+        assert_eq!(arrival, ContainerArrival::Alone(id.clone()));
+        assert_eq!(workspace.logical_slots.len(), 1);
+        assert_eq!(
+            workspace.logical_slots.get(&id),
+            Some(LogicalRect::from(area))
+        );
+    }
+
+    #[test]
+    fn an_arrival_divides_the_longer_edge_unless_it_is_told_otherwise() {
+        for (area, expected) in [
+            (work_area(1920, 1080), SplitAxis::LeftRight),
+            (work_area(1080, 1920), SplitAxis::TopBottom),
+        ] {
+            let mut workspace = workspace_with_containers(&[1]);
+            workspace.record_logical_slots(area);
+
+            let arrival = workspace.adopt_container(container_with_hwnds(&[10]), None);
+
+            assert!(matches!(
+                arrival,
+                ContainerArrival::Split { axis, .. } if axis == expected
+            ));
+        }
+
+        // And a forced axis overrides the shape of the slot.
+        let mut workspace = workspace_with_containers(&[1]);
+        workspace.record_logical_slots(work_area(1920, 1080));
+
+        let arrival =
+            workspace.adopt_container(container_with_hwnds(&[10]), Some(SplitAxis::TopBottom));
+
+        assert!(matches!(
+            arrival,
+            ContainerArrival::Split {
+                axis: SplitAxis::TopBottom,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn an_arrival_discards_the_exact_hidden_restores_it_invalidates() {
+        let mut workspace = workspace_with_containers(&[1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        // Hiding a container writes the restore record which says who absorbed its slot.
+        workspace.containers_mut()[0].windows_mut()[0].set_minimized();
+        workspace.record_logical_slots(area);
+        assert!(!workspace.hidden_slot_restores.is_empty());
+
+        workspace.adopt_container(container_with_hwnds(&[10]), None);
+
+        // A container arriving from elsewhere is the topology change that record cannot survive.
+        assert!(workspace.hidden_slot_restores.is_empty());
     }
 
     #[test]
