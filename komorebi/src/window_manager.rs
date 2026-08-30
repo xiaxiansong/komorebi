@@ -78,6 +78,7 @@ use crate::should_act;
 use crate::should_act_individual;
 use crate::state::State;
 use crate::static_config::StaticConfig;
+use crate::suspension::SuspensionSet;
 use crate::transparency_manager;
 use crate::window::RuleDebug;
 use crate::window::Window;
@@ -131,7 +132,7 @@ pub struct WindowManager {
     ///
     /// This is deliberately not part of persisted state. A new window manager process treats any
     /// still-existing, otherwise eligible HWND as a newly opened window.
-    pub temporarily_unmanaged_hwnds: HashSet<isize>,
+    pub temporarily_unmanaged_hwnds: SuspensionSet,
 }
 
 impl AsRef<Self> for WindowManager {
@@ -211,7 +212,7 @@ impl WindowManager {
             already_moved_window_handles: Arc::new(Mutex::new(HashSet::new())),
             uncloack_to_ignore: 0,
             known_hwnds: HashMap::new(),
-            temporarily_unmanaged_hwnds: HashSet::new(),
+            temporarily_unmanaged_hwnds: SuspensionSet::default(),
         })
     }
 
@@ -813,7 +814,7 @@ impl WindowManager {
     #[tracing::instrument(skip(self))]
     pub fn manage_focused_window(&mut self) -> eyre::Result<()> {
         let hwnd = WindowsApi::foreground_window()?;
-        let event = if self.temporarily_unmanaged_hwnds.contains(&hwnd) {
+        let event = if self.temporarily_unmanaged_hwnds.claims(hwnd) {
             WindowManagerEvent::Resume(Window::from(hwnd))
         } else {
             WindowManagerEvent::Manage(Window::from(hwnd))
@@ -1309,7 +1310,7 @@ impl WindowManager {
             ));
         };
 
-        if self.temporarily_unmanaged_hwnds.contains(&hwnd) {
+        if self.temporarily_unmanaged_hwnds.claims(hwnd) {
             return Ok(CommandResponse::new(
                 CommandOutcome::Suspended,
                 format!("hwnd {hwnd} is already temporarily unmanaged"),
@@ -1343,7 +1344,7 @@ impl WindowManager {
             ));
         };
 
-        if !self.temporarily_unmanaged_hwnds.contains(&hwnd) {
+        if !self.temporarily_unmanaged_hwnds.claims(hwnd) {
             return Ok(CommandResponse::new(
                 CommandOutcome::NoOp,
                 format!("hwnd {hwnd} is not temporarily unmanaged"),
@@ -1370,19 +1371,23 @@ impl WindowManager {
     /// The window a resume acts on when the caller named none: the foreground window if it is
     /// suspended, otherwise the only suspended window there is. More than one candidate is
     /// ambiguous and is refused rather than guessed at.
-    fn resume_subject(&self, hwnd: Option<isize>) -> Option<isize> {
+    fn resume_subject(&mut self, hwnd: Option<isize>) -> Option<isize> {
         if hwnd.is_some() {
             return hwnd;
         }
 
+        // Counting suspended windows is only a fair question once handles which have died or been
+        // reused have been given up, so this is one of the few places which prunes the whole set.
+        self.temporarily_unmanaged_hwnds.reclaim_stale();
+
         if let Ok(foreground) = WindowsApi::foreground_window()
-            && self.temporarily_unmanaged_hwnds.contains(&foreground)
+            && self.temporarily_unmanaged_hwnds.contains(foreground)
         {
             return Some(foreground);
         }
 
         if self.temporarily_unmanaged_hwnds.len() == 1 {
-            return self.temporarily_unmanaged_hwnds.iter().copied().next();
+            return self.temporarily_unmanaged_hwnds.hwnds().copied().next();
         }
 
         None
@@ -1476,6 +1481,19 @@ impl WindowManager {
             .ok_or_eyre("there is no workspace")?;
         *workspace = snapshot;
         Ok(())
+    }
+
+    /// Forget everything the runtime remembers about a window which is no longer there.
+    ///
+    /// The destroy path clears these tables one by one as it processes the event. A window which
+    /// vanishes without a destroy event ever arriving - an application which crashed, or one
+    /// Windows tore down while komorebi was paused - is removed by the reaper instead, and has to
+    /// be forgotten just as completely: every entry left behind is read as belonging to whichever
+    /// window Windows next hands that numeric handle to.
+    pub(crate) fn forget_window(&mut self, hwnd: isize) {
+        self.known_hwnds.remove(&hwnd);
+        self.temporarily_unmanaged_hwnds.remove(hwnd);
+        self.clear_window_transients(hwnd);
     }
 
     pub(crate) fn clear_window_transients(&mut self, hwnd: isize) {
@@ -5422,13 +5440,13 @@ mod tests {
         wm.known_hwnds.insert(42, (0, 0));
 
         assert!(wm.suspend_managed_window(42).unwrap());
-        assert!(wm.temporarily_unmanaged_hwnds.contains(&42));
+        assert!(wm.temporarily_unmanaged_hwnds.contains(42));
         assert!(wm.managed_window_location(42).is_none());
         assert!(!wm.known_hwnds.contains_key(&42));
         assert!(wm.focused_workspace().unwrap().containers().is_empty());
 
         assert!(!wm.suspend_managed_window(42).unwrap());
-        assert!(wm.temporarily_unmanaged_hwnds.contains(&42));
+        assert!(wm.temporarily_unmanaged_hwnds.contains(42));
     }
 
     /// A monitor with two workspaces, the first holding one container with these windows.
@@ -5886,7 +5904,7 @@ mod tests {
         let response = wm.suspend_window(Some(42)).unwrap();
 
         assert_eq!(response.outcome, CommandOutcome::Success);
-        assert!(wm.temporarily_unmanaged_hwnds.contains(&42));
+        assert!(wm.temporarily_unmanaged_hwnds.contains(42));
         assert!(wm.managed_window_location(42).is_none());
         assert!(wm.managed_window_location(43).is_some());
     }
@@ -5936,6 +5954,42 @@ mod tests {
     }
 
     #[test]
+    fn forgetting_a_window_clears_every_runtime_table_the_destroy_path_clears() {
+        let (mut wm, _test_context) = window_manager_with_container(&[42]);
+
+        wm.temporarily_unmanaged_hwnds.insert(42);
+        wm.already_moved_window_handles.lock().insert(42);
+        crate::HIDDEN_HWNDS.lock().push(42);
+        *Arc::make_mut(&mut wm.pending_move_op) = Some((0, 0, 42));
+
+        wm.forget_window(42);
+
+        assert!(!wm.known_hwnds.contains_key(&42));
+        assert!(!wm.temporarily_unmanaged_hwnds.contains(42));
+        assert!(!wm.already_moved_window_handles.lock().contains(&42));
+        assert!(!crate::HIDDEN_HWNDS.lock().contains(&42));
+        assert!(wm.pending_move_op.is_none());
+    }
+
+    #[test]
+    fn forgetting_a_window_leaves_another_windows_runtime_state_alone() {
+        let (mut wm, _test_context) = window_manager_with_container(&[42, 43]);
+
+        wm.already_moved_window_handles.lock().insert(43);
+        crate::HIDDEN_HWNDS.lock().push(43);
+        *Arc::make_mut(&mut wm.pending_move_op) = Some((0, 0, 43));
+
+        wm.forget_window(42);
+
+        assert!(wm.known_hwnds.contains_key(&43));
+        assert!(wm.already_moved_window_handles.lock().contains(&43));
+        assert!(crate::HIDDEN_HWNDS.lock().contains(&43));
+        assert_eq!(*wm.pending_move_op, Some((0, 0, 43)));
+
+        crate::HIDDEN_HWNDS.lock().retain(|hwnd| *hwnd != 43);
+    }
+
+    #[test]
     fn resuming_the_only_suspended_window_hands_it_back() {
         let (mut wm, _test_context) = window_manager_with_container(&[42]);
         wm.suspend_window(Some(42)).unwrap();
@@ -5945,7 +5999,7 @@ mod tests {
         assert_eq!(response.outcome, CommandOutcome::Success);
         // The window leaves the suspension set on its way through the event pipeline, not here:
         // this command hands it back to be processed as a newly opened window.
-        assert!(wm.temporarily_unmanaged_hwnds.contains(&42));
+        assert!(wm.temporarily_unmanaged_hwnds.contains(42));
     }
 
     fn window_manager_with_container(hwnds: &[isize]) -> (WindowManager, TestContext) {
@@ -5986,7 +6040,7 @@ mod tests {
 
         // Unlike suspending, minimizing leaves ownership and the container completely intact.
         assert_eq!(wm.managed_window_location(42), Some((0, 0)));
-        assert!(!wm.temporarily_unmanaged_hwnds.contains(&42));
+        assert!(!wm.temporarily_unmanaged_hwnds.contains(42));
         let workspace = wm.focused_workspace().unwrap();
         assert_eq!(workspace.containers().len(), 1);
         assert_eq!(workspace.containers()[0].windows().len(), 2);
@@ -6049,7 +6103,7 @@ mod tests {
         let (mut wm, _test_context) = setup_window_manager();
 
         assert!(!wm.suspend_managed_window(42).unwrap());
-        assert!(!wm.temporarily_unmanaged_hwnds.contains(&42));
+        assert!(!wm.temporarily_unmanaged_hwnds.contains(42));
     }
 
     #[test]

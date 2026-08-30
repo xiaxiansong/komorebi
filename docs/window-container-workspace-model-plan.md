@@ -1799,19 +1799,101 @@ passing.
 
 ### Phase 14 - Event reconciliation, serialization, documentation, and final verification
 
-- [ ] Audit create/show/hide/destroy/minimize/restore/maximize/fullscreen, HWND reuse/crash, monitor
-  hotplug, DPI/work-area change, workspace-switch races, and suspended HWND events.
-- [ ] Make duplicate and out-of-order transitions converge idempotently.
-- [ ] Complete state output fields and migration/version policy with serde defaults.
-- [ ] Add randomized operation/property tests if current dependencies permit it without an outsized
-  dependency; otherwise add a deterministic seeded operation harness.
-- [ ] Map all 16 invariants to implementation and tests in final documentation.
-- [ ] Regenerate schemas/docs and run all available checks.
-- [ ] Commit as `feat: validate and document managed window model`.
+The closing phase covers task sections 21, 22, 23 and 26. It was split into five sub-phases on
+2026-08-30, after an audit of the event pipeline, the state output and the test inventory, because
+the four bullets it started as are four unrelated pieces of work and only one of them is an event
+question.
 
-Expected handwritten change: 350-500 lines plus generated artifacts. Likely files:
-`process_event.rs`, `window_manager_event.rs`, `monitor_reconciliator/mod.rs`, `workspace.rs`,
-`window_manager.rs`, `state.rs`, `static_config.rs`, tests, and docs.
+- [x] 14A: reclaim a suspended handle Windows has reused, and clear every per-window runtime table
+  when a window is reaped rather than destroyed.
+- [ ] 14B: converge the model's presentation with a maximize or restore the user performed outside
+  komorebi, idempotently and without changing placement or ownership.
+- [ ] 14C: complete the state output with the derived fields a consumer cannot compute, and version
+  it so an older state document is recognised rather than silently misread.
+- [ ] 14D: add a deterministic seeded operation harness which drives long random operation
+  sequences against the invariants.
+- [ ] 14E: map all 16 invariants to their implementation and tests, regenerate the schemas, run
+  every available check and write the final delivery summary.
+
+#### Phase 14A - Suspended handle identity and orphan cleanup
+
+The audit which opened Phase 14 found two defects in what happens to a window komorebi stops
+tracking without seeing it destroyed.
+
+A suspended window is removed from `known_hwnds` and from the reaper's cache, which is correct -
+komorebi no longer manages it - but it means nothing will ever notice that the window has gone. Its
+handle stays in `temporarily_unmanaged_hwnds` for the lifetime of the process, and Windows reuses
+window handles freely: the next window to be given that numeric handle is silently suppressed from
+management forever, with no command able to fix it because the resume path refuses a window it does
+not own.
+
+The reaper is the second. It removes a vanished window from its workspace and from `known_hwnds`,
+but not from `HIDDEN_HWNDS`, `already_moved_window_handles` or a pending move operation, all of
+which the destroy path clears. A crashed application therefore leaves entries behind which a reused
+handle will read as its own.
+
+- [x] Give the suspension set an identity per handle - the owning process - and validate it on
+  every consultation, so a handle which now names a different window is reclaimed instead of
+  suppressed.
+- [x] Keep the identity check off the hot path: an event for a handle the set does not hold makes
+  no Win32 call at all.
+- [x] Prune the whole set where a stale entry would change an answer: the resume subject heuristic
+  and the suspend and resume commands.
+- [x] Clear the per-window runtime tables when the reaper removes an orphan, exactly as the destroy
+  path does.
+- [x] Add reuse, death, pruning and orphan-cleanup tests against an injected identity source.
+- [x] Commit as `feat: reclaim reused and orphaned window handles`.
+
+Actual files: new `komorebi/src/suspension.rs`, `komorebi/src/lib.rs`,
+`komorebi/src/window_manager.rs`, `komorebi/src/process_event.rs`, `komorebi/src/reaper.rs`,
+`komorebi/src/invariants.rs`, `komorebi/src/static_config.rs`.
+
+`HashSet<isize>` became `SuspensionSet`, which holds a `SuspendedWindow` per handle rather than a
+bare number, and the difference between its two lookups is the phase. `contains` is the plain
+membership question and asks Win32 nothing, which is what invariant validation needs; `claims` is
+the question the event path asks, and it gives the entry up when the handle no longer names the
+window which was suspended with it.
+
+Staleness is anchored on what was recorded, not on liveness alone: an entry keeps the owning
+process it was suspended with, and it is stale exactly when the handle does not currently name a
+window of that process. That covers both the dead handle and the reused handle with one comparison.
+An entry recorded without an identity - which in a running window manager means Win32 refused to
+answer about a window it was managing a moment earlier - has no anchor to contradict, so it is only
+ever given up explicitly. That is deliberately the old behaviour, and it is what keeps the
+suspension semantics of the existing tests, whose handles name no real window, unchanged.
+
+The identity source is injected through a `WindowIdentity` trait so the reuse and death cases are
+testable without a desktop session. `Win32Identity` is the only production implementation and the
+default for every method which does not name one.
+
+The reaper fix is the smaller half but the same defect. It removed an orphan from its workspace and
+from `known_hwnds` while leaving `HIDDEN_HWNDS`, `already_moved_window_handles` and a pending move
+operation pointing at a handle whose window no longer exists - all of which the destroy path clears.
+`WindowManager::forget_window` is now the single answer to "this window is gone", and the reaper
+calls it.
+
+Verification: `komorebi` lib tests 491 -> 503 passing, full workspace suite serial and green.
+`cargo fmt --check` and `cargo clippy --workspace --all-targets` clean apart from the pre-existing
+`items after a test module` warning.
+
+#### Phase 14B - External presentation convergence
+
+Expected handwritten change: 200-300 lines. Likely files: `process_event.rs`, `workspace.rs`,
+`window_manager.rs`, `window_manager_event.rs`.
+
+#### Phase 14C - State output completeness and versioning
+
+Expected handwritten change: 200-300 lines plus generated schema. Likely files: `state.rs`,
+`container.rs`, `workspace.rs`, `schema.json`.
+
+#### Phase 14D - Seeded operation harness
+
+Expected handwritten change: 250-350 lines. Likely files: new
+`komorebi/src/model_operations.rs` or a colocated test module.
+
+#### Phase 14E - Invariant map, schemas, documentation and final verification
+
+Expected handwritten change: documentation only, plus regenerated schemas.
 
 ## Provisional affected-file inventory
 

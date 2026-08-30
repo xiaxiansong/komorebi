@@ -90,6 +90,7 @@ use crate::stackbar_manager::STACKBAR_TAB_BACKGROUND_COLOUR;
 use crate::stackbar_manager::STACKBAR_TAB_HEIGHT;
 use crate::stackbar_manager::STACKBAR_TAB_WIDTH;
 use crate::stackbar_manager::STACKBAR_UNFOCUSED_TEXT_COLOUR;
+use crate::suspension::SuspensionSet;
 use crate::theme_manager;
 use crate::transparency_manager;
 use crate::window;
@@ -1395,7 +1396,7 @@ impl StaticConfig {
             already_moved_window_handles: Arc::new(Mutex::new(HashSet::new())),
             uncloack_to_ignore: 0,
             known_hwnds: HashMap::new(),
-            temporarily_unmanaged_hwnds: HashSet::new(),
+            temporarily_unmanaged_hwnds: SuspensionSet::default(),
         };
 
         #[allow(deprecated)]

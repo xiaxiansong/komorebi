@@ -370,7 +370,7 @@ impl ValidateInvariants for WindowManager {
                             ));
                         }
 
-                        if self.temporarily_unmanaged_hwnds.contains(&window.hwnd) {
+                        if self.temporarily_unmanaged_hwnds.contains(window.hwnd) {
                             violations.push(InvariantViolation::new(
                                 Invariant::UnmanagedExclusion,
                                 format!(

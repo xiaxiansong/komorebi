@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -33,6 +32,9 @@ use crate::splash;
 use crate::splash::mdm_enrollment;
 use crate::stackbar_manager;
 use crate::state::State;
+use crate::suspension::SuspensionSet;
+use crate::suspension::Win32Identity;
+use crate::suspension::WindowIdentity;
 use crate::transparency_manager;
 use crate::window::RuleDebug;
 use crate::window::should_act;
@@ -57,17 +59,30 @@ fn should_refocus_after_destroy(foreground_hwnd: Option<isize>) -> bool {
     matches!(foreground_hwnd, None | Some(0))
 }
 
+/// Whether this event is about a temporarily unmanaged window and must therefore change nothing.
+///
+/// The set is consulted through `claims`, not through plain membership, so a handle which has died
+/// or been reused is given up here and the event goes on to be processed for whatever window now
+/// holds that handle. A handle the set never held costs no Win32 call at all.
 fn should_suppress_temporarily_unmanaged_event(
-    temporarily_unmanaged_hwnds: &mut HashSet<isize>,
+    temporarily_unmanaged_hwnds: &mut SuspensionSet,
     event: WindowManagerEvent,
+    identity: &impl WindowIdentity,
 ) -> bool {
     match event {
         WindowManagerEvent::Destroy(_, window) => {
-            temporarily_unmanaged_hwnds.remove(&window.hwnd);
+            temporarily_unmanaged_hwnds.remove(window.hwnd);
             false
         }
-        WindowManagerEvent::Resume(window) => !temporarily_unmanaged_hwnds.remove(&window.hwnd),
-        _ => temporarily_unmanaged_hwnds.contains(&event.hwnd()),
+        WindowManagerEvent::Resume(window) => {
+            // A resume only proceeds for a handle the set still claims. One which has been reused
+            // names a window which was never suspended, and that window is managed the ordinary
+            // way rather than handed back.
+            let claimed = temporarily_unmanaged_hwnds.claims_with(window.hwnd, identity);
+            temporarily_unmanaged_hwnds.remove(window.hwnd);
+            !claimed
+        }
+        _ => temporarily_unmanaged_hwnds.claims_with(event.hwnd(), identity),
     }
 }
 
@@ -114,43 +129,121 @@ mod destroy_focus_tests {
 #[cfg(test)]
 mod temporarily_unmanaged_event_tests {
     use super::*;
+    use std::collections::HashMap;
+
+    /// An identity source which answers from a table instead of from the desktop.
+    #[derive(Default)]
+    struct FakeIdentity {
+        owners: HashMap<isize, u32>,
+    }
+
+    impl FakeIdentity {
+        fn with(owners: &[(isize, u32)]) -> Self {
+            Self {
+                owners: owners.iter().copied().collect(),
+            }
+        }
+    }
+
+    impl WindowIdentity for FakeIdentity {
+        fn identify(&self, hwnd: isize) -> Option<u32> {
+            self.owners.get(&hwnd).copied()
+        }
+    }
+
+    fn suspended(hwnds: &[isize], identity: &impl WindowIdentity) -> SuspensionSet {
+        let mut set = SuspensionSet::default();
+
+        for hwnd in hwnds {
+            set.insert_with(*hwnd, identity);
+        }
+
+        set
+    }
 
     #[test]
     fn ordinary_events_are_suppressed_without_clearing_the_hwnd() {
-        let mut hwnds = HashSet::from([42]);
+        let identity = FakeIdentity::with(&[(42, 1000)]);
+        let mut hwnds = suspended(&[42], &identity);
         let event = WindowManagerEvent::Show(WinEvent::ObjectShow, Window::from(42));
 
         assert!(should_suppress_temporarily_unmanaged_event(
-            &mut hwnds, event
+            &mut hwnds, event, &identity
         ));
-        assert!(hwnds.contains(&42));
+        assert!(hwnds.contains(42));
     }
 
     #[test]
     fn destroy_clears_the_hwnd() {
-        let mut hwnds = HashSet::from([42]);
+        let identity = FakeIdentity::with(&[(42, 1000)]);
+        let mut hwnds = suspended(&[42], &identity);
         let event = WindowManagerEvent::Destroy(WinEvent::ObjectDestroy, Window::from(42));
 
         assert!(!should_suppress_temporarily_unmanaged_event(
-            &mut hwnds, event
+            &mut hwnds, event, &identity
         ));
-        assert!(!hwnds.contains(&42));
+        assert!(!hwnds.contains(42));
     }
 
     #[test]
     fn only_a_suspended_hwnd_can_be_resumed() {
-        let mut hwnds = HashSet::new();
+        let identity = FakeIdentity::with(&[(42, 1000)]);
+        let mut hwnds = SuspensionSet::default();
         let event = WindowManagerEvent::Resume(Window::from(42));
 
         assert!(should_suppress_temporarily_unmanaged_event(
-            &mut hwnds, event
+            &mut hwnds, event, &identity
         ));
 
-        hwnds.insert(42);
+        hwnds.insert_with(42, &identity);
         assert!(!should_suppress_temporarily_unmanaged_event(
-            &mut hwnds, event
+            &mut hwnds, event, &identity
         ));
-        assert!(!hwnds.contains(&42));
+        assert!(!hwnds.contains(42));
+    }
+
+    #[test]
+    fn an_event_for_a_reused_handle_is_processed_rather_than_suppressed() {
+        let mut hwnds = suspended(&[42], &FakeIdentity::with(&[(42, 1000)]));
+
+        // The suspended window went away without a destroy event, and Windows handed the same
+        // handle to a window of another process.
+        let reused = FakeIdentity::with(&[(42, 2000)]);
+        let event = WindowManagerEvent::Show(WinEvent::ObjectShow, Window::from(42));
+
+        assert!(!should_suppress_temporarily_unmanaged_event(
+            &mut hwnds, event, &reused
+        ));
+        assert!(!hwnds.contains(42));
+    }
+
+    #[test]
+    fn resuming_a_reused_handle_does_not_hand_back_a_window_nothing_suspended() {
+        let mut hwnds = suspended(&[42], &FakeIdentity::with(&[(42, 1000)]));
+
+        let reused = FakeIdentity::with(&[(42, 2000)]);
+        let event = WindowManagerEvent::Resume(Window::from(42));
+
+        // Suppressed as a resume, because there is nothing to resume: the window which now holds
+        // the handle is managed the ordinary way, by the show event which introduces it.
+        assert!(should_suppress_temporarily_unmanaged_event(
+            &mut hwnds, event, &reused
+        ));
+        assert!(!hwnds.contains(42));
+    }
+
+    #[test]
+    fn an_event_for_a_dead_handle_gives_the_entry_up() {
+        let mut hwnds = suspended(&[42], &FakeIdentity::with(&[(42, 1000)]));
+
+        let event = WindowManagerEvent::Show(WinEvent::ObjectShow, Window::from(42));
+
+        assert!(!should_suppress_temporarily_unmanaged_event(
+            &mut hwnds,
+            event,
+            &FakeIdentity::default()
+        ));
+        assert!(!hwnds.contains(42));
     }
 }
 
@@ -204,7 +297,7 @@ impl WindowManager {
     pub fn process_event(&mut self, event: WindowManagerEvent) -> eyre::Result<()> {
         // Destroy cleanup is unconditional, including while global event processing is paused.
         if let WindowManagerEvent::Destroy(_, window) = event {
-            self.temporarily_unmanaged_hwnds.remove(&window.hwnd);
+            self.temporarily_unmanaged_hwnds.remove(window.hwnd);
         }
 
         if self.is_paused {
@@ -212,8 +305,11 @@ impl WindowManager {
             return Ok(());
         }
 
-        if should_suppress_temporarily_unmanaged_event(&mut self.temporarily_unmanaged_hwnds, event)
-        {
+        if should_suppress_temporarily_unmanaged_event(
+            &mut self.temporarily_unmanaged_hwnds,
+            event,
+            &Win32Identity,
+        ) {
             tracing::trace!(
                 "ignoring event for temporarily unmanaged hwnd: {}",
                 event.hwnd()

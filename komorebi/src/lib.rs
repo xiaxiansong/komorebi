@@ -28,6 +28,7 @@ pub mod stackbar_manager;
 pub mod state;
 pub mod static_config;
 pub mod styles;
+pub mod suspension;
 pub mod theme_manager;
 pub mod transparency_manager;
 pub mod window;

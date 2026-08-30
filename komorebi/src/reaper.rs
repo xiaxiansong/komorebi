@@ -112,7 +112,9 @@ fn handle_notifications(wm: Arc<Mutex<WindowManager>>) -> color_eyre::Result<()>
                 }
             }
 
-            wm.known_hwnds.remove(hwnd);
+            // Everything the destroy path would have cleared for this handle, cleared here
+            // instead: a reaped window never produced the event that path listens for.
+            wm.forget_window(*hwnd);
 
             let window = Window::from(*hwnd);
             notify_subscribers(
