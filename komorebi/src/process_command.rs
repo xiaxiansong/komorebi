@@ -87,6 +87,7 @@ use crate::theme_manager;
 use crate::transparency_manager;
 use crate::window::RuleDebug;
 use crate::window::Window;
+use crate::window_manager::FloatingOutcome;
 use crate::window_manager::WindowManager;
 use crate::windows_api::WindowsApi;
 use crate::winevent_listener;
@@ -328,7 +329,14 @@ impl WindowManager {
                         self.move_container_in_direction(direction)?;
                     }
                     WorkspaceLayer::Floating => {
-                        self.move_floating_window_in_direction(direction)?;
+                        // The floating layer's directional move is the same operation as the
+                        // explicit floating move command, taking its delta from the
+                        // configuration; a window it may not act on is reported, not an error.
+                        if let FloatingOutcome::Rejected(rejection) =
+                            self.move_floating_window(direction, None)?
+                        {
+                            tracing::info!("{rejection}");
+                        }
                     }
                 }
             }

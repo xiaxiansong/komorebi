@@ -1,3 +1,4 @@
+use std::fmt;
 use std::ops::Deref;
 use std::ops::DerefMut;
 
@@ -34,6 +35,43 @@ pub enum Presentation {
     Normal,
     Maximized,
     Fullscreen,
+}
+
+/// Why a floating geometry command did not act on a window.
+///
+/// These are refusals rather than failures: the command found a window and decided it was the
+/// wrong kind of window, so nothing at all was changed. They are values instead of error strings
+/// because the command surface has to be able to tell "you asked to move a tiled window" apart
+/// from "komorebi could not do it".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub enum FloatingRejection {
+    /// There is no focused window for the command to act on.
+    NoSubject,
+    /// The window is positioned by its container, so it has no rectangle of its own to change.
+    NotFloating,
+    /// The window is minimized, so it has no rectangle on screen.
+    Minimized,
+    /// The window is drawn over the arrangement rather than at its own rectangle.
+    Presented(Presentation),
+    /// The window floats, but neither the model nor Win32 could say where it currently is.
+    UnknownGeometry,
+}
+
+impl fmt::Display for FloatingRejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoSubject => write!(f, "there is no focused window"),
+            Self::NotFloating => write!(f, "the focused window is not floating"),
+            Self::Minimized => write!(f, "the focused window is minimized"),
+            Self::Presented(presentation) => {
+                write!(f, "the focused window is {presentation:?}")
+            }
+            Self::UnknownGeometry => {
+                write!(f, "the focused window has no known floating rectangle")
+            }
+        }
+    }
 }
 
 /// Runtime and serialized state for a window owned by a container.
@@ -204,6 +242,35 @@ impl ManagedWindow {
                 self.window.restore_with_border(with_border);
             }
         }
+    }
+
+    /// The rectangle a floating move or resize may act on.
+    ///
+    /// Only a visible, floating, `Normal` window has one. A stored window's rectangle belongs to
+    /// its container's slot, a minimized window has none, and a maximized or fullscreen window is
+    /// drawn somewhere its own rectangle does not describe; changing any of those here would
+    /// silently contradict a state this model owns elsewhere.
+    ///
+    /// `observed` is what Win32 currently reports for the window and takes precedence over the
+    /// recorded rectangle, because the user can drag a floating window with the mouse without any
+    /// command passing through here. The record is where the last commanded geometry was stored,
+    /// not a claim about where the window is now.
+    pub fn floating_geometry(&self, observed: Option<Rect>) -> Result<Rect, FloatingRejection> {
+        if self.placement != ManagedPlacement::Floating {
+            return Err(FloatingRejection::NotFloating);
+        }
+
+        if self.visibility == Visibility::Minimized {
+            return Err(FloatingRejection::Minimized);
+        }
+
+        if self.presentation != Presentation::Normal {
+            return Err(FloatingRejection::Presented(self.presentation));
+        }
+
+        observed
+            .or(self.floating_rect)
+            .ok_or(FloatingRejection::UnknownGeometry)
     }
 
     pub fn set_floating(&mut self, current_rect: Rect) -> bool {
@@ -417,6 +484,54 @@ mod tests {
 
         assert_eq!(window.set_normal(rect(3)), None);
         assert_eq!(window.presentation, Presentation::Fullscreen);
+    }
+
+    #[test]
+    fn only_a_visible_floating_normal_window_has_floating_geometry() {
+        let mut window = managed();
+        assert_eq!(
+            window.floating_geometry(Some(rect(1))),
+            Err(FloatingRejection::NotFloating)
+        );
+
+        window.set_floating(rect(2));
+        assert_eq!(window.floating_geometry(Some(rect(1))), Ok(rect(1)));
+
+        window.set_maximized(rect(2));
+        assert_eq!(
+            window.floating_geometry(Some(rect(1))),
+            Err(FloatingRejection::Presented(Presentation::Maximized))
+        );
+
+        window.set_fullscreen(rect(2));
+        assert_eq!(
+            window.floating_geometry(Some(rect(1))),
+            Err(FloatingRejection::Presented(Presentation::Fullscreen))
+        );
+
+        window.set_normal(rect(2));
+        window.set_minimized();
+        assert_eq!(
+            window.floating_geometry(Some(rect(1))),
+            Err(FloatingRejection::Minimized)
+        );
+    }
+
+    #[test]
+    fn floating_geometry_prefers_what_win32_reports_over_the_record() {
+        let mut window = managed();
+        window.set_floating(rect(2));
+
+        // The user can drag a floating window without any command passing through the model, so
+        // the recorded rectangle is only used when Win32 could not be asked.
+        assert_eq!(window.floating_geometry(Some(rect(9))), Ok(rect(9)));
+        assert_eq!(window.floating_geometry(None), Ok(rect(2)));
+
+        window.floating_rect = None;
+        assert_eq!(
+            window.floating_geometry(None),
+            Err(FloatingRejection::UnknownGeometry)
+        );
     }
 
     #[test]

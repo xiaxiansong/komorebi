@@ -58,7 +58,11 @@ use crate::border_manager::BORDER_OFFSET;
 use crate::border_manager::BORDER_WIDTH;
 use crate::container::Container;
 use crate::current_virtual_desktop;
+use crate::floating_geometry::FloatingBounds;
+use crate::floating_geometry::FloatingLimits;
+use crate::floating_geometry::scale_delta;
 use crate::load_configuration;
+use crate::managed_window::FloatingRejection;
 use crate::managed_window::Presentation;
 use crate::monitor::Monitor;
 use crate::ring::Ring;
@@ -73,6 +77,17 @@ use crate::windows_api::WindowsApi;
 use crate::winevent_listener;
 use crate::workspace::Workspace;
 use crate::workspace::WorkspaceLayer;
+
+/// The result of a floating move or resize command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatingOutcome {
+    /// The window was moved or resized to this rectangle, as accepted by Win32.
+    Applied(Rect),
+    /// The command was valid and changed nothing, because the window was already at the clamp.
+    NoOp,
+    /// The focused window was the wrong kind of window for this command.
+    Rejected(FloatingRejection),
+}
 
 #[derive(Debug)]
 pub struct WindowManager {
@@ -2384,81 +2399,107 @@ impl WindowManager {
         Ok(())
     }
 
+    /// What a floating geometry command did.
+    ///
+    /// A refusal is not an error: the command found the focused window, decided it was the wrong
+    /// kind of window and changed nothing. The caller reports the difference rather than treating
+    /// a tiled window as a failure to move a floating one.
     #[tracing::instrument(skip(self))]
-    pub fn move_floating_window_in_direction(
+    pub fn move_floating_window(
         &mut self,
         direction: OperationDirection,
-    ) -> eyre::Result<()> {
+        delta: Option<i32>,
+    ) -> eyre::Result<FloatingOutcome> {
+        let delta = self.scaled_floating_delta(delta.unwrap_or(self.floating_move_delta))?;
+        let bounds = FloatingBounds::new(self.focused_monitor_work_area()?);
         let mouse_follows_focus = self.mouse_follows_focus;
+        let workspace = self.focused_workspace_mut()?;
+        let observed = Self::observed_floating_rect(workspace);
 
-        let mut focused_monitor_work_area = self.focused_monitor_work_area()?;
-        let border_offset = BORDER_OFFSET.load(Ordering::SeqCst);
-        let border_width = BORDER_WIDTH.load(Ordering::SeqCst);
-        focused_monitor_work_area.left += border_offset;
-        focused_monitor_work_area.left += border_width;
-        focused_monitor_work_area.top += border_offset;
-        focused_monitor_work_area.top += border_width;
-        focused_monitor_work_area.right -= border_offset * 2;
-        focused_monitor_work_area.right -= border_width * 2;
-        focused_monitor_work_area.bottom -= border_offset * 2;
-        focused_monitor_work_area.bottom -= border_width * 2;
+        let change =
+            match workspace.move_focused_floating_window(direction, delta, bounds, observed) {
+                Ok(change) => change,
+                Err(rejection) => return Ok(FloatingOutcome::Rejected(rejection)),
+            };
 
-        let focused_workspace = self.focused_workspace()?;
-        let delta = self.resize_delta;
+        let accepted = Self::apply_floating_geometry(change.hwnd, change.rect)?;
+        self.focused_workspace_mut()?
+            .confirm_floating_geometry(change.hwnd, accepted);
 
-        let focused_hwnd = WindowsApi::foreground_window()?;
-        for window in focused_workspace.floating_windows().iter() {
-            if window.hwnd == focused_hwnd {
-                let mut rect = WindowsApi::window_rect(window.hwnd)?;
-                match direction {
-                    OperationDirection::Left => {
-                        if rect.left - delta < focused_monitor_work_area.left {
-                            rect.left = focused_monitor_work_area.left;
-                        } else {
-                            rect.left -= delta;
-                        }
-                    }
-                    OperationDirection::Right => {
-                        if rect.left + delta + rect.right
-                            > focused_monitor_work_area.left + focused_monitor_work_area.right
-                        {
-                            rect.left = focused_monitor_work_area.left
-                                + focused_monitor_work_area.right
-                                - rect.right;
-                        } else {
-                            rect.left += delta;
-                        }
-                    }
-                    OperationDirection::Up => {
-                        if rect.top - delta < focused_monitor_work_area.top {
-                            rect.top = focused_monitor_work_area.top;
-                        } else {
-                            rect.top -= delta;
-                        }
-                    }
-                    OperationDirection::Down => {
-                        if rect.top + delta + rect.bottom
-                            > focused_monitor_work_area.top + focused_monitor_work_area.bottom
-                        {
-                            rect.top = focused_monitor_work_area.top
-                                + focused_monitor_work_area.bottom
-                                - rect.bottom;
-                        } else {
-                            rect.top += delta;
-                        }
-                    }
-                }
-
-                WindowsApi::position_window(window.hwnd, &rect, false, true)?;
-                if mouse_follows_focus {
-                    WindowsApi::center_cursor_in_rect(&rect)?;
-                }
-
-                break;
-            }
+        if mouse_follows_focus {
+            WindowsApi::center_cursor_in_rect(&accepted)?;
         }
 
-        Ok(())
+        Ok(if change.changed {
+            FloatingOutcome::Applied(accepted)
+        } else {
+            FloatingOutcome::NoOp
+        })
+    }
+
+    #[tracing::instrument(skip(self))]
+    pub fn resize_floating_window(
+        &mut self,
+        direction: OperationDirection,
+        sizing: Sizing,
+        delta: Option<i32>,
+    ) -> eyre::Result<FloatingOutcome> {
+        let delta = self.scaled_floating_delta(delta.unwrap_or(self.floating_resize_delta))?;
+        let limits = FloatingLimits::default();
+        let workspace = self.focused_workspace_mut()?;
+        let observed = Self::observed_floating_rect(workspace);
+
+        let change = match workspace
+            .resize_focused_floating_window(direction, sizing, delta, limits, observed)
+        {
+            Ok(change) => change,
+            Err(rejection) => return Ok(FloatingOutcome::Rejected(rejection)),
+        };
+
+        let accepted = Self::apply_floating_geometry(change.hwnd, change.rect)?;
+        self.focused_workspace_mut()?
+            .confirm_floating_geometry(change.hwnd, accepted);
+
+        Ok(if change.changed {
+            FloatingOutcome::Applied(accepted)
+        } else {
+            FloatingOutcome::NoOp
+        })
+    }
+
+    /// Convert a configured delta into physical pixels for the focused monitor.
+    ///
+    /// A monitor which cannot be asked for its scale is treated as unscaled rather than failing
+    /// the command; the delta is then simply the configured one.
+    fn scaled_floating_delta(&self, delta: i32) -> eyre::Result<i32> {
+        let hmonitor = self.focused_monitor().ok_or_eyre("there is no monitor")?.id;
+        let scale = WindowsApi::dpi_for_monitor(hmonitor).unwrap_or(1.0);
+
+        Ok(scale_delta(delta, scale))
+    }
+
+    /// What Win32 currently reports for the window a floating command would act on.
+    ///
+    /// A window can be dragged with the mouse without any command passing through the model, so
+    /// the live rectangle is the honest starting point. A query which fails is not an error here:
+    /// the model's recorded rectangle is then used instead.
+    fn observed_floating_rect(workspace: &Workspace) -> Option<Rect> {
+        let hwnd = workspace.floating_geometry_subject()?.hwnd;
+
+        WindowsApi::window_rect(hwnd).ok()
+    }
+
+    /// Apply a floating rectangle and return the one Win32 ended up with.
+    ///
+    /// The window is positioned without a z-order change and without a retile: no slot, no other
+    /// window and no container state is involved in either command. Reading the rectangle back is
+    /// what makes the model's record agree with an application which refused the size it was
+    /// given; a read-back which fails leaves the requested rectangle recorded, which is the best
+    /// available answer.
+    fn apply_floating_geometry(hwnd: isize, rect: Rect) -> eyre::Result<Rect> {
+        WindowsApi::position_window(hwnd, &rect, false, true)?;
+
+        Ok(WindowsApi::window_rect(hwnd).unwrap_or(rect))
     }
 
     #[tracing::instrument(skip(self))]

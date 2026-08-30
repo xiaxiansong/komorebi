@@ -1123,6 +1123,8 @@ than extended.
 - [x] Add move, eight-edge resize, clamp, minimum-size and DPI tests.
 - [x] Commit as `feat: add floating window geometry primitives`.
 
+Commit: `9d588595`.
+
 Expected handwritten change: 300-450 lines. Likely files: new `floating_geometry.rs`, `lib.rs`,
 `static_config.rs`, `window_manager.rs`, `state.rs`.
 
@@ -1162,15 +1164,54 @@ which are 9B, and the command spelling, which is 9C.
 
 #### Phase 9B - Validated floating operations and Win32 read-back
 
-- [ ] Resolve the subject from the model's focused window, never from a foreground query.
-- [ ] Reject non-floating, minimized and presented subjects with typed reasons and no state change.
-- [ ] Store the planned rectangle, apply it, then read the accepted rectangle back and store that.
-- [ ] Leave slots, container state, focus and every other window untouched.
-- [ ] Add rejection, isolation, hidden-container, clamp and read-back tests.
-- [ ] Commit as `feat: move and resize floating windows independently`.
+- [x] Resolve the subject from the model's focused window, never from a foreground query.
+- [x] Reject non-floating, minimized and presented subjects with typed reasons and no state change.
+- [x] Store the planned rectangle, apply it, then read the accepted rectangle back and store that.
+- [x] Leave slots, container state, focus and every other window untouched.
+- [x] Add rejection, isolation, hidden-container, clamp and read-back tests.
+- [x] Commit as `feat: move and resize floating windows independently`.
 
 Expected handwritten change: 300-450 lines. Likely files: `workspace.rs`, `window_manager.rs`,
 `windows_api.rs`, `managed_window.rs`.
+
+Actual files: `managed_window.rs`, `workspace.rs`, `window_manager.rs` and `process_command.rs`.
+`windows_api.rs` was not needed: `position_window` already compensates for the shadow frame and
+`window_rect` already returns the DWM extended frame bounds, so applying a rectangle and reading
+back what was accepted are both existing calls. Actual Rust change: 576 added, 66 removed, of which
+about 300 are tests and 66 removed are upstream's `move_floating_window_in_direction`.
+
+The subject is the focused window and nothing else. `focused_floating_window` was the obvious thing
+to reuse and is the wrong function here: its fallback to the first floating window in cycle order
+is what entering the floating layer needs, and would make a floating command act on a window the
+user never selected. Upstream's foreground-window query is wrong for a second reason - it asks the
+desktop who is focused instead of asking the model, so it disagrees with the model exactly when
+they have drifted apart, which is the moment a command most needs to be predictable.
+
+The starting rectangle comes from Win32 rather than from the record. A floating window can be
+dragged with the mouse without any command passing through the model, so `floating_rect` is a
+record of the last commanded geometry rather than a claim about where the window is now; planning
+from the stale record would make the first keystroke after a drag jump the window back.
+
+Refusals are values, not errors. `FloatingRejection` distinguishes "you asked to move a tiled
+window" from "komorebi could not move it", which is what Phase 9C needs to return distinct exit
+information, and it is what lets the floating layer's existing directional move report a wrong
+subject without failing a command. The state is inspected before anything is written, so a refused
+command has nothing to roll back.
+
+The read-back is the phase's only real Win32 dependency and it exists because an application may
+refuse the size it is given. Recording what it settled on rather than what was asked for is what
+stops the next resize from starting off a rectangle the window never had.
+
+Nothing in either command touches a slot, a container state, a stack, a focus history or another
+window, and the isolation test pins that: the slot map and the container identities are compared
+before and after, and a floating window inside a Hidden container moves without the container
+becoming Active.
+
+Verification: `cargo test --workspace -- --test-threads=1` passed with komorebi 372 passed/1 ignored
+(up from 361), layouts 128, bar 3. `cargo fmt --all --check` clean; `cargo clippy --workspace
+--all-targets` reported only the pre-existing `items after a test module` warning.
+
+Not in this phase: the command spelling, which is 9C.
 
 #### Phase 9C - Distinct floating commands
 

@@ -34,7 +34,12 @@ use crate::core::OperationDirection;
 use crate::core::PlacementMatchingRules;
 use crate::core::PlacementTarget;
 use crate::core::Rect;
+use crate::core::Sizing;
 use crate::core::WindowPlacement;
+use crate::floating_geometry::FloatingBounds;
+use crate::floating_geometry::FloatingLimits;
+use crate::floating_geometry::plan_edge_resize;
+use crate::floating_geometry::plan_move;
 use crate::focus_history::Mru;
 use crate::geometry::LogicalRect;
 use crate::geometry::LogicalSlots;
@@ -44,6 +49,7 @@ use crate::geometry::SlotResize;
 use crate::geometry::SlotShift;
 use crate::geometry::SplitAxis;
 use crate::lockable_sequence::LockableSequence;
+use crate::managed_window::FloatingRejection;
 use crate::managed_window::ManagedPlacement;
 use crate::managed_window::ManagedWindow;
 use crate::managed_window::Presentation;
@@ -373,6 +379,17 @@ fn resolve_threshold_match(
         .rev()
         .find(|(threshold, _)| container_count >= *threshold)
         .map(|(_, opts)| *opts)
+}
+
+/// A floating window and the rectangle a geometry command produced for it.
+///
+/// `changed` distinguishes a command which moved a window from one which was already against the
+/// clamp, so a caller can report a no-op without comparing rectangles itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FloatingGeometryChange {
+    pub hwnd: isize,
+    pub rect: Rect,
+    pub changed: bool,
 }
 
 impl Workspace {
@@ -2546,6 +2563,86 @@ impl Workspace {
         Some(hwnd)
     }
 
+    /// The window a floating geometry command acts on.
+    ///
+    /// This is the focused window, and only the focused window. It is deliberately not
+    /// [`Workspace::focused_floating_window`], whose fallback to the first floating window in
+    /// cycle order is what entering the floating layer needs and would here quietly act on a
+    /// window the user never selected.
+    #[must_use]
+    pub fn floating_geometry_subject(&self) -> Option<&ManagedWindow> {
+        self.focused_container()
+            .and_then(Container::focused_managed_window)
+    }
+
+    /// Move the focused floating window, changing nothing else in the workspace.
+    pub fn move_focused_floating_window(
+        &mut self,
+        direction: OperationDirection,
+        delta: i32,
+        bounds: FloatingBounds,
+        observed: Option<Rect>,
+    ) -> Result<FloatingGeometryChange, FloatingRejection> {
+        self.change_focused_floating_geometry(observed, |rect| {
+            plan_move(rect, direction, delta, bounds)
+        })
+    }
+
+    /// Move one edge of the focused floating window, changing nothing else in the workspace.
+    pub fn resize_focused_floating_window(
+        &mut self,
+        direction: OperationDirection,
+        sizing: Sizing,
+        delta: i32,
+        limits: FloatingLimits,
+        observed: Option<Rect>,
+    ) -> Result<FloatingGeometryChange, FloatingRejection> {
+        self.change_focused_floating_geometry(observed, |rect| {
+            plan_edge_resize(rect, direction, sizing, delta, limits)
+        })
+    }
+
+    /// Plan and record new geometry for the focused floating window.
+    ///
+    /// Nothing here reads or writes a logical slot, a container's state, a stack, a focus history
+    /// or any other window. A floating window's own rectangle is the entire extent of what these
+    /// commands own, which is what makes them independent of container movement rather than a
+    /// variant of it.
+    ///
+    /// A rejected subject leaves the workspace exactly as it was: the state is inspected before
+    /// anything is written, so there is no half-applied case to undo.
+    fn change_focused_floating_geometry(
+        &mut self,
+        observed: Option<Rect>,
+        plan: impl FnOnce(Rect) -> Rect,
+    ) -> Result<FloatingGeometryChange, FloatingRejection> {
+        let subject = self
+            .floating_geometry_subject()
+            .ok_or(FloatingRejection::NoSubject)?;
+
+        let hwnd = subject.hwnd;
+        let current = subject.floating_geometry(observed)?;
+        let planned = plan(current);
+
+        self.set_floating_rect(hwnd, planned);
+
+        Ok(FloatingGeometryChange {
+            hwnd,
+            rect: planned,
+            changed: planned != current,
+        })
+    }
+
+    /// Record the rectangle Win32 ended up giving a floating window.
+    ///
+    /// An application is free to refuse a size, and a resize which asked for less than an
+    /// application's own minimum comes back larger. Storing what was accepted rather than what
+    /// was asked for is what stops the next command from starting off a rectangle the window
+    /// never had.
+    pub fn confirm_floating_geometry(&mut self, hwnd: isize, accepted: Rect) -> bool {
+        self.set_floating_rect(hwnd, accepted)
+    }
+
     /// Record the rectangle a floating window actually occupies.
     pub fn set_floating_rect(&mut self, hwnd: isize, rect: Rect) -> bool {
         for window in self.floating_managed_windows_mut() {
@@ -3869,6 +3966,255 @@ mod tests {
         assert_eq!(workspace.active_container_count(), 1);
         // The container is still there with its window; only its slot went away.
         assert_eq!(workspace.containers().len(), 2);
+    }
+
+    fn floating_bounds() -> FloatingBounds {
+        FloatingBounds::new(work_area(1920, 1080))
+    }
+
+    /// A workspace with two single-window containers, the first of which floats and is focused.
+    fn workspace_with_a_focused_floating_window() -> Workspace {
+        let mut workspace = workspace_with_containers(&[1, 1]);
+
+        workspace.float_window(0, floating_rect(100)).unwrap();
+        workspace.focus_container(0);
+
+        workspace
+    }
+
+    #[test]
+    fn moving_a_floating_window_changes_its_rectangle_and_nothing_else() {
+        let mut workspace = workspace_with_a_focused_floating_window();
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        let slots_before = workspace.logical_slots.ordered(SlotOrder::LeftToRight);
+        let ids_before = workspace
+            .containers()
+            .iter()
+            .map(|container| container.id.clone())
+            .collect::<Vec<_>>();
+
+        let change = workspace
+            .move_focused_floating_window(OperationDirection::Right, 50, floating_bounds(), None)
+            .unwrap();
+
+        assert_eq!(change.hwnd, 0);
+        assert!(change.changed);
+        assert_eq!(change.rect, floating_rect(150));
+        assert_eq!(
+            workspace.containers()[0].windows()[0].floating_rect,
+            Some(floating_rect(150))
+        );
+
+        // The arrangement, the container identities and the other container's window are all
+        // untouched: a floating move is not a layout operation.
+        assert_eq!(
+            workspace.logical_slots.ordered(SlotOrder::LeftToRight),
+            slots_before
+        );
+        assert_eq!(
+            workspace
+                .containers()
+                .iter()
+                .map(|container| container.id.clone())
+                .collect::<Vec<_>>(),
+            ids_before
+        );
+        assert_eq!(workspace.containers()[1].windows()[0].floating_rect, None);
+    }
+
+    #[test]
+    fn resizing_a_floating_window_moves_only_the_named_edge() {
+        let mut workspace = workspace_with_a_focused_floating_window();
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        let slots_before = workspace.logical_slots.ordered(SlotOrder::LeftToRight);
+
+        let change = workspace
+            .resize_focused_floating_window(
+                OperationDirection::Right,
+                Sizing::Increase,
+                50,
+                FloatingLimits::default(),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(change.rect.left, floating_rect(100).left);
+        assert_eq!(change.rect.top, floating_rect(100).top);
+        assert_eq!(change.rect.right, floating_rect(100).right + 50);
+        assert_eq!(change.rect.bottom, floating_rect(100).bottom);
+        assert_eq!(
+            workspace.logical_slots.ordered(SlotOrder::LeftToRight),
+            slots_before
+        );
+    }
+
+    #[test]
+    fn a_floating_command_refuses_every_other_kind_of_window() {
+        let mut workspace = workspace_with_containers(&[1, 1]);
+        workspace.focus_container(0);
+
+        // Stored: the container owns this window's rectangle.
+        assert_eq!(
+            workspace.move_focused_floating_window(
+                OperationDirection::Right,
+                50,
+                floating_bounds(),
+                None
+            ),
+            Err(FloatingRejection::NotFloating)
+        );
+
+        workspace.float_window(0, floating_rect(100)).unwrap();
+        workspace.minimize_window(0).unwrap();
+        assert_eq!(
+            workspace.move_focused_floating_window(
+                OperationDirection::Right,
+                50,
+                floating_bounds(),
+                None
+            ),
+            Err(FloatingRejection::Minimized)
+        );
+
+        workspace.unminimize_window(0).unwrap();
+        workspace.containers_mut()[0].windows_mut()[0].set_maximized(floating_rect(100));
+        assert_eq!(
+            workspace.resize_focused_floating_window(
+                OperationDirection::Right,
+                Sizing::Increase,
+                50,
+                FloatingLimits::default(),
+                None,
+            ),
+            Err(FloatingRejection::Presented(Presentation::Maximized))
+        );
+
+        // None of the refusals wrote anything.
+        assert_eq!(
+            workspace.containers()[0].windows()[0].floating_rect,
+            Some(floating_rect(100))
+        );
+    }
+
+    #[test]
+    fn a_floating_command_without_a_focused_window_is_refused() {
+        let mut workspace = Workspace::default();
+
+        assert_eq!(
+            workspace.move_focused_floating_window(
+                OperationDirection::Left,
+                50,
+                floating_bounds(),
+                None
+            ),
+            Err(FloatingRejection::NoSubject)
+        );
+    }
+
+    #[test]
+    fn a_floating_command_acts_on_the_focused_window_not_the_first_floating_one() {
+        let mut workspace = workspace_with_containers(&[1, 1]);
+        workspace.float_window(0, floating_rect(100)).unwrap();
+        workspace.float_window(1, floating_rect(700)).unwrap();
+        workspace.focus_container(1);
+
+        let change = workspace
+            .move_focused_floating_window(OperationDirection::Right, 50, floating_bounds(), None)
+            .unwrap();
+
+        assert_eq!(change.hwnd, 1);
+        assert_eq!(
+            workspace.containers()[0].windows()[0].floating_rect,
+            Some(floating_rect(100))
+        );
+    }
+
+    #[test]
+    fn moving_a_floating_window_in_a_hidden_container_leaves_it_hidden() {
+        let mut workspace = workspace_with_a_focused_floating_window();
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        let hidden_id = workspace.containers()[0].id.clone();
+        assert!(workspace.containers()[0].is_hidden());
+
+        workspace
+            .move_focused_floating_window(OperationDirection::Down, 50, floating_bounds(), None)
+            .unwrap();
+
+        // A hidden container's floating window is visible and movable; moving it is not a reason
+        // to give the container a slot back, because nothing about its placement changed.
+        assert!(workspace.containers()[0].is_hidden());
+        assert!(!workspace.logical_slots.contains(&hidden_id));
+        assert_eq!(workspace.active_container_count(), 1);
+    }
+
+    #[test]
+    fn a_floating_move_settles_against_the_work_area() {
+        let mut workspace = workspace_with_a_focused_floating_window();
+
+        let change = workspace
+            .move_focused_floating_window(OperationDirection::Left, 5000, floating_bounds(), None)
+            .unwrap();
+
+        assert_eq!(change.rect.left, 0);
+        assert!(change.changed);
+
+        // Already against the edge: the command is a no-op rather than a refusal.
+        let change = workspace
+            .move_focused_floating_window(OperationDirection::Left, 5000, floating_bounds(), None)
+            .unwrap();
+
+        assert!(!change.changed);
+        assert_eq!(change.rect.left, 0);
+    }
+
+    #[test]
+    fn a_floating_command_starts_from_what_win32_reports() {
+        let mut workspace = workspace_with_a_focused_floating_window();
+
+        // The window was dragged with the mouse, so the record is stale until a command reads the
+        // live rectangle and plans from that.
+        let dragged = floating_rect(900);
+        let change = workspace
+            .move_focused_floating_window(
+                OperationDirection::Right,
+                50,
+                floating_bounds(),
+                Some(dragged),
+            )
+            .unwrap();
+
+        assert_eq!(change.rect, floating_rect(950));
+    }
+
+    #[test]
+    fn the_accepted_rectangle_replaces_the_planned_one() {
+        let mut workspace = workspace_with_a_focused_floating_window();
+
+        let change = workspace
+            .resize_focused_floating_window(
+                OperationDirection::Right,
+                Sizing::Decrease,
+                200,
+                FloatingLimits::default(),
+                None,
+            )
+            .unwrap();
+
+        // The application refused to go that narrow and Win32 reported what it settled on.
+        let mut accepted = change.rect;
+        accepted.right = 320;
+        assert!(workspace.confirm_floating_geometry(change.hwnd, accepted));
+
+        assert_eq!(
+            workspace.containers()[0].windows()[0].floating_rect,
+            Some(accepted)
+        );
     }
 
     #[test]
