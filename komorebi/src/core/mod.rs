@@ -876,4 +876,72 @@ mod tests {
             SocketMessage::MoveFloatingWindow(OperationDirection::Up, None)
         ));
     }
+
+    /// The wire form of a command is what an AutoHotkey script, a subscriber and an older
+    /// komorebic all agree on, so each new command's JSON is pinned rather than left to the
+    /// derive to decide again after the next refactor.
+    #[test]
+    fn the_new_commands_keep_their_wire_form() {
+        let cases = [
+            (SocketMessage::Pause, r#"{"type":"Pause"}"#),
+            (SocketMessage::Unpause, r#"{"type":"Unpause"}"#),
+            (
+                SocketMessage::SuspendWindow(None),
+                r#"{"type":"SuspendWindow","content":null}"#,
+            ),
+            (
+                SocketMessage::ResumeWindow(Some(4242)),
+                r#"{"type":"ResumeWindow","content":4242}"#,
+            ),
+            (
+                SocketMessage::RestoreLastMinimizedWindow,
+                r#"{"type":"RestoreLastMinimizedWindow"}"#,
+            ),
+            (
+                SocketMessage::CreateContainer(None),
+                r#"{"type":"CreateContainer","content":null}"#,
+            ),
+            (
+                SocketMessage::CreateContainer(Some(SplitAxis::TopBottom)),
+                r#"{"type":"CreateContainer","content":"TopBottom"}"#,
+            ),
+            (
+                SocketMessage::DestroyContainer,
+                r#"{"type":"DestroyContainer"}"#,
+            ),
+            (
+                SocketMessage::MoveWorkspaceToIndex(2),
+                r#"{"type":"MoveWorkspaceToIndex","content":2}"#,
+            ),
+            (
+                SocketMessage::CycleMoveWorkspace(CycleDirection::Previous),
+                r#"{"type":"CycleMoveWorkspace","content":"Previous"}"#,
+            ),
+            (
+                SocketMessage::SwapWorkspaceWithIndex(1),
+                r#"{"type":"SwapWorkspaceWithIndex","content":1}"#,
+            ),
+            (
+                SocketMessage::MergeFocusedWorkspace,
+                r#"{"type":"MergeFocusedWorkspace"}"#,
+            ),
+            (
+                SocketMessage::MoveWindowToWorkspaceId(String::from("abc"), true),
+                r#"{"type":"MoveWindowToWorkspaceId","content":["abc",true]}"#,
+            ),
+            (
+                SocketMessage::MoveWindowToContainerId(String::from("xyz"), false),
+                r#"{"type":"MoveWindowToContainerId","content":["xyz",false]}"#,
+            ),
+        ];
+
+        for (message, expected) in cases {
+            let json = serde_json::to_string(&message).unwrap();
+            assert_eq!(json, expected);
+
+            // Parsing what was written is what komorebi actually does with it.
+            let parsed: SocketMessage = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.to_string(), message.to_string());
+        }
+    }
 }

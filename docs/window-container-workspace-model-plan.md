@@ -1537,17 +1537,157 @@ estimate was low and is recorded as such.
 
 ### Phase 12 - Socket protocol and komorebic CLI
 
-- [ ] Finalize distinct commands for global pause, suspend/resume manage, placement, floating move and
-  resize, active resize, maximize, fullscreen, minimize/restore, container lifecycle, stable-ID
-  transfers, workspace ordering/merge, and monitor transfers.
-- [ ] Add typed command outcomes: success, no-op, non-floating, minimized, no target, ignored,
-  suspended, and invariant failure. Preserve compatibility for existing commands where practical.
-- [ ] Add CLI parsing/serialization tests and generated command docs/schema updates.
-- [ ] Commit as `feat: expose managed model commands in komorebic`.
+Split into 12A outcomes, 12B window lifecycle, 12C container lifecycle, 12D workspace ordering and
+12E stable-ID transfers on 2026-08-30, before coding. The split is drawn around what a command
+*answers* rather than around what it touches: 12A is the answer itself, and each of the others is a
+family of operations the model has owned since an earlier phase with no way for a caller to reach
+it.
 
-Expected handwritten change: 350-500 lines plus generated docs/schema. Likely files:
-`core/mod.rs`, `process_command.rs`, `komorebic/src/main.rs`, `komorebi-client/src/lib.rs`, `docs/cli`,
-`schema.json`, `schema.asc.json`.
+The audit which opened the phase found that the command surface had fallen a long way behind the
+model. Everything Phases 5 to 11 built - suspension, minimize restore, manual splitting, container
+destruction, workspace reordering and merging - existed with no socket message at all, and the only
+new commands since Phase 1 were the two floating ones brought forward in 9C.
+
+#### Phase 12A - Typed command outcomes and the reply channel
+
+- [x] Add `CommandOutcome` and `CommandResponse` with the eight answers the task names, plus a
+  distinct process exit code for each.
+- [x] Convert `FloatingOutcome` and `FloatingRejection` into responses, and reply from the floating
+  commands.
+- [x] Add `komorebic send_command`, which reads the reply, exits with the outcome's code and prints
+  its detail to stderr.
+- [x] Add wire-form, exit-code and conversion tests.
+- [x] Commit as `feat: report typed command outcomes to komorebic` (`be1a5791`).
+
+Actual files: new `komorebi/src/command_outcome.rs`, `komorebi/src/lib.rs`,
+`komorebi/src/process_command.rs`, `komorebi-client/src/lib.rs`, `komorebic/src/main.rs`.
+
+The transport needed nothing new. `process_command` has always taken a `reply` writer for queries,
+and `send_query` already writes, shuts down its write half and reads to EOF, so a mutating command
+can answer over the same connection a query does. What makes this compatible in both directions is
+that neither side insists: komorebi writes the reply best-effort, because a caller which used
+`send_message` has a socket nobody is reading, and komorebic treats both an empty reply and no
+reply within the read timeout as "this build does not report an outcome for this command", which is
+every build older than this one.
+
+A presented window is reported as `NotFloating` rather than as an outcome of its own. What the
+caller needs to know is that the window is not currently positioned by a floating rectangle; which
+presentation is responsible is detail, not a different answer.
+
+Verification: `komorebi` lib tests 441 -> 450 passing, full workspace suite serial and green.
+`cargo fmt --check` and `cargo clippy --workspace --all-targets` clean apart from the pre-existing
+`items after a test module` warning.
+
+#### Phase 12B - Window lifecycle commands
+
+- [x] Add `Pause`, `Unpause`, `SuspendWindow(Option<isize>)`, `ResumeWindow(Option<isize>)` and
+  `RestoreLastMinimizedWindow`, with `komorebic` subcommands for each.
+- [x] Answer `Ignored` or `NoTarget` for a window komorebi does not own, and `Suspended` for one
+  already suspended.
+- [x] Reply `NoOp` for commands which arrive while paused instead of dropping them silently, and
+  process the pause commands themselves while paused.
+- [x] Add pause idempotence, suspension, resume-subject and refusal tests.
+- [x] Commit as `feat: expose window lifecycle commands with outcomes` (`4dab5145`).
+
+Actual files: `komorebi/src/core/mod.rs`, `komorebi/src/window_manager.rs`,
+`komorebi/src/process_command.rs`, `komorebic/src/main.rs`, five new `docs/cli` pages, `mkdocs.yml`.
+
+Suspension and resumption take deliberately different paths, and the asymmetry is the phase's one
+real design decision. Suspension is applied directly, because the caller is asking about one window
+and the answer is already known: whether it was managed at all, and whether detaching it left the
+model consistent. Resumption goes back through the event pipeline, because a resumed window is
+processed as a newly opened one - the current monitor, the current workspace, the new-window
+threshold and the routing rules decide where it lands - and none of that is the command's decision
+to make.
+
+A resume with no handle takes the foreground window when that window is suspended, otherwise the
+only suspended window there is, and refuses anything ambiguous rather than guessing. Suspending a
+window komorebi does not own distinguishes `Ignored` from `NoTarget` by asking the same rule
+evaluation the event pipeline asks, so the caller hears which of the two it is.
+
+Pause and Unpause are idempotent so that a hotkey which names a state leaves komorebi in that
+state, whichever was pressed last, and both are in the paused allow-list - without that, `unpause`
+would be dropped by the very state it exists to leave.
+
+Verification: `komorebi` lib tests 450 -> 457 passing, full workspace suite serial and green. Docs
+pages were generated with `komorebic docgen` into a scratch directory and reconciled by hand to the
+checked-in format, as Phase 9C established.
+
+#### Phase 12C - Container lifecycle commands
+
+- [x] Add `CreateContainer(Option<SplitAxis>)` and `DestroyContainer`, with `komorebic`
+  subcommands, and give `SplitAxis` a clap `ValueEnum`.
+- [x] Add `commit_workspace_change`: apply to a copy, validate, commit only if consistent.
+- [x] Add split, refusal, distribution and empty-workspace tests.
+- [x] Commit as `feat: expose container creation and destruction` (`d8c73a29`).
+
+Actual files: `komorebi/src/core/mod.rs`, `komorebi/src/geometry.rs`,
+`komorebi/src/window_manager.rs`, `komorebi/src/process_command.rs`, `komorebic/src/main.rs`,
+`komorebi-client/src/lib.rs`, two new `docs/cli` pages, `mkdocs.yml`.
+
+`commit_workspace_change` is the phase's substance rather than the two commands. It makes "validate
+before committing" structural instead of remembered: the operation runs against a clone, the result
+is validated, and a candidate which breaks an invariant is thrown away with the clone. That is also
+what makes the `InvariantViolation` outcome reachable at all - without it the outcome would be a
+variant nothing could ever produce.
+
+The desktop work stays outside the validated commit and after it, which is the ordering Phase 10C
+established: the model settles first, and only the part which talks to Win32 may fail afterwards.
+The tests rely on exactly that - a focus call for an unreal handle does fail, and the model change
+it follows is still there to assert on.
+
+Verification: `komorebi` lib tests 457 -> 462 passing, full workspace suite serial and green.
+
+#### Phase 12D - Workspace ordering and merge commands
+
+- [x] Add `MoveWorkspaceToIndex`, `CycleMoveWorkspace`, `SwapWorkspaceWithIndex` and
+  `MergeFocusedWorkspace`, with `komorebic` subcommands.
+- [x] Answer refusals rather than erroring on them: a position which does not exist, a position
+  already held, a swap with itself, a monitor's last workspace.
+- [x] Add ordering, swap, no-op and refusal tests.
+- [x] Commit as `feat: expose workspace ordering and merge commands` (`6e252521`).
+
+Actual files: `komorebi/src/core/mod.rs`, `komorebi/src/window_manager.rs`,
+`komorebi/src/process_command.rs`, `komorebic/src/main.rs`, four new `docs/cli` pages, `mkdocs.yml`.
+
+A position which does not exist is `NoTarget` rather than a clamp. A hotkey which meant workspace 5
+on a monitor with three of them has asked for nothing, not for the last one, and silently moving a
+workspace somewhere the user did not name is worse than doing nothing. The merge command is
+deliberately not the older `CloseWorkspace`: that one still requires an empty, unnamed workspace,
+while this one merges whatever the workspace owns into the neighbour the model's direction rule
+chooses, and refuses only a monitor's last workspace.
+
+Verification: `komorebi` lib tests 462 -> 470 passing, full workspace suite serial and green.
+
+#### Phase 12E - Stable-ID window transfers
+
+- [x] Add `MoveWindowToWorkspaceId(String, bool)` and `MoveWindowToContainerId(String, bool)` with
+  `--follow` variants, and ID lookups on `WindowManager`.
+- [x] Plan the transfer on copies of both workspaces, validate, then commit and touch the desktop.
+- [x] Place into the target's MRU active container, or into a container of its own when there is
+  none; a named container receives at the top of its stack.
+- [x] Add refusal, no-op, empty-target, stack-position, focus-follow and emptied-source tests.
+- [x] Commit as `feat: address window transfers by stable id` (`ac9a157d`).
+
+Actual files: `komorebi/src/core/mod.rs`, `komorebi/src/window_manager.rs`,
+`komorebi/src/process_command.rs`, `komorebic/src/main.rs`, two new `docs/cli` pages, `mkdocs.yml`.
+
+The transfer spans two workspaces, so `commit_workspace_change` does not fit it; the same
+discipline is applied to a pair instead, with the same-workspace case handled by cloning once. The
+`--follow` flag is what separates an operator's move from a rule's move, which the task requires:
+a background move must not take focus away from what the user is doing.
+
+Two tests were corrected after they failed. Both assumed the window at the top of a test container
+was the focused one; a container built by pushing windows focuses the first it was given, so the
+window that travels is the first, and the tests now say so.
+
+Verification: `komorebi` lib tests 470 -> 477 passing; the socket wire-form test added afterwards
+brought this to 478. Full workspace suite serial and green. `cargo fmt --check` and
+`cargo clippy --workspace --all-targets` clean apart from the pre-existing warning.
+
+Not in this phase: no static configuration field changed, so `schema.json` and `schema.asc.json`
+need no regeneration. Reconciling `komorebic docgen` with the checked-in `docs/cli` format remains
+deferred to Phase 14.
 
 ### Phase 13 - AutoHotkey v2 workflow
 
@@ -1712,6 +1852,23 @@ This list is updated from actual diffs, not treated as permission to change ever
 - 2026-08-30: `WindowManager::remove_focused_workspace` was removed rather than guarded. It could
   leave a monitor with no workspaces, and every caller now goes through `release_workspace`, which
   refuses that. This is an intended API removal relative to upstream komorebi.
+- 2026-08-30: A mutating command answers over the same connection a query does, and both sides
+  treat a missing answer as "this build does not report one". That is what let outcomes be added
+  without breaking a single existing caller, all of which write and never read.
+- 2026-08-30: A presented window is reported as `NotFloating` rather than as its own outcome. The
+  caller needs to know the window is not positioned by a floating rectangle; which presentation is
+  responsible is detail.
+- 2026-08-30: Suspension is applied directly by its command while resumption is dispatched as an
+  event. A resumed window is processed as a newly opened one, and where it lands is decided by the
+  new-window path rather than by the command.
+- 2026-08-30: Refusals are outcomes, not errors. A position which does not exist, a workspace
+  already where it was asked to go, a swap with itself and a monitor's last workspace all answer
+  rather than fail, so a script can tell them apart from komorebi being unreachable.
+- 2026-08-30: `commit_workspace_change` applies a compound operation to a clone, validates it and
+  commits only if consistent. This is what makes the `InvariantViolation` outcome producible, and
+  it is the structural form of the task's "validate before committing" rule.
+- 2026-08-30: `Pause`/`Unpause` are in the paused allow-list. A resume command dropped by the state
+  it exists to leave would be unreachable.
 - 2026-08-30: The two workspace routing-rule passes are ordered readdress-then-remap. The departing
   workspace's rules must be sent on while the indices still describe the list they were written
   against; the reverse order slides a following workspace's rule onto the vacated index and then
@@ -1891,3 +2048,20 @@ This list is updated from actual diffs, not treated as permission to change ever
   pre-existing warning. The 1Password signing agent was unreachable for several minutes again and
   refused four commit attempts; staging the finished 11B in the index kept the two phases separable
   while it was down, as in Phase 9. Next phase: 12, socket protocol and komorebic CLI.
+- 2026-08-30: Phase 12 turn. The plan was re-read and the worktree confirmed clean at `40dc3f9a`
+  before editing, and `cargo check --workspace --all-targets` was re-run as the turn's baseline.
+  Phase 12 was split into 12A outcomes, 12B window lifecycle, 12C container lifecycle, 12D
+  workspace ordering and 12E stable-ID transfers before coding. The audit which opened the turn is
+  the finding worth recording: the model had been ahead of the command surface since Phase 5, and
+  suspension, minimize restore, manual splitting, container destruction, workspace reordering and
+  merging all existed with no socket message at all. The transport needed nothing new - the reply
+  writer for queries was already there - and compatibility came from neither side insisting: a
+  missing answer means "this build does not report one". 12C produced the turn's most reusable
+  piece in `commit_workspace_change`, which is also what made `InvariantViolation` a producible
+  outcome rather than a variant nothing could reach. Two tests were corrected after failing, both
+  wrong about which window a test container focuses; each is recorded in its phase. Full serial
+  workspace suite passed at every step (komorebi 441 -> 450 -> 457 -> 462 -> 470 -> 477 -> 478
+  passing); fmt and Clippy clean apart from the pre-existing warning. The 1Password signing agent
+  was unreachable for several minutes again and refused three attempts at the 12A commit; staging
+  the finished phase in the index kept the phases separable while it was down, as in Phases 9 and
+  11. Next phase: 13, the AutoHotkey v2 workflow.
