@@ -2563,6 +2563,88 @@ impl Workspace {
         Some(hwnd)
     }
 
+    /// Whether this workspace owns `hwnd` and it could take focus as it stands.
+    ///
+    /// A minimized window is owned and remembered, but it cannot be focused without being restored
+    /// first, which is a separate decision from choosing what to focus.
+    #[must_use]
+    pub fn managed_window_is_focusable(&self, hwnd: isize) -> bool {
+        self.containers()
+            .iter()
+            .flat_map(|container| container.windows().iter())
+            .any(|window| window.hwnd == hwnd && window.visibility == Visibility::Visible)
+    }
+
+    /// Take everything `source` owns into this workspace.
+    ///
+    /// This is how a workspace is deleted without stranding the windows living on it. Containers
+    /// are re-parented rather than rebuilt: each arrives with its stable ID, its stack order, its
+    /// window states and its own window focus history intact, which is what keeps a stack, a
+    /// hidden container or a floating window's rectangle meaningful on the other side of a merge.
+    ///
+    /// Both histories are merged with the source's entries first, so the workspace which was just
+    /// deleted decides what is focused next, and deduplicated, because a history entry names an
+    /// object rather than an event.
+    ///
+    /// The arrangement is the one thing which cannot come along: these containers are about to be
+    /// tiled by a different layout in a different work area. Every exact hidden restore is
+    /// invalidated and the manual resize dimensions are discarded, so the next update recalculates
+    /// the slots of the active containers alone. Hidden containers stay hidden, because their
+    /// state is derived from their windows and none of those have changed.
+    pub fn merge_from(&mut self, mut source: Self) {
+        // A preselect container is a transient insertion marker whose index means nothing once the
+        // ring it indexes has changed, so neither side carries one across the merge.
+        source.cancel_preselect();
+        self.cancel_preselect();
+
+        // The source's monocle is a claim to show one container alone in a work area which is
+        // about to hold this workspace's containers as well; the container arrives like any other.
+        source.monocle_container_id = None;
+
+        let inherited = source.focused_container().map(|container| {
+            (
+                container.id.clone(),
+                container.focused_managed_window().map(|window| window.hwnd),
+            )
+        });
+
+        let container_focus_history = source
+            .container_focus_history
+            .iter()
+            .cloned()
+            .chain(self.container_focus_history.iter().cloned())
+            .collect::<Mru<_>>();
+
+        let minimize_history = source
+            .minimize_history
+            .iter()
+            .copied()
+            .chain(self.minimize_history.iter().copied())
+            .collect::<Mru<_>>();
+
+        for container in std::mem::take(source.containers_mut()) {
+            self.containers_mut().push_back(container);
+        }
+
+        self.container_focus_history = container_focus_history;
+        self.minimize_history = minimize_history;
+
+        // Manual boundaries describe an arrangement which no longer exists.
+        self.resize_dimensions = vec![None; self.containers().len()];
+        self.invalidate_slot_geometry();
+        self.prune_histories();
+
+        let Some((container, window)) = inherited else {
+            return;
+        };
+
+        if let Some(hwnd) = window.filter(|hwnd| self.managed_window_is_focusable(*hwnd)) {
+            self.record_focused_window(hwnd);
+        } else if let Some(idx) = self.container_idx_for_id(&container) {
+            self.focus_container(idx);
+        }
+    }
+
     /// The window a floating geometry command acts on.
     ///
     /// This is the focused window, and only the focused window. It is deliberately not
@@ -5567,6 +5649,207 @@ mod tests {
                 .resize_focused_container(OperationDirection::Right, 100)
                 .is_err()
         );
+    }
+
+    /// A workspace whose containers hold exactly the given window handles.
+    fn workspace_with_hwnds(containers: &[&[isize]]) -> Workspace {
+        let mut workspace = Workspace::default();
+
+        for hwnds in containers {
+            let mut container = Container::default();
+            for hwnd in *hwnds {
+                container.add_window(Window::from(*hwnd));
+            }
+            workspace.add_container_to_back(container);
+        }
+
+        workspace
+    }
+
+    fn container_ids(workspace: &Workspace) -> Vec<ContainerId> {
+        workspace
+            .containers()
+            .iter()
+            .map(|container| container.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn merging_re_parents_every_container_whole() {
+        let mut target = workspace_with_hwnds(&[&[1, 2]]);
+        let source = workspace_with_hwnds(&[&[3], &[4, 5]]);
+        let target_ids = container_ids(&target);
+        let source_ids = container_ids(&source);
+
+        target.merge_from(source);
+
+        assert_eq!(
+            container_ids(&target),
+            [target_ids, source_ids].concat(),
+            "containers keep their stable IDs and their relative order"
+        );
+        assert_eq!(stacks(&target), vec![vec![1, 2], vec![3], vec![4, 5]]);
+    }
+
+    #[test]
+    fn merging_preserves_the_multi_dimensional_state_of_every_window() {
+        let mut target = workspace_with_hwnds(&[&[1]]);
+        let mut source = workspace_with_hwnds(&[&[2, 3]]);
+        let floating_rect = Rect {
+            left: 10,
+            top: 20,
+            right: 300,
+            bottom: 400,
+        };
+
+        {
+            let container = source.containers_mut().front_mut().unwrap();
+            container.windows_mut()[0].set_floating(floating_rect);
+            container.windows_mut()[1].set_minimized();
+        }
+        source.record_minimized_window(3);
+
+        target.merge_from(source);
+
+        let merged = &target.containers()[1];
+        assert_eq!(merged.windows()[0].placement, ManagedPlacement::Floating);
+        assert_eq!(merged.windows()[0].floating_rect, Some(floating_rect));
+        assert_eq!(merged.windows()[1].visibility, Visibility::Minimized);
+        assert!(target.minimize_history.contains(&3));
+    }
+
+    #[test]
+    fn a_container_with_nothing_visible_and_stored_stays_hidden_across_a_merge() {
+        let mut target = workspace_with_hwnds(&[&[1]]);
+        let mut source = workspace_with_hwnds(&[&[2]]);
+
+        source.containers_mut()[0].windows_mut()[0].set_minimized();
+        assert!(source.containers()[0].is_hidden());
+
+        target.merge_from(source);
+
+        assert!(target.containers()[1].is_hidden());
+        assert_eq!(target.active_container_count(), 1);
+    }
+
+    #[test]
+    fn merging_puts_the_source_history_first_and_keeps_each_entry_once() {
+        let mut target = workspace_with_hwnds(&[&[1], &[2]]);
+        let mut source = workspace_with_hwnds(&[&[3], &[4]]);
+        let target_ids = container_ids(&target);
+        let source_ids = container_ids(&source);
+
+        target.focus_container(1);
+        target.focus_container(0);
+        source.focus_container(0);
+        source.focus_container(1);
+        source.record_minimized_window(3);
+        target.record_minimized_window(1);
+
+        target.merge_from(source);
+
+        assert_eq!(
+            target
+                .container_focus_history
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![
+                source_ids[1].clone(),
+                source_ids[0].clone(),
+                target_ids[0].clone(),
+                target_ids[1].clone()
+            ]
+        );
+        assert_eq!(
+            target.minimize_history.iter().copied().collect::<Vec<_>>(),
+            vec![3, 1]
+        );
+    }
+
+    #[test]
+    fn merging_inherits_the_focused_window_of_the_workspace_which_was_deleted() {
+        let mut target = workspace_with_hwnds(&[&[1]]);
+        let mut source = workspace_with_hwnds(&[&[2], &[3, 4]]);
+
+        source.focus_container(1);
+        source.containers_mut()[1].focus_window(0);
+        let inherited = source.containers()[1].id.clone();
+
+        target.merge_from(source);
+
+        assert_eq!(
+            target.focused_container().map(|c| c.id.clone()),
+            Some(inherited)
+        );
+        assert_eq!(
+            target
+                .focused_container()
+                .and_then(|c| c.focused_window())
+                .map(|w| w.hwnd),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn an_inherited_container_is_focused_even_when_its_window_cannot_be() {
+        let mut target = workspace_with_hwnds(&[&[1]]);
+        let mut source = workspace_with_hwnds(&[&[2]]);
+
+        source.containers_mut()[0].windows_mut()[0].set_minimized();
+        let inherited = source.containers()[0].id.clone();
+
+        target.merge_from(source);
+
+        assert_eq!(
+            target.focused_container().map(|c| c.id.clone()),
+            Some(inherited)
+        );
+    }
+
+    #[test]
+    fn merging_into_an_empty_workspace_keeps_the_source_arrangement_order() {
+        let mut target = Workspace::default();
+        let source = workspace_with_hwnds(&[&[1], &[2]]);
+        let source_ids = container_ids(&source);
+
+        target.merge_from(source);
+
+        assert_eq!(container_ids(&target), source_ids);
+    }
+
+    #[test]
+    fn merging_discards_manual_boundaries_and_every_exact_hidden_restore() {
+        let mut target = workspace_with_hwnds(&[&[1], &[2]]);
+        let source = workspace_with_hwnds(&[&[3]]);
+
+        target.record_logical_slots(work_area(1920, 1080));
+        target.resize_dimensions = vec![
+            Some(Rect {
+                left: 0,
+                top: 0,
+                right: 40,
+                bottom: 0,
+            }),
+            None,
+        ];
+        target.hidden_slot_restores.insert(
+            target.containers()[0].id.clone(),
+            HiddenSlotRestore {
+                old_rect: LogicalRect::from(work_area(100, 100)),
+                direction: OperationDirection::Left,
+                absorbers: vec![],
+                absorber_rects_before: vec![],
+                geometry_generation: 0,
+                exact_restore_valid: true,
+            },
+        );
+
+        target.merge_from(source);
+
+        assert_eq!(target.resize_dimensions, vec![None, None, None]);
+        assert!(target.hidden_slot_restores.is_empty());
+        assert!(target.relayout_pending);
     }
 
     fn workspace_with_containers(counts: &[usize]) -> Workspace {

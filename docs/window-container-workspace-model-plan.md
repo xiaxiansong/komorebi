@@ -1307,19 +1307,42 @@ warns that `imports_granularity` is nightly-only and skips only that option.
 
 #### Phase 10B - Workspace deletion and merge
 
-- [ ] Add the merge: every container of the source workspace enters the target with its ID, stack,
+- [x] Add the merge: every container of the source workspace enters the target with its ID, stack,
   window states and window focus history unchanged.
-- [ ] Merge both histories with deduplication, source order first, and inherit the source's focused
+- [x] Merge both histories with deduplication, source order first, and inherit the source's focused
   container and window when that window is still focusable.
-- [ ] Invalidate the target's exact hidden restores and manual resize dimensions, leaving Hidden
+- [x] Invalidate the target's exact hidden restores and manual resize dimensions, leaving Hidden
   containers hidden and letting the next update relayout only the Active ones.
-- [ ] Add the delete-direction rule on `Monitor`: refuse the only workspace, merge the first into
+- [x] Add the delete-direction rule on `Monitor`: refuse the only workspace, merge the first into
   its right neighbour and every other workspace into its left neighbour, atomically.
-- [ ] Add first/middle/last direction, only-workspace refusal, container/history/state preservation,
+- [x] Add first/middle/last direction, only-workspace refusal, container/history/state preservation,
   hidden-container, focus inheritance and rollback tests.
-- [ ] Commit as `feat: merge deleted workspaces into a neighbour`.
+- [x] Commit as `feat: merge deleted workspaces into a neighbour`.
 
-Expected handwritten change: 300-400 lines. Likely files: `workspace.rs`, `monitor.rs`.
+Actual files: `komorebi/src/workspace.rs`, `komorebi/src/monitor.rs`.
+
+`Workspace::merge_from` re-parents containers rather than rebuilding them, which is what makes the
+preservation claims true by construction: a container arrives with its ID, stack, window states,
+floating rectangles and its own window focus history because the container value itself is moved.
+Hidden containers need no special handling for the same reason - the state is derived from the
+windows, and the windows did not change.
+
+Two things deliberately do not survive. The manual resize dimensions and every exact hidden restore
+describe an arrangement which no longer exists, so they are discarded and the next update
+recalculates the slots of the active containers alone. A preselect container is a transient
+insertion marker indexing a ring which is about to change, so both sides drop theirs, and the
+source's monocle reference is dropped because it claims a whole work area the target's containers
+are about to share.
+
+Deleting shifts the same index-keyed tables reordering does, but not identically: the name of a
+deleted workspace is dropped, while its application routing rules follow its windows to the
+workspace which absorbed them. `WorkspaceReorder` therefore answers two questions -
+`new_idx` for what describes the workspace and `content_idx` for what describes its windows - and
+the focused index follows the contents, so deleting the focused workspace lands on the survivor.
+
+Verification: `komorebi` lib tests 386 -> 400 passing, full workspace suite serial and green.
+`cargo fmt --check` and `cargo clippy --all-targets` clean apart from the pre-existing
+`items after a test module` warning.
 
 #### Phase 10C - Window manager wiring and minimized restore
 

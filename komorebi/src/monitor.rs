@@ -63,8 +63,12 @@ impl_ring_elements!(Monitor, Workspace);
 /// the monitor, so the move is reported instead of being applied in one place.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceReorder {
-    /// The new index of the workspace which was at each old index.
-    positions: Vec<usize>,
+    /// The new index of the workspace which was at each old index, or `None` for a workspace
+    /// which no longer exists.
+    positions: Vec<Option<usize>>,
+    /// The old index of a workspace which was merged away, and the new index of the workspace
+    /// which took its contents.
+    merged: Option<(usize, usize)>,
 }
 
 impl WorkspaceReorder {
@@ -74,7 +78,7 @@ impl WorkspaceReorder {
     fn from_move(len: usize, from: usize, to: usize) -> Self {
         let positions = (0..len)
             .map(|idx| {
-                if idx == from {
+                Some(if idx == from {
                     to
                 } else if from < to && idx > from && idx <= to {
                     idx - 1
@@ -82,11 +86,14 @@ impl WorkspaceReorder {
                     idx + 1
                 } else {
                     idx
-                }
+                })
             })
             .collect();
 
-        Self { positions }
+        Self {
+            positions,
+            merged: None,
+        }
     }
 
     /// The rearrangement produced by exchanging two workspaces and moving nothing else.
@@ -94,32 +101,75 @@ impl WorkspaceReorder {
     fn from_swap(len: usize, i: usize, j: usize) -> Self {
         let positions = (0..len)
             .map(|idx| {
-                if idx == i {
+                Some(if idx == i {
                     j
                 } else if idx == j {
                     i
                 } else {
                     idx
+                })
+            })
+            .collect();
+
+        Self {
+            positions,
+            merged: None,
+        }
+    }
+
+    /// The rearrangement produced by removing the workspace at `removed` from a list of `len`
+    /// workspaces, its contents having gone to the workspace which now sits at `target`.
+    #[must_use]
+    fn from_merge(len: usize, removed: usize, target: usize) -> Self {
+        let positions = (0..len)
+            .map(|idx| {
+                if idx == removed {
+                    None
+                } else if idx < removed {
+                    Some(idx)
+                } else {
+                    Some(idx - 1)
                 }
             })
             .collect();
 
-        Self { positions }
+        Self {
+            positions,
+            merged: Some((removed, target)),
+        }
     }
 
-    /// The index the workspace which was at `old` now occupies.
+    /// The index the workspace which was at `old` now occupies, or `None` if it is gone.
+    ///
+    /// This is what a table describing the workspace itself follows - its configured name, or the
+    /// fact that it was focused - because none of that survives the workspace.
     #[must_use]
     pub fn new_idx(&self, old: usize) -> Option<usize> {
-        self.positions.get(old).copied()
+        self.positions.get(old).copied().flatten()
+    }
+
+    /// The index of the workspace which now holds the contents of the workspace at `old`.
+    ///
+    /// This is what a table describing a workspace's *windows* follows - the application routing
+    /// rules - because a merged workspace's windows are still on the monitor, in the workspace
+    /// which absorbed them.
+    #[must_use]
+    pub fn content_idx(&self, old: usize) -> Option<usize> {
+        match self.merged {
+            Some((removed, target)) if old == removed => Some(target),
+            _ => self.new_idx(old),
+        }
     }
 
     /// Whether every workspace stayed where it was.
     #[must_use]
     pub fn is_identity(&self) -> bool {
-        self.positions
-            .iter()
-            .enumerate()
-            .all(|(old, new)| old == *new)
+        self.merged.is_none()
+            && self
+                .positions
+                .iter()
+                .enumerate()
+                .all(|(old, new)| Some(old) == *new)
     }
 
     /// Rebuild an index-keyed table so each entry stays with the workspace it described.
@@ -561,6 +611,51 @@ impl Monitor {
         self.reorder_workspace(from, direction.next_idx(from, len))
     }
 
+    /// The workspace which would take the contents of the workspace at `idx` if it were deleted.
+    ///
+    /// A monitor must always have at least one workspace, so the only workspace has no target and
+    /// cannot be deleted. Every other workspace merges into its left neighbour, except the first,
+    /// which has none and merges into its right.
+    #[must_use]
+    pub fn merge_target_idx(&self, idx: usize) -> Option<usize> {
+        let len = self.workspaces().len();
+
+        if idx >= len || len < 2 {
+            return None;
+        }
+
+        Some(if idx == 0 { 1 } else { idx - 1 })
+    }
+
+    /// Delete the workspace at `idx`, merging everything it owned into a neighbour.
+    ///
+    /// The neighbour becomes this monitor's focused workspace, because after a delete the user is
+    /// looking at the workspace their windows just moved to. Returns its index, which is not
+    /// `merge_target_idx`'s answer once the deleted workspace has left the list.
+    ///
+    /// Refuses a monitor's only workspace without changing anything.
+    pub fn merge_workspace(&mut self, idx: usize) -> eyre::Result<usize> {
+        let target = self
+            .merge_target_idx(idx)
+            .ok_or_eyre("a monitor cannot delete its only workspace")?;
+
+        // Nothing above this point has written anything, and nothing below it can fail.
+        let len = self.workspaces().len();
+        let target_idx = if target > idx { target - 1 } else { target };
+        let reorder = WorkspaceReorder::from_merge(len, idx, target_idx);
+
+        let source = self
+            .workspaces_mut()
+            .remove(idx)
+            .expect("the workspace index was checked against the length");
+
+        self.workspaces_mut()[target_idx].merge_from(source);
+        self.apply_workspace_reorder(&reorder);
+        self.workspaces.focus(target_idx);
+
+        Ok(target_idx)
+    }
+
     /// Move every index-keyed description of a workspace to where its workspace went.
     ///
     /// The monitor's own tables are the configured names and the last-focused index; the focused
@@ -570,7 +665,7 @@ impl Monitor {
     fn apply_workspace_reorder(&mut self, reorder: &WorkspaceReorder) {
         self.workspace_names = reorder.remap_keys(&self.workspace_names);
 
-        if let Some(idx) = reorder.new_idx(self.workspaces.focused_idx()) {
+        if let Some(idx) = reorder.content_idx(self.workspaces.focused_idx()) {
             self.workspaces.focus(idx);
         }
 
@@ -719,6 +814,8 @@ impl Monitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Window;
+    use crate::model::ContainerId;
 
     /// A monitor with `count` workspaces, focused back on the first.
     fn monitor_with_workspaces(count: usize) -> Monitor {
@@ -748,6 +845,119 @@ mod tests {
             .iter()
             .map(|workspace| workspace.id.clone())
             .collect()
+    }
+
+    /// Give the workspace at `idx` a container holding one window, so a merge has something to
+    /// carry and the workspace can be told apart afterwards.
+    fn populate_workspace(monitor: &mut Monitor, idx: usize, hwnd: isize) -> ContainerId {
+        let mut container = Container::default();
+        container.add_window(Window::from(hwnd));
+        let id = container.id.clone();
+
+        monitor.workspaces_mut()[idx].add_container_to_back(container);
+
+        id
+    }
+
+    #[test]
+    fn a_middle_workspace_merges_into_its_left_neighbour() {
+        let mut monitor = monitor_with_workspaces(3);
+        let left = populate_workspace(&mut monitor, 0, 1);
+        let deleted = populate_workspace(&mut monitor, 1, 2);
+        let right = populate_workspace(&mut monitor, 2, 3);
+        let survivor = monitor.workspaces()[0].id.clone();
+
+        assert_eq!(monitor.merge_target_idx(1), Some(0));
+        assert_eq!(monitor.merge_workspace(1).unwrap(), 0);
+
+        assert_eq!(monitor.workspaces().len(), 2);
+        assert_eq!(monitor.workspaces()[0].id, survivor);
+        assert_eq!(
+            monitor.workspaces()[0]
+                .containers()
+                .iter()
+                .map(|container| container.id.clone())
+                .collect::<Vec<_>>(),
+            vec![left, deleted]
+        );
+        assert_eq!(monitor.workspaces()[1].containers()[0].id, right);
+        assert_eq!(monitor.focused_workspace_idx(), 0);
+    }
+
+    #[test]
+    fn the_first_workspace_merges_into_its_right_neighbour() {
+        let mut monitor = monitor_with_workspaces(3);
+        let deleted = populate_workspace(&mut monitor, 0, 1);
+        let right = populate_workspace(&mut monitor, 1, 2);
+        let survivor = monitor.workspaces()[1].id.clone();
+
+        assert_eq!(monitor.merge_target_idx(0), Some(1));
+        assert_eq!(monitor.merge_workspace(0).unwrap(), 0);
+
+        assert_eq!(monitor.workspaces()[0].id, survivor);
+        assert_eq!(
+            monitor.workspaces()[0]
+                .containers()
+                .iter()
+                .map(|container| container.id.clone())
+                .collect::<Vec<_>>(),
+            vec![right, deleted]
+        );
+        assert_eq!(monitor.focused_workspace_idx(), 0);
+    }
+
+    #[test]
+    fn the_last_workspace_merges_into_its_left_neighbour() {
+        let mut monitor = monitor_with_workspaces(3);
+        populate_workspace(&mut monitor, 2, 1);
+        let survivor = monitor.workspaces()[1].id.clone();
+
+        assert_eq!(monitor.merge_workspace(2).unwrap(), 1);
+
+        assert_eq!(monitor.workspaces().len(), 2);
+        assert_eq!(monitor.workspaces()[1].id, survivor);
+        assert_eq!(monitor.workspaces()[1].containers().len(), 1);
+        assert_eq!(monitor.focused_workspace_idx(), 1);
+    }
+
+    #[test]
+    fn a_monitor_refuses_to_delete_its_only_workspace() {
+        let mut monitor = monitor_with_workspaces(1);
+        let id = monitor.workspaces()[0].id.clone();
+        populate_workspace(&mut monitor, 0, 1);
+
+        assert_eq!(monitor.merge_target_idx(0), None);
+        assert!(monitor.merge_workspace(0).is_err());
+
+        assert_eq!(monitor.workspaces().len(), 1);
+        assert_eq!(monitor.workspaces()[0].id, id);
+        assert_eq!(monitor.workspaces()[0].containers().len(), 1);
+    }
+
+    #[test]
+    fn merging_drops_the_deleted_name_and_moves_the_ones_which_survive() {
+        let mut monitor = monitor_with_workspaces(3);
+        monitor.workspace_names.insert(0, "first".to_string());
+        monitor.workspace_names.insert(1, "deleted".to_string());
+        monitor.workspace_names.insert(2, "third".to_string());
+
+        monitor.merge_workspace(1).unwrap();
+
+        assert_eq!(monitor.workspace_names.get(&0), Some(&"first".to_string()));
+        assert_eq!(monitor.workspace_names.get(&1), Some(&"third".to_string()));
+        assert_eq!(monitor.workspace_names.len(), 2);
+    }
+
+    #[test]
+    fn a_merge_sends_the_windows_of_the_deleted_workspace_to_the_survivor() {
+        let reorder = WorkspaceReorder::from_merge(3, 1, 0);
+
+        // The workspace itself is gone ...
+        assert_eq!(reorder.new_idx(1), None);
+        // ... but its windows are on the workspace which absorbed them.
+        assert_eq!(reorder.content_idx(1), Some(0));
+        assert_eq!(reorder.content_idx(2), Some(1));
+        assert!(!reorder.is_identity());
     }
 
     #[test]
