@@ -1053,6 +1053,12 @@ impl Workspace {
 
         self.focus_container(container_idx);
 
+        // This is where a focus change on the desktop reaches the model, so it is where the
+        // workspace's own window history is written. Every focus komorebi performs itself comes
+        // back through the same event, so recording here covers the directional focus commands,
+        // the stack raise and a plain click alike.
+        self.window_focus_history.record(hwnd);
+
         Ok(())
     }
 
@@ -4178,10 +4184,12 @@ impl Workspace {
         }
     }
 
-    /// Record a window focus at both history levels and move the ring focus to match.
+    /// Record a window focus at every history level and move the ring focus to match.
     ///
-    /// This is the single entry point used when a managed window gains focus, so a container
-    /// MRU update can never happen without the corresponding workspace MRU update.
+    /// This is the entry point for a focus komorebi decides on internally - restoring a workspace,
+    /// merging one, folding an adoption - where there is no desktop event to hear back from. A
+    /// focus which happens on the desktop arrives at [`Self::focus_container_by_window`] instead,
+    /// and both write the same three histories.
     pub fn record_focused_window(&mut self, hwnd: isize) -> bool {
         let Some(container_idx) = self.container_idx_for_window(hwnd) else {
             return false;
@@ -9276,6 +9284,25 @@ mod tests {
         assert_eq!(
             workspace.logical_slots.get(&target),
             Some(LogicalRect::from(area))
+        );
+    }
+
+    #[test]
+    fn a_focus_change_from_the_desktop_records_the_workspace_window_history() {
+        let mut workspace = workspace_with_hwnds(&[&[1, 2], &[3]]);
+
+        // This is the call the FocusChange event makes, and it is the only way the history gets
+        // written while komorebi is running.
+        workspace.focus_container_by_window(1).unwrap();
+        workspace.focus_container_by_window(3).unwrap();
+
+        assert_eq!(
+            workspace
+                .window_focus_history
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![3, 1]
         );
     }
 
