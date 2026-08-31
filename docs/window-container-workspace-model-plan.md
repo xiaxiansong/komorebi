@@ -2419,8 +2419,10 @@ The rules this phase implements, over and above what Phases 7 and 8 established:
   and outcomes which distinguish "no window can be moved" from "nothing to destroy".
 - [x] 20E: `auto_split_threshold` configuration field with a serde default of 2, applied to the
   new-window placement path, plus the regenerated schema.
-- [ ] 20F: AutoHotkey bindings, `docs/window-model.md`, this plan, and live verification on the
+- [x] 20F: AutoHotkey bindings, `docs/window-model.md`, this plan, and live verification on the
   desktop, including that startup adoption still opens with one container in workspace one.
+- [x] 20G: write the workspace window history from the focus event which actually happens. Found
+  by the live verification, not by the tests.
 
 Planned files: `komorebi/src/container.rs`, `komorebi/src/workspace.rs`,
 `komorebi/src/window_manager.rs`, `komorebi/src/process_command.rs`, `komorebi/src/core/mod.rs`,
@@ -2494,6 +2496,61 @@ goes - unlike `window_adoption_behaviour`, which is read once. An empty workspac
 case above the threshold: there is nothing to join.
 
 Verification: komorebi 555 -> 558 passing, full serial suite green; fmt clean; Clippy unchanged.
+
+20F actual files: `docs/common-workflows/komorebi-model.ahk`,
+`docs/common-workflows/autohotkey-window-model.md`, `docs/window-model.md`, `docs/cli/`
+(`create-container`, `destroy-container`, and the new `destroy-focused-container`), `mkdocs.yml`,
+`schema.json`, this plan. Commit `242ba9a5`. Deployment: the four installed binaries.
+
+`komorebic docgen` was not committed as it ran: run from a build directory it writes `Usage: <name>`
+rather than `Usage: komorebic.exe <name>` and drops the page title, which would have rewritten all
+199 pages to say nothing. The three pages this phase changes were regenerated from the release
+binary's own `--help` and trimmed to the committed style, and the three pages docgen wanted to add
+for older commands were dropped as belonging to no phase.
+
+20G actual files: `komorebi/src/workspace.rs`. Commit `adffe0ac`.
+
+Found by the live verification and by nothing else. `record_focused_window` is called from exactly
+two places in the running program - merging a workspace and folding an adoption - so on a live
+desktop the new workspace window history held one entry and never grew, and every manual split fell
+through to its stack fallback. The tests could not see it: they call `record_focused_window`
+directly, which is precisely the path the desktop does not use. `focus_container_by_window` is where
+a focus change on the desktop reaches the model, and every focus komorebi performs itself comes back
+through the same event, so one record there covers a click, the directional focus commands and the
+stack raise alike.
+
+Live verification, on commit `adffe0ac`, chosen so the desktop ends where it began. Cold start with
+`--clean-state`: one monitor, four workspaces, workspace one holding one active container with all
+four desktop windows, the foreground window on top and shown, one slot covering the work area,
+three workspaces with no containers.
+
+Two `raise-next-stack-window` calls grew the workspace window history from one entry to two and
+reordered it, which is what says the history is now written by the event which happens.
+`create-container` then moved the *second* entry - not the second window of the stack, which is the
+fallback's answer and a different window - into a new container on the left, both halves 1908 wide
+and touching at 1920, with the focus and both shown windows unchanged. A `DWMWA_CLOAKED` probe
+confirmed both halves draw a window and the two stack members underneath stay cloaked.
+
+Earlier on `242ba9a5`, before the history fix: a second `create-container` divided the newer of two
+equally sized slots top to bottom, old above and new below, taking its window from the *other*
+container's stack - the two roles falling to two containers, which is the rule. Four windows in four
+containers tiled the work area 2x2 gap-free, and the fifth `create-container` answered exit 13 with
+"every window in this workspace is the one its container is showing". `destroy-container --count 2`
+and `--count 3` unwound the arrangement to one container each time.
+
+`destroy-focused-container` was verified twice, once from the CLI and once through `Alt+Shift+D`:
+the focused container went, the survivor took the whole work area, and the focused window was raised
+to the top of the stack it landed in and is what that container shows. `Alt+C` and `Alt+D` were
+verified through the hotkey layer the same way, with a `SendLevel 1` probe, and left the workspace
+where it started.
+
+The runtime log holds no ERROR or WARN from either new process. The two entries around each
+deployment fall seconds *before* the new process starts, so they belong to the binary being
+replaced.
+
+Verification: komorebi 558 -> 559 passing, full serial suite green; `cargo fmt --check` clean;
+Clippy clean apart from the pre-existing `items after a test module` warning; the installed
+`komorebic --version` reporting `adffe0ac`; live desktop as above.
 
 ## Provisional affected-file inventory
 
