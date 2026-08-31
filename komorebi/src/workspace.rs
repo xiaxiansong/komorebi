@@ -3216,35 +3216,119 @@ impl Workspace {
         NewWindowPlacement::Joined(target)
     }
 
-    /// The container a manual split takes its window from.
+    /// The container whose slot a manual split divides.
     ///
-    /// Container MRU order, most recent first, and only active containers holding more than one
-    /// window qualify: a hidden container has no slot to divide, and taking the only window from a
-    /// container would destroy it rather than split it. Container order is the tie-break for
-    /// containers the history has never seen, so an empty history cannot refuse an operation the
-    /// workspace can clearly perform.
+    /// The largest active slot, because halving the biggest rectangle is what keeps an arrangement
+    /// even, and the most recently created container when two slots are exactly the same size, so
+    /// repeated splits walk across the workspace instead of cutting the same half forever. Only
+    /// active containers qualify: a hidden container has no slot to divide.
+    ///
+    /// This is a question about geometry alone. The window the split moves comes from the focus
+    /// history and may belong to a completely different container.
     #[must_use]
-    fn donor_container_idx(&self) -> Option<usize> {
-        let eligible = |idx: usize| {
-            self.containers()
-                .get(idx)
-                .is_some_and(|container| container.is_active() && container.windows().len() > 1)
-        };
-
-        self.container_focus_history
+    fn split_donor_idx(&self) -> Option<usize> {
+        let largest = self
+            .containers()
             .iter()
-            .filter_map(|id| self.container_idx_for_id(id))
-            .find(|idx| eligible(*idx))
-            .or_else(|| (0..self.containers().len()).find(|idx| eligible(*idx)))
+            .enumerate()
+            .filter(|(_, container)| container.is_active() && !container.is_preselect())
+            .filter_map(|(idx, container)| {
+                self.logical_slots
+                    .get(&container.id)
+                    .map(|slot| (idx, slot.area(), container.sequence()))
+            })
+            .max_by_key(|(_, area, sequence)| (*area, *sequence))
+            .map(|(idx, _, _)| idx);
+
+        // A workspace which has not been arranged yet has no slots to compare. The split cannot be
+        // planned against them either, so the operation is going to fall back to a rearrangement
+        // and this only decides where the created container is inserted.
+        largest.or_else(|| self.active_container_idx_for_geometry())
     }
 
-    /// Split a new container off an eligible donor, moving one of the donor's windows into it.
+    /// The window a manual split moves into the container it creates.
     ///
-    /// `axis` forces the dividing line; `None` divides the donor's longer edge. The moved window
-    /// keeps its placement, visibility, presentation and floating rectangle, so a container which
-    /// receives a floating or minimized window is created hidden and gives its half straight back
-    /// on the next reconciliation, and a donor left without a visible stored window becomes hidden
-    /// the same way. Neither is a special case here: both are the ordinary hidden transition.
+    /// The second most recent window in this workspace's focus history, and then the next, until
+    /// one is found which is not the window its own container is currently showing. A container
+    /// shows one window at a time, so moving the shown one would change what two containers
+    /// display for a command which was only asked to change how many there are.
+    ///
+    /// The most recent window is skipped outright: it is the focused window, which is shown by
+    /// definition, and skipping it is what makes this "the second most recent" rather than "the
+    /// first eligible".
+    ///
+    /// The history does not always cover the workspace - straight after a restart, an import or an
+    /// adoption, no window has been focused yet - so the stack answers when it cannot: the first
+    /// window below the top of the container holding the most windows.
+    ///
+    /// `None` means every window in the workspace is the one its container is showing, which is
+    /// exactly the case where there are already as many containers as there are windows.
+    #[must_use]
+    fn split_window_hwnd(&self) -> Option<isize> {
+        let shown = self
+            .containers()
+            .iter()
+            .filter_map(Container::focused_managed_window)
+            .map(|window| window.hwnd)
+            .collect::<Vec<_>>();
+
+        let movable =
+            |hwnd: isize| !shown.contains(&hwnd) && self.container_idx_for_window(hwnd).is_some();
+
+        if let Some(hwnd) = self
+            .window_focus_history
+            .iter()
+            .skip(1)
+            .copied()
+            .find(|hwnd| movable(*hwnd))
+        {
+            return Some(hwnd);
+        }
+
+        self.containers()
+            .iter()
+            .filter(|container| !container.is_preselect())
+            .max_by_key(|container| (container.windows().len(), container.sequence()))
+            .and_then(|container| {
+                let shown = container.focused_managed_window().map(|window| window.hwnd);
+
+                container
+                    .windows()
+                    .iter()
+                    .rev()
+                    .map(|window| window.hwnd)
+                    .find(|hwnd| Some(*hwnd) != shown)
+            })
+    }
+
+    /// Put the ring focus back on `id` without recording a focus which did not happen.
+    ///
+    /// Changing how many containers a workspace has is not a focus change, but inserting and
+    /// removing containers moves the ring's focused index and writes to the container history on
+    /// the way. This puts both back.
+    fn restore_container_focus(&mut self, id: &ContainerId) {
+        if let Some(idx) = self.container_idx_for_id(id) {
+            self.containers.focus(idx);
+        }
+    }
+
+    /// Split a new container off the largest active slot, moving one window into it.
+    ///
+    /// `axis` forces the dividing line; `None` divides the divided slot's longer edge. Two
+    /// different containers are involved and they are chosen for different reasons: the slot comes
+    /// from the largest active container, and the window comes from wherever this workspace's
+    /// focus history says it can be taken from without changing what a container is showing. They
+    /// are frequently the same container and nothing depends on that.
+    ///
+    /// The moved window keeps its placement, visibility, presentation and floating rectangle, so a
+    /// container which receives a floating or minimized window is created hidden and gives its half
+    /// straight back on the next reconciliation. That is the ordinary hidden transition, not a
+    /// special case here. The container the window came from cannot be emptied by this, because the
+    /// window taken is never the only one it has.
+    ///
+    /// Focus does not move. Adding a container is a change to how many there are, not to what the
+    /// user is working on, so the created container is shown but not focused and takes the oldest
+    /// place in the container history rather than the newest.
     ///
     /// Everything which can refuse the operation is decided before anything is written, so a
     /// refusal leaves the workspace exactly as it was.
@@ -3252,14 +3336,28 @@ impl Workspace {
         &mut self,
         axis: Option<SplitAxis>,
     ) -> eyre::Result<ContainerId> {
+        let hwnd = self
+            .split_window_hwnd()
+            .ok_or_eyre("every window in this workspace is the one its container is showing")?;
+
+        let source_idx = self
+            .container_idx_for_window(hwnd)
+            .ok_or_eyre("the window to be moved belongs to no container")?;
+
+        let window_idx = self
+            .containers()
+            .get(source_idx)
+            .and_then(|container| container.idx_for_window(hwnd))
+            .ok_or_eyre("the window to be moved disappeared from its container")?;
+
         let donor_idx = self
-            .donor_container_idx()
-            .ok_or_eyre("no active container has more than one window to give away")?;
+            .split_donor_idx()
+            .ok_or_eyre("this workspace has no active container to divide")?;
 
         let donor = self.containers()[donor_idx].id.clone();
-        let window_idx = self.containers()[donor_idx]
-            .donor_window_idx()
-            .ok_or_eyre("the donor container has no window to give away")?;
+        let focused_before = self
+            .focused_container()
+            .map(|container| container.id.clone());
 
         let mut container = Container::default();
         let created = container.id.clone();
@@ -3280,31 +3378,40 @@ impl Workspace {
 
         let window = self
             .containers_mut()
-            .get_mut(donor_idx)
-            .and_then(|donor| donor.remove_window_by_idx(window_idx))
-            .ok_or_eyre("the donor window disappeared while it was being moved")?;
+            .get_mut(source_idx)
+            .and_then(|source| source.remove_window_by_idx(window_idx))
+            .ok_or_eyre("the window disappeared while it was being moved")?;
 
         // A stack only ever shows the window on top of it, so everything below the window which
-        // has just been taken away has been hidden all along. The donor keeps its half of the
-        // slot, so unless it is told to show what it is now showing it draws an empty rectangle.
-        if let Some(donor) = self.containers_mut().get_mut(donor_idx) {
-            donor.load_focused_window();
+        // has just been taken away has been hidden all along. The window moved is never the one
+        // its container was showing, so this is a guarantee rather than a correction.
+        if let Some(source) = self.containers_mut().get_mut(source_idx) {
+            source.load_focused_window();
         }
 
         container.add_managed_window(window);
 
-        // The window which was pulled out of the stack may have been a hidden member of it too,
-        // and the container it has landed in is the only thing which knows it is now on top.
+        // The window which was pulled out of the stack was a hidden member of it, and the container
+        // it has landed in is the only thing which knows it is now the window being shown.
         container.load_focused_window();
 
-        // The created container is inserted where its half actually is, and after the donor when
-        // there is no half because the arrangement is about to be recalculated.
+        // The created container is inserted where its half actually is, and after the divided
+        // container when there is no half because the arrangement is about to be recalculated.
         let insertion_idx = match split.as_ref().map(|split| split.axis) {
             Some(SplitAxis::LeftRight) => donor_idx,
             Some(SplitAxis::TopBottom) | None => donor_idx + 1,
         };
 
         self.insert_container_at_idx(insertion_idx, container);
+
+        // Inserting focused the created container and recorded it as the most recently used one.
+        // Neither happened: a container was added, and the user goes on working where they were.
+        self.container_focus_history.remove(&created);
+        self.container_focus_history.record_oldest(created.clone());
+
+        if let Some(id) = focused_before {
+            self.restore_container_focus(&id);
+        }
 
         if let Some(split) = split {
             self.logical_slots.apply_split(&split);
@@ -4096,7 +4203,8 @@ impl Workspace {
             .collect::<Vec<_>>();
 
         self.minimize_history.retain(|hwnd| hwnds.contains(hwnd));
-        self.window_focus_history.retain(|hwnd| hwnds.contains(hwnd));
+        self.window_focus_history
+            .retain(|hwnd| hwnds.contains(hwnd));
         self.prune_monocle_reference();
     }
 
@@ -8411,50 +8519,120 @@ mod tests {
         assert_eq!(workspace.containers().len(), 2);
     }
     #[test]
-    fn a_manual_split_takes_the_most_recent_window_of_the_most_recent_eligible_container() {
+    fn a_manual_split_takes_the_second_most_recent_window_which_is_not_being_shown() {
         let area = work_area(1920, 1080);
         let mut workspace = arranged_workspace(&[1, 2], area);
-        let donor_id = workspace.containers()[1].id.clone();
+        let source_id = workspace.containers()[1].id.clone();
 
-        // The single-window container is the most recent, but it cannot give a window away.
-        workspace.focus_container(1);
-        workspace.focus_container(0);
-        workspace.containers_mut()[1].focus_window_by_hwnd(1);
+        // 2 is the window its container shows and 1 is the one underneath it, so the history reads
+        // [2, 1] and the second most recent entry is the one which can be moved.
+        workspace.record_focused_window(1);
+        workspace.record_focused_window(2);
 
         let created = workspace.create_container_from_donor(None).unwrap();
         let created_idx = workspace.container_idx_for_id(&created).unwrap();
 
         assert_eq!(workspace.containers().len(), 3);
-        assert_eq!(workspace.containers()[created_idx].windows().len(), 1);
         assert_eq!(
             workspace.containers()[created_idx]
                 .windows()
-                .front()
-                .unwrap()
-                .hwnd,
-            1
+                .iter()
+                .map(|window| window.hwnd)
+                .collect::<Vec<_>>(),
+            vec![1]
         );
 
-        let donor_idx = workspace.container_idx_for_id(&donor_id).unwrap();
-        assert_eq!(workspace.containers()[donor_idx].windows().len(), 1);
+        // The container it came from still shows what it was showing.
+        let source_idx = workspace.container_idx_for_id(&source_id).unwrap();
         assert_eq!(
-            workspace.containers()[donor_idx]
-                .windows()
-                .front()
+            workspace.containers()[source_idx]
+                .focused_window()
                 .unwrap()
                 .hwnd,
             2
         );
-        // The donor's history no longer names a window it does not own.
+        // And its history no longer names a window it does not own.
         assert!(
-            !workspace.containers()[donor_idx]
+            !workspace.containers()[source_idx]
                 .focus_history()
                 .contains(&1)
         );
     }
 
     #[test]
-    fn a_manual_split_halves_the_donor_slot_and_focuses_the_new_container() {
+    fn a_manual_split_divides_the_largest_slot_whoever_the_window_came_from() {
+        let area = work_area(1920, 1080);
+        let mut workspace = arranged_workspace(&[2, 1], area);
+        workspace.record_logical_slots(area);
+
+        // The two-window container is the only one which can give a window away; the other one is
+        // made the largest slot, so the two roles fall to different containers.
+        let source_id = workspace.containers()[0].id.clone();
+        let largest_id = workspace.containers()[1].id.clone();
+        workspace
+            .logical_slots
+            .set(source_id.clone(), LogicalRect::new(0, 0, 640, 1080));
+        workspace
+            .logical_slots
+            .set(largest_id.clone(), LogicalRect::new(640, 0, 1280, 1080));
+
+        let created = workspace.create_container_from_donor(None).unwrap();
+
+        // The half came off the largest slot, and the container which gave up the window kept its
+        // own rectangle untouched.
+        assert_eq!(
+            slot_of(&workspace, &created),
+            LogicalRect::new(640, 0, 640, 1080)
+        );
+        assert_eq!(
+            slot_of(&workspace, &largest_id),
+            LogicalRect::new(1280, 0, 640, 1080)
+        );
+        assert_eq!(
+            slot_of(&workspace, &source_id),
+            LogicalRect::new(0, 0, 640, 1080)
+        );
+        assert_eq!(
+            workspace
+                .logical_slots
+                .validate_coverage(LogicalRect::from(area)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn the_newest_container_wins_a_tie_between_equally_large_slots() {
+        let area = work_area(1920, 1080);
+        let mut workspace = arranged_workspace(&[2, 1], area);
+
+        // Two halves of exactly the same size; the container built second is the newer one.
+        let older = workspace.containers()[0].id.clone();
+        let newer = workspace.containers()[1].id.clone();
+        assert!(
+            workspace.containers()[1].sequence() > workspace.containers()[0].sequence(),
+            "the helper builds containers in order"
+        );
+
+        let created = workspace.create_container_from_donor(None).unwrap();
+
+        // Two 960x1080 halves: the newer one is the one which gets divided, along its longer edge,
+        // and the older one is left exactly as it was.
+        assert_eq!(
+            slot_of(&workspace, &newer),
+            LogicalRect::new(960, 0, 960, 540)
+        );
+        assert_eq!(
+            slot_of(&workspace, &created),
+            LogicalRect::new(960, 540, 960, 540)
+        );
+        assert_eq!(
+            slot_of(&workspace, &older),
+            LogicalRect::new(0, 0, 960, 1080)
+        );
+    }
+
+    #[test]
+    fn a_manual_split_halves_the_donor_slot_without_moving_focus() {
         let area = work_area(1920, 1080);
         let mut workspace = arranged_workspace(&[2], area);
         let donor_id = workspace.containers()[0].id.clone();
@@ -8475,11 +8653,16 @@ mod tests {
                 .validate_coverage(LogicalRect::from(area)),
             Ok(())
         );
-        assert_eq!(workspace.focused_container().unwrap().id, created);
+
+        // Adding a container is not a focus change: the workspace is still on the container and
+        // the window it was on, and the created container takes the oldest place in the history
+        // rather than the newest.
+        assert_eq!(workspace.focused_container().unwrap().id, donor_id);
         assert_eq!(
             workspace.container_focus_history.most_recent(),
-            Some(&created)
+            Some(&donor_id)
         );
+        assert_eq!(workspace.container_focus_history.oldest(), Some(&created));
     }
 
     #[test]
@@ -8564,7 +8747,8 @@ mod tests {
         };
 
         workspace.float_window(1, floating_rect).unwrap();
-        workspace.containers_mut()[0].focus_window_by_hwnd(1);
+        // 0 is the window the container shows, so 1 is the one a split may move.
+        workspace.containers_mut()[0].focus_window_by_hwnd(0);
 
         let created = workspace.create_container_from_donor(None).unwrap();
         let created_idx = workspace.container_idx_for_id(&created).unwrap();
@@ -8587,12 +8771,15 @@ mod tests {
     }
 
     #[test]
-    fn a_donor_left_without_a_visible_stored_window_becomes_hidden() {
+    fn a_manual_split_cannot_hide_the_container_it_took_a_window_from() {
         let area = work_area(1920, 1080);
         let mut workspace = arranged_workspace(&[2], area);
-        let donor_id = workspace.containers()[0].id.clone();
+        let source_id = workspace.containers()[0].id.clone();
 
-        // The window which stays behind is minimized, so the donor keeps a window but no slot.
+        // The window left behind is the one being shown, and a shown window is a visible stored
+        // window, so the container it is in cannot lose its slot by giving another window away.
+        // This is what the selection rule buys: the previous rule could take the shown window and
+        // leave a minimized one in charge.
         workspace.containers_mut()[0]
             .windows_mut()
             .iter_mut()
@@ -8604,11 +8791,23 @@ mod tests {
         let created = workspace.create_container_from_donor(None).unwrap();
         workspace.record_logical_slots(area);
 
-        let donor_idx = workspace.container_idx_for_id(&donor_id).unwrap();
-        assert!(workspace.containers()[donor_idx].is_hidden());
-        assert_eq!(workspace.containers()[donor_idx].windows().len(), 1);
-        assert!(!workspace.logical_slots.contains(&donor_id));
-        assert_eq!(slot_of(&workspace, &created), LogicalRect::from(area));
+        let source_idx = workspace.container_idx_for_id(&source_id).unwrap();
+        assert!(workspace.containers()[source_idx].is_active());
+        assert_eq!(
+            workspace.containers()[source_idx]
+                .focused_window()
+                .unwrap()
+                .hwnd,
+            1
+        );
+
+        // The minimized window is the one which moved, so the created container is the hidden one
+        // and hands its half straight back.
+        assert!(
+            workspace.containers()[workspace.container_idx_for_id(&created).unwrap()].is_hidden()
+        );
+        assert!(!workspace.logical_slots.contains(&created));
+        assert_eq!(slot_of(&workspace, &source_id), LogicalRect::from(area));
     }
 
     /// Whether komorebi currently believes it has hidden `hwnd`.
@@ -8640,28 +8839,32 @@ mod tests {
         let created = workspace.create_container_from_donor(None).unwrap();
         let created_idx = workspace.container_idx_for_id(&created).unwrap();
 
-        // The window which was pulled out is the one its new container shows.
+        // The window which was pulled out is the one which was hidden underneath the top, and it
+        // is what its new container now shows.
         assert_eq!(
             workspace.containers()[created_idx]
                 .focused_window()
                 .unwrap()
                 .hwnd,
-            TOP
+            BELOW
         );
-        assert!(!is_programmatically_hidden(TOP));
-
-        // And the window left behind is no longer hidden underneath it: the donor keeps half the
-        // work area, so it has to draw something in it.
         assert!(!is_programmatically_hidden(BELOW));
+
+        // And the container it came from goes on showing exactly what it was showing.
+        assert!(!is_programmatically_hidden(TOP));
     }
 
     #[test]
-    fn a_manual_split_gives_away_the_window_the_donor_names() {
+    fn a_manual_split_falls_back_to_the_stack_when_the_history_says_nothing() {
         let area = work_area(1920, 1080);
-        let mut workspace = arranged_workspace(&[3], area);
+        let mut workspace = arranged_workspace(&[1, 3], area);
 
-        let expected = workspace.containers()[0].donor_window_idx().unwrap();
-        let expected_hwnd = workspace.containers()[0].windows()[expected].hwnd;
+        // Nothing has been focused, which is the state adoption and a restart leave behind. The
+        // biggest stack answers instead, with the window directly below the one it is showing.
+        assert!(workspace.window_focus_history.is_empty());
+        let shown = workspace.containers()[1].focused_window().unwrap().hwnd;
+        let expected = workspace.containers()[1].windows()[1].hwnd;
+        assert_ne!(expected, shown);
 
         let created = workspace.create_container_from_donor(None).unwrap();
         let created_idx = workspace.container_idx_for_id(&created).unwrap();
@@ -8672,7 +8875,23 @@ mod tests {
                 .front()
                 .unwrap()
                 .hwnd,
-            expected_hwnd
+            expected
+        );
+    }
+
+    #[test]
+    fn a_manual_split_is_refused_when_every_window_is_the_one_its_container_shows() {
+        let area = work_area(1920, 1080);
+        let mut workspace = arranged_workspace(&[1, 1, 1], area);
+        let before = workspace.clone();
+
+        // Three containers, three windows: there are already as many containers as there are
+        // windows, so adding one could only be done by emptying another.
+        assert!(workspace.create_container_from_donor(None).is_err());
+        assert_eq!(workspace.containers(), before.containers());
+        assert_eq!(
+            workspace.logical_slots.ordered(SlotOrder::TopToBottom),
+            before.logical_slots.ordered(SlotOrder::TopToBottom)
         );
     }
 

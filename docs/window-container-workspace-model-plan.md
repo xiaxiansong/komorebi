@@ -2389,7 +2389,13 @@ were settled by the user before any code was written:
   not cover the workspace - straight after a restart, or after an import - the stack order is the
   fallback: the first window below the top of the container holding the most windows.
 - `create-container` and `destroy-container` keep their names and change meaning, both gaining an
-  optional count. The old "destroy the focused container" is kept as `destroy-focused-container`.
+  optional count. Destroying by age and destroying by focus are two separate keys, so the old
+  "destroy the focused container" stays reachable as `destroy-focused-container`.
+
+Corrected on 2026-08-31, mid-phase, before the destroy path was written: `destroy-container`
+destroys the *newest* container, not the oldest. Adding and removing containers by hand are then
+each other's inverse - a create followed by a destroy leaves the workspace where it started - which
+is what the pair of keys is for.
 
 The rules this phase implements, over and above what Phases 7 and 8 established:
 
@@ -2397,7 +2403,8 @@ The rules this phase implements, over and above what Phases 7 and 8 established:
   it holds a window.
 - A manual split divides the *largest* active logical slot, the most recently created container
   winning a tie - not the container the window came from, which may be a different one.
-- A manual destroy destroys the *oldest* container, by creation order rather than by focus.
+- A manual destroy destroys the *newest* container, by creation order rather than by focus. The
+  focused container is destroyed by its own separate command.
 - Neither operation changes which window is focused.
 
 - [ ] 20A: the two model facts these rules need and the workspace does not yet record - a
@@ -2405,8 +2412,9 @@ The rules this phase implements, over and above what Phases 7 and 8 established:
   defaulted, both maintained by every path which already maintains the histories beside them.
 - [ ] 20B: `create_container_from_donor` rewritten around the new donor and window selection, with
   the geometry donor and the window donor allowed to be different containers, and focus untouched.
-- [ ] 20C: destroy by creation order, with the focused window raised in its recipient, and the
-  container-count invariants added to `validate_invariants`.
+- [ ] 20C: destroy the newest container, keep destroying the focused one as a command of its own,
+  raise the focused window in whichever recipient it is dealt to, and add the container-count
+  invariants to `validate_invariants`.
 - [ ] 20D: socket and `komorebic` wiring: `--count` on both commands, `destroy-focused-container`,
   and outcomes which distinguish "no window can be moved" from "nothing to destroy".
 - [ ] 20E: `auto_split_threshold` configuration field with a serde default of 2, applied to the

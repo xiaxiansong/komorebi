@@ -1302,24 +1302,20 @@ impl WindowManager {
         Ok(response)
     }
 
-    /// Split a new container off an eligible donor on the focused workspace.
+    /// Divide the largest active slot on the focused workspace, giving the created container one
+    /// window.
     ///
-    /// `axis` forces the dividing line and `None` divides the donor's longer edge, exactly as an
-    /// automatically placed window divides one. Focus follows the created container: the window
-    /// the operator just pulled out of a stack is the one they are working with.
+    /// `axis` forces the dividing line and `None` divides the longer edge, exactly as an
+    /// automatically placed window divides one. Focus does not move: this changes how many
+    /// containers the workspace has, and the window the user is working on is not one of the
+    /// things it is allowed to change.
     pub fn create_container(&mut self, axis: Option<SplitAxis>) -> eyre::Result<CommandResponse> {
         self.commit_workspace_change(|workspace| {
             match workspace.create_container_from_donor(axis) {
-                Ok(created) => {
-                    if let Some(idx) = workspace.container_idx_for_id(&created) {
-                        workspace.focus_container(idx);
-                    }
-
-                    CommandResponse::new(
-                        CommandOutcome::Success,
-                        format!("created container {created}"),
-                    )
-                }
+                Ok(created) => CommandResponse::new(
+                    CommandOutcome::Success,
+                    format!("created container {created}"),
+                ),
                 Err(error) => CommandResponse::new(CommandOutcome::NoTarget, error.to_string()),
             }
         })
