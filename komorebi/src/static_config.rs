@@ -1,3 +1,4 @@
+use crate::AUTO_SPLIT_THRESHOLD;
 use crate::AspectRatio;
 use crate::Axis;
 use crate::CrossBoundaryBehaviour;
@@ -528,6 +529,11 @@ pub struct StaticConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schemars", schemars(extend("default" = 4)))]
     pub default_workspace_count: Option<usize>,
+    /// Number of active containers a workspace may hold before a new window joins one instead of
+    /// making its own; 0 stops new windows ever adding a container (default: 2)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(extend("default" = 2)))]
+    pub auto_split_threshold: Option<usize>,
     /// Enable or disable float override, which makes it so every new window opens in floating mode
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "schemars", schemars(extend("default" = false)))]
@@ -907,6 +913,7 @@ impl From<&WindowManager> for StaticConfig {
             ),
             window_adoption_behaviour: Option::from(WINDOW_ADOPTION_BEHAVIOUR.load()),
             default_workspace_count: Option::from(DEFAULT_WORKSPACE_COUNT.load(Ordering::SeqCst)),
+            auto_split_threshold: Option::from(AUTO_SPLIT_THRESHOLD.load(Ordering::SeqCst)),
             float_override: Option::from(value.window_management_behaviour.float_override),
             floating_layer_behaviour: Option::from(
                 value.window_management_behaviour.floating_layer_behaviour,
@@ -1034,6 +1041,11 @@ impl StaticConfig {
         // as the ones which were there at startup.
         if let Some(count) = self.default_workspace_count {
             DEFAULT_WORKSPACE_COUNT.store(count.max(1), Ordering::SeqCst);
+        }
+
+        // Read on every new window, so a reload changes where the next one goes.
+        if let Some(threshold) = self.auto_split_threshold {
+            AUTO_SPLIT_THRESHOLD.store(threshold, Ordering::SeqCst);
         }
 
         if let Some(height) = self.minimum_window_height {
@@ -2045,6 +2057,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::Ordering;
 
+    use crate::AUTO_SPLIT_THRESHOLD;
     use crate::DEFAULT_WORKSPACE_COUNT;
     use crate::StaticConfig;
     use crate::WINDOW_ADOPTION_BEHAVIOUR;
@@ -2144,6 +2157,24 @@ mod tests {
 
             assert_eq!(config.window_adoption_behaviour, Some(behaviour));
         }
+    }
+
+    #[test]
+    fn an_auto_split_threshold_reaches_the_global_the_placement_reads() {
+        let restore = AUTO_SPLIT_THRESHOLD.load(Ordering::SeqCst);
+
+        let mut config =
+            serde_json::from_str::<StaticConfig>(r#"{ "auto_split_threshold": 0 }"#).unwrap();
+        config.apply_globals().unwrap();
+        assert_eq!(AUTO_SPLIT_THRESHOLD.load(Ordering::SeqCst), 0);
+
+        // A configuration which does not mention it leaves whatever was there.
+        let mut config = serde_json::from_str::<StaticConfig>("{}").unwrap();
+        config.apply_globals().unwrap();
+        assert_eq!(config.auto_split_threshold, None);
+        assert_eq!(AUTO_SPLIT_THRESHOLD.load(Ordering::SeqCst), 0);
+
+        AUTO_SPLIT_THRESHOLD.store(restore, Ordering::SeqCst);
     }
 
     #[test]

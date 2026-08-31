@@ -7,6 +7,7 @@ use std::io::Write;
 use std::num::NonZeroUsize;
 use std::sync::atomic::Ordering;
 
+use crate::AUTO_SPLIT_THRESHOLD;
 use crate::DATA_DIR;
 use crate::DEFAULT_CONTAINER_PADDING;
 use crate::DEFAULT_WORKSPACE_PADDING;
@@ -3167,9 +3168,13 @@ impl Workspace {
             return self.new_container_for_new_window(window);
         }
 
+        // An empty workspace has nothing to join and nothing to divide, whatever the threshold
+        // says; below it the arrangement is divided, above it the window joins a neighbour.
         match self.active_container_ids().len() {
             0 => self.new_container_for_new_window(window),
-            1 | 2 => self.split_for_new_window(window, None),
+            count if count <= AUTO_SPLIT_THRESHOLD.load(Ordering::SeqCst) => {
+                self.split_for_new_window(window, None)
+            }
             _ => self.join_neighbour_for_new_window(window),
         }
     }
@@ -8668,6 +8673,66 @@ mod tests {
         assert!(matches!(placement, NewWindowPlacement::NewContainer(_)));
         assert_eq!(workspace.containers().len(), 4);
         assert_eq!(workspace.containers()[0].focused_window().unwrap().hwnd, 80);
+    }
+
+    #[test]
+    fn the_default_threshold_gives_the_first_three_windows_a_container_each() {
+        let area = work_area(1920, 1080);
+        let mut workspace = Workspace::default();
+        workspace.record_logical_slots(area);
+
+        assert_eq!(AUTO_SPLIT_THRESHOLD.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            workspace.place_new_window(Window::from(70)),
+            NewWindowPlacement::NewContainer(_)
+        ));
+        workspace.record_logical_slots(area);
+        assert!(matches!(
+            workspace.place_new_window(Window::from(71)),
+            NewWindowPlacement::Split { .. }
+        ));
+        workspace.record_logical_slots(area);
+        assert!(matches!(
+            workspace.place_new_window(Window::from(72)),
+            NewWindowPlacement::Split { .. }
+        ));
+        workspace.record_logical_slots(area);
+
+        // Three active containers is past the threshold, so the fourth window joins one.
+        assert!(matches!(
+            workspace.place_new_window(Window::from(73)),
+            NewWindowPlacement::Joined(_)
+        ));
+    }
+
+    #[test]
+    fn a_threshold_of_zero_never_adds_a_container_for_a_new_window() {
+        let restore = AUTO_SPLIT_THRESHOLD.load(Ordering::SeqCst);
+        AUTO_SPLIT_THRESHOLD.store(0, Ordering::SeqCst);
+
+        let area = work_area(1920, 1080);
+        let mut workspace = Workspace::default();
+        workspace.record_logical_slots(area);
+
+        // The workspace has nothing to join, so the first window still gets a container.
+        assert!(matches!(
+            workspace.place_new_window(Window::from(74)),
+            NewWindowPlacement::NewContainer(_)
+        ));
+
+        // And from then on the count is the create and destroy commands' business alone.
+        for hwnd in 75..78 {
+            workspace.record_logical_slots(area);
+            assert!(matches!(
+                workspace.place_new_window(Window::from(hwnd)),
+                NewWindowPlacement::Joined(_)
+            ));
+        }
+
+        assert_eq!(workspace.containers().len(), 1);
+        assert_eq!(workspace.containers()[0].windows().len(), 4);
+
+        AUTO_SPLIT_THRESHOLD.store(restore, Ordering::SeqCst);
     }
 
     #[test]

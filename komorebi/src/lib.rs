@@ -264,6 +264,15 @@ lazy_static! {
 /// belongs here rather than only in `komorebi.json`. Configuration which asks for more still gets
 /// more: `ensure_workspace_count` only ever grows a monitor's list.
 pub static DEFAULT_WORKSPACE_COUNT: AtomicUsize = AtomicUsize::new(4);
+
+/// How many active containers a workspace may have before a new window stops making one of its own.
+///
+/// A new window divides the arrangement while the workspace holds this many active containers or
+/// fewer, and joins a neighbour once it holds more. Two is the tiling default: the first three
+/// windows each get a container. Zero gives the other model entirely - a workspace which already
+/// has an active container never grows another one on its own, and the count is decided by the
+/// create and destroy commands alone.
+pub static AUTO_SPLIT_THRESHOLD: AtomicUsize = AtomicUsize::new(2);
 pub static DEFAULT_WORKSPACE_PADDING: AtomicI32 = AtomicI32::new(10);
 pub static DEFAULT_CONTAINER_PADDING: AtomicI32 = AtomicI32::new(10);
 pub static DEFAULT_RESIZE_DELTA: i32 = 50;
