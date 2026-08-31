@@ -2783,6 +2783,97 @@ chosen so the desktop ends where it began, which it did:
 The one ERROR in the runtime log across the whole session belongs to a PowerShell console window of
 the deployment shell arriving during the previous instance's shutdown, and is not from this work.
 
+### Phase 23 - The floating window the mouse cannot move, and the keys the user asked for
+
+Added on 2026-09-01 from live use. Four reports, and the audit which opened the turn found that the
+first three share one cause and the fourth is a keymap request:
+
+1. A floated window (`Alt+T`) cannot be moved with the mouse. Releasing the drag makes it jump
+   somewhere else, and after a few drags it is gone from the screen entirely and `Alt+Tab` will not
+   bring it back.
+2. The floating move and floating resize keys do nothing.
+3. `Win+方向键` collides with the Windows snap shortcuts.
+4. The keymap: `Alt+方向键` should move the focused window into the container in that direction,
+   `Alt+Shift+方向键` should merge the focused container with the container in that direction,
+   `Alt+X` / `Alt+Z` add and remove a container, `Alt+[` / `Alt+]` walk the focused container's
+   window focus history, `Alt+Shift+[` / `Alt+Shift+]` walk the workspace's container focus history,
+   `Alt+W` closes, `Alt+F` toggles floating, `Alt+I` opens the panel and `Alt+/` goes away.
+
+The evidence for the first three came from the runtime rather than from the source. The log has
+`resizing with mouse` for every single drag of a floating window, and a live `GetWindowRect` probe
+found the two floating windows of the focused workspace at `y = 2271` and `y = 2187` on a 2160-tall
+screen - entirely below it - while the model still recorded the centred rectangle it gave them when
+they were floated. That is one chain:
+
+- `process_event` handles `MoveResizeEnd` for any managed window with the tiling path. It measures
+  the drag against `latest_layout[focused_container_idx]`, which for a floating window is another
+  container's rectangle or nothing at all, so the delta is meaningless and `is_move` is false.
+- The meaningless delta becomes `resize_window` calls, and `toggle_float` has set
+  `workspace.layer = Floating`, so `resize_window` takes its floating arm - which positions the
+  focused floating window directly by that delta. `(Up, Decrease)` is `rect.top += delta`, which is
+  how a window walks off the bottom of the screen a drag at a time.
+- Nothing on that path ever writes `floating_rect`, so the model's record and the window disagree
+  from the first drag onwards.
+
+The second report is the same window's second symptom rather than a separate defect: a floating
+window which has been blown up to the size of the work area by that arm is pinned by
+`clamp_position` in every direction, and `move-floating-window` correctly answers `no-op`. The
+`Win+方向键` bindings themselves reach komorebi; the log shows the commands arriving.
+
+- [ ] 23A: a drag of a floating window is a change to that window's own rectangle. `MoveResizeEnd`
+  records the observed rectangle, clamped back into the work area, and never enters the container
+  move/swap/resize path; `resize_window` loses its floating arm, because a container resize and a
+  floating resize are two commands in this model and only one of them may move a floating window.
+- [ ] 23B: `toggle-float` leaves a window with a rectangle it can be moved from - a maximized window
+  is restored before it is centred, and the recorded rectangle is clamped into the work area.
+- [ ] 23C: `merge-container <direction>`: the windows of the neighbouring container move into the
+  focused container, the neighbour is destroyed and its slot is absorbed by the ordinary deletion
+  path.
+- [ ] 23D: history cycling which does not rewrite the history it walks:
+  `cycle-container-window previous|next` over the focused container's window MRU, raising the
+  selected window to the top of the stack, and `cycle-focus-container previous|next` over the
+  workspace's container MRU. A cursor walks the history; any focus which does not come from these
+  commands resets it.
+- [ ] 23E: the AutoHotkey keymap, the panel and the documentation.
+- [ ] 23F: build, deploy and verify on the live desktop.
+
+Planned files: `komorebi/src/process_event.rs`, `komorebi/src/window_manager.rs`,
+`komorebi/src/workspace.rs`, `komorebi/src/container.rs`, `komorebi/src/core/mod.rs`,
+`komorebi/src/process_command.rs`, `komorebic/src/main.rs`,
+`docs/common-workflows/komorebi-model.ahk`, `docs/common-workflows/autohotkey-window-model.md`,
+`docs/window-model.md`, this plan.
+
+On `Alt+[` / `Alt+]` not changing the history they walk: they must not, and 23D implements that.
+A history whose head is rewritten on every step can only ever reach the two most recent windows,
+which is the same reason Windows' own `Alt+Tab` holds its order until the key is released. The stack
+order does change - the selected window is raised to the top of its container, which is what the
+request asks for - but the MRU is left alone until a focus arrives from somewhere else.
+
+The keymap this phase settles, with one rule behind it: `Alt` is the model, `Shift` reverses or
+strengthens, `Ctrl` means the floating window, and the arrow keys are never used with `Win`.
+
+| Key | Action |
+| --- | --- |
+| `Alt+H J K L` | focus the container to the left / below / above / right |
+| `Alt+Shift+H J K L` | swap the focused container with that neighbour |
+| `Alt+←↓↑→` | move the focused window into the container in that direction |
+| `Alt+Shift+←↓↑→` | merge the focused container with the container in that direction |
+| `Alt+Ctrl+H J K L` | move the floating window |
+| `Alt+Ctrl+Shift+H J K L` | grow the floating window's left / bottom / top / right edge |
+| `Alt+Ctrl+Shift+Y U I O` | shrink the same four edges (the row above `H J K L`) |
+| `Alt+Ctrl+←↓↑→` | push the focused container's boundary outwards |
+| `Alt+Ctrl+Shift+←↓↑→` | pull the same boundary inwards |
+| `Alt+X` / `Alt+Shift+X` / `Alt+Ctrl+X` | create a container: automatic / left-right / top-bottom |
+| `Alt+Z` / `Alt+Shift+Z` | destroy the newest / the focused container |
+| `Alt+[` `Alt+]` | walk the focused container's window history |
+| `Alt+Shift+[` `Alt+Shift+]` | walk the workspace's container history |
+| `Alt+Ctrl+[` `Alt+Ctrl+]` | move the workspace one position left / right |
+| `Alt+W` | close the window |
+| `Alt+F` / `Alt+Shift+F` / `Alt+Ctrl+F` | floating / maximized / fullscreen |
+| `Alt+M` / `Alt+Shift+M` | minimize / restore the last minimized window |
+| `Alt+A` / `Alt+Shift+A` | new workspace / delete and merge this workspace |
+| `Alt+I` | the shortcut panel; `Alt+/` is removed |
+
 ## Provisional affected-file inventory
 
 This list is updated from actual diffs, not treated as permission to change every file.
