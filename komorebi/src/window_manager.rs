@@ -57,14 +57,13 @@ use crate::REGEX_IDENTIFIERS;
 use crate::SUBSCRIPTION_SOCKETS;
 use crate::WORKSPACE_MATCHING_RULES;
 use crate::border_manager;
-use crate::border_manager::BORDER_OFFSET;
-use crate::border_manager::BORDER_WIDTH;
 use crate::command_outcome::CommandOutcome;
 use crate::command_outcome::CommandResponse;
 use crate::container::Container;
 use crate::current_virtual_desktop;
 use crate::floating_geometry::FloatingBounds;
 use crate::floating_geometry::FloatingLimits;
+use crate::floating_geometry::clamp_reachable;
 use crate::floating_geometry::scale_delta;
 use crate::floating_geometry::transfer_between_areas;
 use crate::geometry::SplitAxis;
@@ -1963,173 +1962,91 @@ impl WindowManager {
         delta: i32,
         update: bool,
     ) -> eyre::Result<()> {
-        let mouse_follows_focus = self.mouse_follows_focus;
-        let mut focused_monitor_work_area = self.focused_monitor_work_area()?;
+        let focused_monitor_work_area = self.focused_monitor_work_area()?;
         let workspace = self.focused_workspace_mut()?;
 
-        match workspace.layer {
-            WorkspaceLayer::Floating => {
-                let workspace = self.focused_workspace()?;
-                let focused_hwnd = WindowsApi::foreground_window()?;
+        // A container resize moves a boundary two containers share. It has nothing to do with a
+        // floating window, whose rectangle is its own and is changed only by the floating
+        // commands, so the workspace layer does not redirect this command at one.
+        match workspace.layout {
+            Layout::Default(layout) => {
+                tracing::info!("resizing window");
+                let len = NonZeroUsize::new(workspace.containers().len())
+                    .ok_or_eyre("there must be at least one container")?;
+                let focused_idx = workspace.focused_container_idx();
+                let focused_idx_resize = workspace
+                    .resize_dimensions
+                    .get(focused_idx)
+                    .ok_or_eyre("there is no resize adjustment for this container")?;
 
-                let border_offset = BORDER_OFFSET.load(Ordering::SeqCst);
-                let border_width = BORDER_WIDTH.load(Ordering::SeqCst);
-                focused_monitor_work_area.left += border_offset;
-                focused_monitor_work_area.left += border_width;
-                focused_monitor_work_area.top += border_offset;
-                focused_monitor_work_area.top += border_width;
-                focused_monitor_work_area.right -= border_offset * 2;
-                focused_monitor_work_area.right -= border_width * 2;
-                focused_monitor_work_area.bottom -= border_offset * 2;
-                focused_monitor_work_area.bottom -= border_width * 2;
+                if direction
+                    .destination(
+                        workspace.layout.as_boxed_direction().as_ref(),
+                        workspace.layout_flip,
+                        focused_idx,
+                        len,
+                        workspace.layout_options,
+                    )
+                    .is_some()
+                {
+                    let unaltered = layout.calculate(
+                        &focused_monitor_work_area,
+                        len,
+                        workspace.container_padding,
+                        workspace.layout_flip,
+                        &[],
+                        workspace.focused_container_idx(),
+                        workspace.layout_options,
+                        &workspace.latest_layout,
+                    );
 
-                for window in workspace.floating_windows().iter() {
-                    if window.hwnd == focused_hwnd {
-                        let mut rect = WindowsApi::window_rect(window.hwnd)?;
-                        match (direction, sizing) {
-                            (OperationDirection::Left, Sizing::Increase) => {
-                                if rect.left - delta < focused_monitor_work_area.left {
-                                    rect.left = focused_monitor_work_area.left;
-                                } else {
-                                    rect.left -= delta;
-                                }
-                            }
-                            (OperationDirection::Left, Sizing::Decrease) => {
-                                rect.left += delta;
-                            }
-                            (OperationDirection::Right, Sizing::Increase) => {
-                                if rect.left + rect.right + delta * 2
-                                    > focused_monitor_work_area.left
-                                        + focused_monitor_work_area.right
+                    let mut direction = direction;
+
+                    // We only ever want to operate on the unflipped Rect positions when resizing, then we
+                    // can flip them however they need to be flipped once the resizing has been done
+                    if let Some(flip) = workspace.layout_flip {
+                        match flip {
+                            Axis::Horizontal => {
+                                if matches!(direction, OperationDirection::Left)
+                                    || matches!(direction, OperationDirection::Right)
                                 {
-                                    rect.right = focused_monitor_work_area.left
-                                        + focused_monitor_work_area.right
-                                        - rect.left;
-                                } else {
-                                    rect.right += delta * 2;
+                                    direction = direction.opposite();
                                 }
                             }
-                            (OperationDirection::Right, Sizing::Decrease) => {
-                                rect.right -= delta * 2;
-                            }
-                            (OperationDirection::Up, Sizing::Increase) => {
-                                if rect.top - delta < focused_monitor_work_area.top {
-                                    rect.top = focused_monitor_work_area.top;
-                                } else {
-                                    rect.top -= delta;
-                                }
-                            }
-                            (OperationDirection::Up, Sizing::Decrease) => {
-                                rect.top += delta;
-                            }
-                            (OperationDirection::Down, Sizing::Increase) => {
-                                if rect.top + rect.bottom + delta * 2
-                                    > focused_monitor_work_area.top
-                                        + focused_monitor_work_area.bottom
+                            Axis::Vertical => {
+                                if matches!(direction, OperationDirection::Up)
+                                    || matches!(direction, OperationDirection::Down)
                                 {
-                                    rect.bottom = focused_monitor_work_area.top
-                                        + focused_monitor_work_area.bottom
-                                        - rect.top;
-                                } else {
-                                    rect.bottom += delta * 2;
+                                    direction = direction.opposite();
                                 }
                             }
-                            (OperationDirection::Down, Sizing::Decrease) => {
-                                rect.bottom -= delta * 2;
-                            }
+                            Axis::HorizontalAndVertical => direction = direction.opposite(),
                         }
-
-                        WindowsApi::position_window(window.hwnd, &rect, false, true)?;
-                        if mouse_follows_focus {
-                            WindowsApi::center_cursor_in_rect(&rect)?;
-                        }
-
-                        break;
                     }
-                }
-            }
-            WorkspaceLayer::Tiling => {
-                match workspace.layout {
-                    Layout::Default(layout) => {
-                        tracing::info!("resizing window");
-                        let len = NonZeroUsize::new(workspace.containers().len())
-                            .ok_or_eyre("there must be at least one container")?;
-                        let focused_idx = workspace.focused_container_idx();
-                        let focused_idx_resize = workspace
-                            .resize_dimensions
+
+                    let resize = layout.resize(
+                        unaltered
                             .get(focused_idx)
-                            .ok_or_eyre("there is no resize adjustment for this container")?;
+                            .ok_or_eyre("there is no last layout")?,
+                        focused_idx_resize,
+                        direction,
+                        sizing,
+                        delta,
+                    );
 
-                        if direction
-                            .destination(
-                                workspace.layout.as_boxed_direction().as_ref(),
-                                workspace.layout_flip,
-                                focused_idx,
-                                len,
-                                workspace.layout_options,
-                            )
-                            .is_some()
-                        {
-                            let unaltered = layout.calculate(
-                                &focused_monitor_work_area,
-                                len,
-                                workspace.container_padding,
-                                workspace.layout_flip,
-                                &[],
-                                workspace.focused_container_idx(),
-                                workspace.layout_options,
-                                &workspace.latest_layout,
-                            );
+                    workspace.resize_dimensions[focused_idx] = resize;
 
-                            let mut direction = direction;
-
-                            // We only ever want to operate on the unflipped Rect positions when resizing, then we
-                            // can flip them however they need to be flipped once the resizing has been done
-                            if let Some(flip) = workspace.layout_flip {
-                                match flip {
-                                    Axis::Horizontal => {
-                                        if matches!(direction, OperationDirection::Left)
-                                            || matches!(direction, OperationDirection::Right)
-                                        {
-                                            direction = direction.opposite();
-                                        }
-                                    }
-                                    Axis::Vertical => {
-                                        if matches!(direction, OperationDirection::Up)
-                                            || matches!(direction, OperationDirection::Down)
-                                        {
-                                            direction = direction.opposite();
-                                        }
-                                    }
-                                    Axis::HorizontalAndVertical => direction = direction.opposite(),
-                                }
-                            }
-
-                            let resize = layout.resize(
-                                unaltered
-                                    .get(focused_idx)
-                                    .ok_or_eyre("there is no last layout")?,
-                                focused_idx_resize,
-                                direction,
-                                sizing,
-                                delta,
-                            );
-
-                            workspace.resize_dimensions[focused_idx] = resize;
-
-                            return if update {
-                                self.update_focused_workspace(false, false)
-                            } else {
-                                Ok(())
-                            };
-                        }
-
-                        tracing::warn!("cannot resize container in this direction");
-                    }
-                    Layout::Custom(_) => {
-                        tracing::warn!("containers cannot be resized when using custom layouts");
-                    }
+                    return if update {
+                        self.update_focused_workspace(false, false)
+                    } else {
+                        Ok(())
+                    };
                 }
+
+                tracing::warn!("cannot resize container in this direction");
+            }
+            Layout::Custom(_) => {
+                tracing::warn!("containers cannot be resized when using custom layouts");
             }
         }
 
@@ -3241,6 +3158,34 @@ impl WindowManager {
         WindowsApi::position_window(hwnd, &rect, false, true)?;
 
         Ok(WindowsApi::window_rect(hwnd).unwrap_or(rect))
+    }
+
+    /// Record where a mouse drag left a floating window.
+    ///
+    /// A floating window has no slot, so a drag of one cannot be measured against the arrangement:
+    /// it is the user placing the window, and the whole operation is agreeing with them. The
+    /// rectangle is kept as dropped unless the drag carried the window out of reach, which is the
+    /// only case where the window is moved at all.
+    ///
+    /// Nothing else changes: no container gains or loses a window, no slot is recomputed and no
+    /// other window moves.
+    pub fn record_floating_drag(&mut self, hwnd: isize, dropped: Rect) -> eyre::Result<Rect> {
+        let bounds = FloatingBounds::new(self.focused_monitor_work_area()?);
+        let reachable = clamp_reachable(dropped, bounds);
+
+        let accepted = if reachable == dropped {
+            dropped
+        } else {
+            tracing::info!(
+                "pulling a floating window dropped out of reach back into the work area"
+            );
+            Self::apply_floating_geometry(hwnd, reachable)?
+        };
+
+        self.focused_workspace_mut()?
+            .confirm_floating_geometry(hwnd, accepted);
+
+        Ok(accepted)
     }
 
     #[tracing::instrument(skip(self))]
@@ -6221,6 +6166,124 @@ mod tests {
         }
 
         (wm, context)
+    }
+
+    /// A workspace on a monitor with a real work area, so the floating clamp has an area to
+    /// measure against rather than the zero rectangle the other helpers are happy with.
+    fn window_manager_with_work_area(
+        hwnds: &[isize],
+        work_area: Rect,
+    ) -> (WindowManager, TestContext) {
+        let (mut wm, context) = setup_window_manager();
+        let mut monitor = monitor::new(
+            0,
+            work_area,
+            work_area,
+            "TestMonitor".to_string(),
+            "TestDevice".to_string(),
+            "TestDeviceID".to_string(),
+            Some("TestMonitorID".to_string()),
+        );
+
+        let mut container = Container::default();
+        for hwnd in hwnds {
+            container.windows_mut().push_back(Window::from(*hwnd));
+        }
+
+        monitor
+            .focused_workspace_mut()
+            .unwrap()
+            .add_container_to_back(container);
+        wm.monitors_mut().push_back(monitor);
+
+        for hwnd in hwnds {
+            wm.known_hwnds.insert(*hwnd, (0, 0));
+        }
+
+        (wm, context)
+    }
+
+    #[test]
+    fn a_dropped_floating_window_keeps_the_rectangle_the_mouse_gave_it() {
+        let work_area = Rect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        let (mut wm, _test_context) = window_manager_with_work_area(&[42, 43], work_area);
+
+        let floated = Rect {
+            left: 100,
+            top: 100,
+            right: 800,
+            bottom: 600,
+        };
+        wm.focused_workspace_mut()
+            .unwrap()
+            .float_window(43, floated)
+            .unwrap();
+
+        let container_id = wm.focused_workspace().unwrap().containers()[0].id.clone();
+        let dropped = Rect {
+            left: 640,
+            top: 420,
+            right: 800,
+            bottom: 600,
+        };
+
+        assert_eq!(wm.record_floating_drag(43, dropped).unwrap(), dropped);
+
+        let workspace = wm.focused_workspace().unwrap();
+        let container = &workspace.containers()[0];
+
+        // The drag changed the window's own rectangle and nothing else: same container, same
+        // stack, same identity, and the stored window beside it is untouched.
+        assert_eq!(container.id, container_id);
+        assert_eq!(container.windows().len(), 2);
+        assert_eq!(container.windows()[0].hwnd, 42);
+        assert_eq!(container.windows()[0].floating_rect, None);
+        assert_eq!(container.windows()[1].floating_rect, Some(dropped));
+        assert_eq!(
+            container.windows()[1].placement,
+            crate::managed_window::ManagedPlacement::Floating
+        );
+    }
+
+    #[test]
+    fn a_floating_window_dropped_where_it_hangs_off_an_edge_is_not_pulled_back() {
+        let work_area = Rect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        let (mut wm, _test_context) = window_manager_with_work_area(&[42], work_area);
+
+        let floated = Rect {
+            left: 100,
+            top: 100,
+            right: 800,
+            bottom: 600,
+        };
+        wm.focused_workspace_mut()
+            .unwrap()
+            .float_window(42, floated)
+            .unwrap();
+
+        // Half off the right edge is a placement, not a mistake, so it is recorded as dropped.
+        let dropped = Rect {
+            left: 1520,
+            top: 700,
+            right: 800,
+            bottom: 600,
+        };
+
+        assert_eq!(wm.record_floating_drag(42, dropped).unwrap(), dropped);
+        assert_eq!(
+            wm.focused_workspace().unwrap().containers()[0].windows()[0].floating_rect,
+            Some(dropped)
+        );
     }
 
     #[test]

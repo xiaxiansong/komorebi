@@ -136,11 +136,45 @@ pub fn clamp_position(rect: Rect, bounds: FloatingBounds) -> Rect {
     clamped
 }
 
+/// Keep a floating window reachable inside `bounds` without insisting that it fits inside it.
+///
+/// This is the rule for a rectangle the user chose with the mouse. A window dropped half off an
+/// edge is left exactly where it was dropped, because moving it back is the jump the user did not
+/// ask for; only a window which has been carried out of reach is pulled back, and only far enough
+/// to leave `min_visible` of it inside the area.
+///
+/// [`clamp_position`] is the stricter rule the movement commands use: it contains a window which
+/// fits, and falls back to this one when it does not.
+#[must_use]
+pub fn clamp_reachable(rect: Rect, bounds: FloatingBounds) -> Rect {
+    let area = bounds.area;
+    let mut clamped = rect;
+
+    clamped.left = clamp_reachable_axis(
+        rect.left,
+        rect.right,
+        area.left,
+        area.right,
+        bounds.min_visible,
+        false,
+    );
+
+    clamped.top = clamp_reachable_axis(
+        rect.top,
+        rect.bottom,
+        area.top,
+        area.bottom,
+        bounds.min_visible,
+        true,
+    );
+
+    clamped
+}
+
 /// Clamp one axis of a window position.
 ///
-/// When the window fits, it is contained. When it does not, `keep_start_inside` decides whether
-/// the near edge is pinned to the area or whether the window may hang off either side as long as
-/// `min_visible` of it stays inside.
+/// When the window fits, it is contained. When it does not, the reachability rule below applies
+/// instead.
 fn clamp_axis(
     position: i32,
     size: i32,
@@ -155,6 +189,29 @@ fn clamp_axis(
         return position.clamp(area_start, contained_upper);
     }
 
+    clamp_reachable_axis(
+        position,
+        size,
+        area_start,
+        area_extent,
+        min_visible,
+        keep_start_inside,
+    )
+}
+
+/// Clamp one axis so that `min_visible` of the window stays inside the area.
+///
+/// `keep_start_inside` decides whether the near edge is pinned to the area or whether the window
+/// may hang off either side. It is set for the vertical axis, because the title bar is at the top:
+/// a window pushed above the top of the work area cannot be dragged back with the mouse.
+fn clamp_reachable_axis(
+    position: i32,
+    size: i32,
+    area_start: i32,
+    area_extent: i32,
+    min_visible: i32,
+    keep_start_inside: bool,
+) -> i32 {
     let visible = min_visible.min(size).min(area_extent);
     let lower = if keep_start_inside {
         area_start
@@ -281,6 +338,53 @@ mod tests {
             right: width,
             bottom: height,
         }
+    }
+
+    #[test]
+    fn a_dropped_window_which_hangs_off_an_edge_stays_where_it_was_dropped() {
+        // What the mouse chose is kept: the strict rule would pull each of these back, which is
+        // the jump a drag must not produce.
+        for dropped in [
+            rect(-200, 100, 800, 600),
+            rect(1700, 100, 800, 600),
+            rect(400, 800, 800, 600),
+        ] {
+            assert_eq!(clamp_reachable(dropped, bounds()), dropped);
+            assert_ne!(clamp_position(dropped, bounds()), dropped);
+        }
+    }
+
+    #[test]
+    fn a_dropped_window_carried_out_of_reach_is_pulled_back_to_its_visible_strip() {
+        let below = clamp_reachable(rect(400, 2000, 800, 600), bounds());
+        assert_eq!(below.top, AREA.bottom - MIN_VISIBLE_EXTENT);
+        assert_eq!((below.left, below.right, below.bottom), (400, 800, 600));
+
+        let above = clamp_reachable(rect(400, -900, 800, 600), bounds());
+        assert_eq!(above.top, AREA.top);
+
+        let left = clamp_reachable(rect(-1000, 100, 800, 600), bounds());
+        assert_eq!(left.left, MIN_VISIBLE_EXTENT - 800);
+
+        let right = clamp_reachable(rect(3000, 100, 800, 600), bounds());
+        assert_eq!(right.left, AREA.right - MIN_VISIBLE_EXTENT);
+    }
+
+    #[test]
+    fn a_dropped_window_larger_than_the_work_area_is_left_alone_while_it_is_reachable() {
+        let oversized = rect(-100, 0, 2200, 1200);
+
+        assert_eq!(clamp_reachable(oversized, bounds()), oversized);
+    }
+
+    #[test]
+    fn the_strict_rule_falls_back_to_the_reachable_one_when_the_window_cannot_fit() {
+        let oversized = rect(-3000, 2000, 2200, 1200);
+
+        assert_eq!(
+            clamp_position(oversized, bounds()),
+            clamp_reachable(oversized, bounds())
+        );
     }
 
     #[test]

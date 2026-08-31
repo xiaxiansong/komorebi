@@ -1018,8 +1018,15 @@ impl WindowManager {
                     }
                 }
 
+                // A drag of a floating window is a change to that window's own rectangle and to
+                // nothing else. It owns no slot, so measuring the drag against the arrangement
+                // measures it against another container's rectangle and turns a move the user made
+                // with the mouse into a container resize they never asked for. Recording where the
+                // window was dropped is the whole operation.
                 let workspace = self.focused_workspace_mut()?;
-                if (workspace.tile && workspace.contains_managed_window(window.hwnd))
+                if !moved_across_monitors && workspace.is_floating_window(window.hwnd) {
+                    self.record_floating_drag(window.hwnd, new_position)?;
+                } else if (workspace.tile && workspace.contains_managed_window(window.hwnd))
                     || moved_across_monitors
                 {
                     let resize = Rect {
