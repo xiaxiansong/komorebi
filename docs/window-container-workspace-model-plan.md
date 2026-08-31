@@ -2571,10 +2571,43 @@ a cause.
   old order for new-window joining; tests and `docs/window-model.md` follow.
 - [x] 21B: restoring a minimized window takes it out of the minimized state Win32 holds it in.
 - [x] 21C: the bar's layout widget draws the focused workspace's active logical slots.
+- [x] 21D: build, deploy and verify all three on the live desktop.
 
 Planned files: `komorebi/src/geometry.rs`, `komorebi/src/window.rs`,
 `komorebi/src/window_manager.rs`, `komorebi-bar/src/widgets/komorebi_layout.rs`,
 `komorebi-bar/src/widgets/komorebi.rs`, `docs/window-model.md`, this plan.
+
+21D actual files: this plan. Deployment: the four installed binaries.
+
+Built, installed through the request-file path in `komorebi-start.ps1` and cold started, with the
+installed `komorebic --version` reporting `fbc05192`. Phase 19's lesson is the reason this is a
+sub-phase of its own rather than a line at the end of the others.
+
+The desktop opened as it always does - one monitor, four workspaces, workspace one holding one
+active container with all four windows and one slot covering the work area - and every check below
+was chosen so it ends there too, which it did.
+
+21A on the desktop: three `create-container` calls quartered the work area into four gap-free slots,
+1908 wide and 1018 high each. `destroy-container` then destroyed the newest, the bottom right, and
+the *top right* container grew down from 1018 to 2036 while the bottom left was untouched. That is
+the reported case, answered the way the user asked for. `destroy-container --count 2` unwound it.
+
+21B on the desktop, reproducing the report exactly: two containers, focus left, `minimize`. The
+window went genuinely iconic, its container went Hidden - two containers, one slot - and the survivor
+took the whole work area. `restore-last-minimized-window` then brought both halves back to the same
+rectangles they held before, *and* `IsIconic` came back false with the window in the foreground and
+drawn at 29,69-1903,2071, inside its slot with the gaps applied. Before this phase the slots came
+back and that last part did not.
+
+21C on the desktop, by screenshot rather than by state, since the point is what is drawn: the icon
+showed one filled cell with one container, two halves with the left one filled with two, and a 2x2
+grid with four - the focused container's cell filled in each. The hotkey layer was not involved in
+any of this and did not need to be: `Alt+Shift+M` has been bound to
+`restore-last-minimized-window` since Phase 13, and the live script includes this repository's
+`komorebi-model.ahk` directly.
+
+The runtime log holds no ERROR or WARN from the new process. Today's twenty-one entries all fall at
+or before the second the old process was stopped, so they belong to the binary being replaced.
 
 21C actual files: `komorebi-client/src/lib.rs`, `komorebi-bar/src/widgets/komorebi_layout.rs`,
 `komorebi-bar/src/widgets/komorebi.rs`.
@@ -3132,3 +3165,26 @@ This list is updated from actual diffs, not treated as permission to change ever
   Phase 15 taught in the configuration layer and this turn repeats in the binary layer: a fix which
   is committed and tested is not a fix the user has, and a bug report that matches the previous
   turn's report exactly should be checked against the deployed version stamp first.
+- 2026-08-31: Phase 21 turn. Three reports from live use, and the audit which opened the turn found
+  three unrelated causes, which is why they became three sub-phases rather than one. The absorption
+  order was not a defect at all - `ABSORPTION_DIRECTIONS` was left, right, up, down, exactly as
+  section 14 of the task specifies - so the question was put to the user before any code was
+  written, and the order became up, down, left, right on their answer. The interesting part was
+  what *not* to change with it: one constant was serving both the absorption order and section 9's
+  separate rule for picking a neighbour to hand a new window to, and those are two questions with
+  two separately specified answers, so it became two constants and only one of them moved. The
+  minimize report is the turn's real bug and its cause is one line deep: `Window::restore` is not
+  the opposite of a minimize - under the default `Cloak` hiding behaviour it clears the cloak
+  komorebi applied and nothing else - so every model step of `Alt+Shift+M` was correct and the last
+  Win32 call uncloaked a window which had never been cloaked. `unminimize` is deliberately separate
+  from `restore` rather than folded into it, because un-minimizing a window the user minimized is
+  the one thing komorebi must not do on its own; only the command itself and a reveal whose recorded
+  visibility is already `Visible` may ask for it. The bar icon was never wrong, only static: it
+  drew a glyph per layout kind, and this fork has had ID-keyed logical slots in its state document
+  since Phase 4, so the arrangement was already there to read. It is drawn by painting interior
+  edges only, which is one routine for every arrangement rather than one per layout. Serial suite
+  komorebi 559 -> 561 passing, komorebi-bar 3 -> 7; fmt clean; Clippy clean apart from the
+  pre-existing warning. The parallel runner's failures are the Phase 18 isolation defect and vary
+  run to run - nine on the unchanged tree, five with this change - which is what says they are
+  scheduling. All three were verified on the live desktop after deployment, on `fbc05192`, and the
+  desktop ends where it began.
