@@ -2332,6 +2332,45 @@ fails on the code as it was - the window left behind stays in the hidden set - a
 load in place. The serial komorebi suite passes at 540, fmt is clean, and Clippy reports only the
 pre-existing `items_after_test_module` warning.
 
+### Phase 19 - Getting the Phase 18 fix onto the desktop
+
+Added on 2026-08-31. The report was that creating a container still leaves the created half empty,
+described exactly as in Phase 18. No Rust changed: Phase 18's fix was already in the tree and
+already tested, but it had never been built into the binaries the machine runs.
+
+The evidence is the version stamp. The repository was clean on `eebcab88`, which is Phase 18, while
+the installed `komorebic.exe` reported `commit_hash:2d49746d` built at `2026-08-31 07:18:58` - the
+Phase 16 build, two commits behind, made before the fix existed. The running `komorebi.exe`
+therefore did not contain the two `load_focused_window` calls, so the symptom was the unfixed
+behaviour, not a second defect. This is the failure mode Phase 15 already recorded once from the
+other direction: a correct model does nothing for a desktop which is running a different binary.
+
+- [x] 19A: rebuild the six release binaries, confirm the embedded commit is `eebcab88`, install
+  through the existing request-file path in `komorebi-start.ps1`, cold start, and verify the fix
+  against the live desktop rather than against the tests which already covered it.
+
+No repository file changed but this plan.
+
+Verification of the deployment itself: `cargo fmt --check` clean; the serial komorebi suite 540
+passing, 0 failed; Clippy reporting only the pre-existing `items after a test module` warning; the
+release `komorebic --version` reporting `eebcab88`; and the SHA-256 of the installed
+`komorebi.exe` equal to the built one after the swap, which is what says the running process is the
+fixed one rather than a rollback.
+
+Verification of the fix on the live desktop, chosen so it returns the desktop to the state it
+started in. The probe reads `DWMWA_CLOAKED` per window, because this configuration hides with
+`Cloak`, so it observes what Windows is drawing rather than what the model believes. From one
+container holding three windows with the top one on screen and two cloaked: the first
+`create-container` left the created half showing its window *and* the donor half showing the window
+it was left with - which is the case that was broken, since the donor's next window had been cloaked
+underneath the one taken away. The second `create-container` split the donor again and all three
+containers drew their window, with three gap-free non-overlapping slots exactly covering the work
+area. Two `destroy-container` calls returned the desktop to a single container filling the work
+area with the same three windows; the stack order came back as the round-robin distribution
+produces it rather than in the original order, which is the documented behaviour and not a defect.
+The runtime log holds one ERROR for the whole day, ten seconds before the new process started, so
+it belongs to the binary being replaced.
+
 ## Provisional affected-file inventory
 
 This list is updated from actual diffs, not treated as permission to change every file.
@@ -2809,3 +2848,18 @@ This list is updated from actual diffs, not treated as permission to change ever
   after this change - they assert on the same global hidden set that other tests mutate - which is
   a pre-existing test-isolation defect, not a regression, and is recorded here rather than fixed in
   a bug-fix turn.
+- 2026-08-31: Phase 19 turn. No Rust changed. The reported symptom was Phase 18's symptom, and the
+  cause was that Phase 18 had never been deployed: the tree was clean on `eebcab88` while the
+  installed binaries reported `2d49746d`, so the running `komorebi.exe` predated the fix by two
+  commits. The turn opened by comparing the embedded commit stamp with `git log` rather than by
+  re-reading the split code, which is what made it a five-minute diagnosis instead of a second
+  investigation of an already-correct model. Rebuilt, checked (fmt clean, serial suite 540 passing,
+  Clippy unchanged), installed through the request-file path `komorebi-start.ps1` already owns -
+  which keeps a rollback copy and elevates through the registered scheduled task rather than a UAC
+  prompt - and cold started. The fix was then verified on the live desktop with a `DWMWA_CLOAKED`
+  probe rather than from `komorebic state`, because the model was never the thing in doubt: what
+  needed observing was whether Windows draws the window the donor is left showing. It does. The
+  smoke test was bounded so the desktop ends where it began. The lesson worth keeping is the one
+  Phase 15 taught in the configuration layer and this turn repeats in the binary layer: a fix which
+  is committed and tested is not a fix the user has, and a bug report that matches the previous
+  turn's report exactly should be checked against the deployed version stamp first.
