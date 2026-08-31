@@ -151,15 +151,25 @@ pub enum SocketMessage {
     ToggleMonocleFocusBehaviour,
     MonocleFocusBehaviour(MonocleFocusBehaviour),
     UnmanagedWindowOperationBehaviour(OperationBehaviour),
-    /// Split a new container off an eligible donor on the focused workspace.
+    /// Add one container to the focused workspace.
     ///
-    /// The donor is the most recently focused active container holding at least two windows, and
-    /// it gives up its most recently focused window. An omitted axis divides the donor's longer
-    /// edge.
+    /// The largest active slot is divided, the most recently created container winning a tie, and
+    /// an omitted axis divides that slot's longer edge. The window put into the created container
+    /// is the second most recent window in the workspace's focus history which is not the window
+    /// its own container is showing. Focus does not move.
     CreateContainer(Option<SplitAxis>),
+    /// Remove one container from the focused workspace: the one created most recently, whichever
+    /// container holds the focus.
+    ///
+    /// Its windows are dealt out to the containers which remain. Focus does not move, except that
+    /// a focused window which was in the destroyed container is raised and focused wherever it
+    /// lands.
+    DestroyContainer,
     /// Destroy the focused container, dealing every window it holds out to the containers which
     /// remain.
-    DestroyContainer,
+    ///
+    /// The focused window travels with the focus into whichever container receives it.
+    DestroyFocusedContainer,
     // Current Workspace Commands
     ManageFocusedWindow,
     UnmanageFocusedWindow,
@@ -931,6 +941,10 @@ mod tests {
             (
                 SocketMessage::DestroyContainer,
                 r#"{"type":"DestroyContainer"}"#,
+            ),
+            (
+                SocketMessage::DestroyFocusedContainer,
+                r#"{"type":"DestroyFocusedContainer"}"#,
             ),
             (
                 SocketMessage::MoveWorkspaceToIndex(2),

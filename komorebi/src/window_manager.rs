@@ -1321,6 +1321,31 @@ impl WindowManager {
         })
     }
 
+    /// Destroy the container the focused workspace made most recently.
+    ///
+    /// This is the inverse of [`Self::create_container`], and like it, it does not move the focus.
+    /// A container with windows and nowhere to send them is the last container of a workspace, and
+    /// destroying it would leave its windows owned by nothing; that is refused rather than
+    /// half-performed.
+    pub fn destroy_newest_container(&mut self) -> eyre::Result<CommandResponse> {
+        self.commit_workspace_change(|workspace| {
+            if workspace.containers().is_empty() {
+                return CommandResponse::new(
+                    CommandOutcome::NoTarget,
+                    "this workspace has no container to destroy",
+                );
+            }
+
+            match workspace.destroy_newest_container() {
+                Ok(()) => CommandResponse::new(
+                    CommandOutcome::Success,
+                    "destroyed the most recently created container",
+                ),
+                Err(error) => CommandResponse::new(CommandOutcome::NoTarget, error.to_string()),
+            }
+        })
+    }
+
     /// Destroy the focused container, sharing out every window it still holds.
     ///
     /// A container with windows and nowhere to send them is the last container of a workspace, and
@@ -5874,11 +5899,18 @@ mod tests {
     }
 
     #[test]
-    fn creating_a_container_splits_the_donor_and_follows_focus() {
+    fn creating_a_container_divides_the_slot_without_moving_the_focus() {
         let (mut wm, _test_context) = window_manager_with_container(&[42, 43]);
+        let focused_before = wm
+            .focused_workspace()
+            .unwrap()
+            .focused_container()
+            .unwrap()
+            .id
+            .clone();
 
-        // The desktop focus which follows the split cannot succeed for unreal handles; what this
-        // asserts is the model the command committed before going near Win32.
+        // What this asserts is the model the command committed before going near Win32; the
+        // desktop calls cannot succeed for unreal handles.
         let _ = wm.create_container(Some(SplitAxis::LeftRight));
 
         let workspace = wm.focused_workspace().unwrap();
@@ -5890,10 +5922,47 @@ mod tests {
                 .all(|container| container.windows().len() == 1)
         );
         assert_eq!(
-            workspace.focused_container().unwrap().windows().len(),
-            1,
-            "the created container should be focused"
+            workspace.focused_container().unwrap().id,
+            focused_before,
+            "adding a container is not a focus change"
         );
+    }
+
+    #[test]
+    fn destroying_the_newest_container_gives_the_created_one_back() {
+        let (mut wm, _test_context) = window_manager_with_container(&[42, 43]);
+        let _ = wm.create_container(Some(SplitAxis::LeftRight));
+
+        let created = {
+            let workspace = wm.focused_workspace().unwrap();
+            assert_eq!(workspace.containers().len(), 2);
+            workspace
+                .containers()
+                .iter()
+                .max_by_key(|container| container.sequence())
+                .unwrap()
+                .id
+                .clone()
+        };
+
+        // The committed model is what this asserts: the desktop calls which follow a successful
+        // command cannot succeed for unreal handles.
+        let _ = wm.destroy_newest_container();
+
+        let workspace = wm.focused_workspace().unwrap();
+        assert_eq!(workspace.containers().len(), 1);
+        assert!(workspace.container_idx_for_id(&created).is_none());
+        assert_eq!(workspace.containers()[0].windows().len(), 2);
+    }
+
+    #[test]
+    fn destroying_the_newest_container_of_a_single_container_workspace_refuses() {
+        let (mut wm, _test_context) = window_manager_with_container(&[42, 43]);
+
+        let response = wm.destroy_newest_container().unwrap();
+
+        assert_eq!(response.outcome, CommandOutcome::NoTarget);
+        assert_eq!(wm.focused_workspace().unwrap().containers().len(), 1);
     }
 
     #[test]

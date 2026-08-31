@@ -1957,6 +1957,10 @@ if (!(Get-Process komorebi-bar -ErrorAction SilentlyContinue))
                 Self::respond(&mut reply, &response);
             }
             SocketMessage::DestroyContainer => {
+                let response = self.destroy_newest_container()?;
+                Self::respond(&mut reply, &response);
+            }
+            SocketMessage::DestroyFocusedContainer => {
                 let response = self.destroy_focused_container()?;
                 Self::respond(&mut reply, &response);
             }

@@ -415,9 +415,19 @@ struct MoveWindowToMonitor {
 
 #[derive(Parser)]
 struct CreateContainer {
-    /// Dividing line for the split [default: the donor's longer edge]
+    /// Dividing line for the split [default: the longer edge of the largest slot]
     #[clap(value_enum)]
     axis: Option<SplitAxis>,
+    /// How many containers to add
+    #[clap(long, default_value = "1", value_parser = clap::value_parser!(u32).range(1..))]
+    count: u32,
+}
+
+#[derive(Parser)]
+struct DestroyContainer {
+    /// How many containers to remove
+    #[clap(long, default_value = "1", value_parser = clap::value_parser!(u32).range(1..))]
+    count: u32,
 }
 
 #[derive(Parser)]
@@ -1508,10 +1518,12 @@ enum SubCommand {
     /// Send the focused window to the focused workspace of another monitor
     #[clap(arg_required_else_help = true)]
     MoveWindowToMonitor(MoveWindowToMonitor),
-    /// Split a new container off the most recently focused container with windows to spare
+    /// Add a container to the focused workspace by dividing its largest slot
     CreateContainer(CreateContainer),
+    /// Destroy the most recently created container, sharing its windows out among those which remain
+    DestroyContainer(DestroyContainer),
     /// Destroy the focused container, sharing its windows out among the containers which remain
-    DestroyContainer,
+    DestroyFocusedContainer,
     /// Force komorebi to manage the focused window
     Manage,
     /// Unmanage a window that was forcibly managed
@@ -3360,10 +3372,20 @@ if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
             ))?;
         }
         SubCommand::CreateContainer(args) => {
-            send_command(&SocketMessage::CreateContainer(args.axis))?;
+            // One message per container: each is validated and committed on its own, so a refusal
+            // partway through leaves the containers already added in place and exits with the
+            // reason the next one could not be.
+            for _ in 0..args.count {
+                send_command(&SocketMessage::CreateContainer(args.axis))?;
+            }
         }
-        SubCommand::DestroyContainer => {
-            send_command(&SocketMessage::DestroyContainer)?;
+        SubCommand::DestroyContainer(args) => {
+            for _ in 0..args.count {
+                send_command(&SocketMessage::DestroyContainer)?;
+            }
+        }
+        SubCommand::DestroyFocusedContainer => {
+            send_command(&SocketMessage::DestroyFocusedContainer)?;
         }
         SubCommand::Manage => {
             send_message(&SocketMessage::ManageFocusedWindow)?;
