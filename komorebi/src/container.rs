@@ -417,14 +417,14 @@ impl Container {
     /// Floating windows are left alone unless they are minimized: their visibility does not
     /// depend on where they sit in the stack.
     pub fn load_focused_window(&mut self) {
-        let focused_idx = self.focused_window_idx();
+        let showing_idx = self.showing_stored_window_idx();
 
         for (i, window) in self.windows_mut().iter_mut().enumerate() {
             match (window.placement, window.visibility) {
                 (_, Visibility::Minimized) => {}
                 (ManagedPlacement::Floating, _) => window.show(false),
                 (ManagedPlacement::Stored, _) => {
-                    if i == focused_idx {
+                    if Some(i) == showing_idx {
                         window.show(false);
                     } else {
                         window.hide_with_border(false);
@@ -444,10 +444,41 @@ impl Container {
     }
 
     /// [`Self::focused_visible_stored_window`] with the managed state the caller needs to show it.
+    ///
+    /// The fallback is the most recently focused window which could be shown, and the top of the
+    /// stack when the history has nothing to offer. That is the same order
+    /// [`Self::first_focusable_window`] selects with, so the window a container shows after its
+    /// ring focus moved onto a floating or minimized window is the window it would focus.
     pub fn focused_visible_stored_managed_window(&self) -> Option<&ManagedWindow> {
-        self.focused_managed_window()
+        if let Some(focused) = self
+            .focused_managed_window()
             .filter(|window| window.is_visible_stored())
-            .or_else(|| self.visible_stored_windows().next())
+        {
+            return Some(focused);
+        }
+
+        self.focus_history
+            .iter()
+            .filter_map(|hwnd| self.windows().iter().find(|window| window.hwnd == *hwnd))
+            .find(|window| window.is_visible_stored())
+            .or_else(|| {
+                self.windows()
+                    .iter()
+                    .rev()
+                    .find(|window| window.is_visible_stored())
+            })
+    }
+
+    /// Where the window this container should be drawing sits in its stack.
+    ///
+    /// [`Self::load_focused_window`] draws one stored window and hides the others, and this is
+    /// the one it draws: the ring focus while that can be shown, and the fallback above once it
+    /// cannot, so floating or minimizing the window a container was showing leaves the container
+    /// showing the next window it owns rather than nothing at all.
+    #[must_use]
+    pub fn showing_stored_window_idx(&self) -> Option<usize> {
+        let hwnd = self.focused_visible_stored_managed_window()?.hwnd;
+        self.idx_for_window(hwnd)
     }
 
     /// The window this container currently presents maximized, if it has one.
@@ -732,13 +763,17 @@ impl Container {
     /// Raise the window under the top of the stack and show it.
     ///
     /// This is the whole of the "raise the next window" operation at container level: the depth
-    /// change and the focus change together, so no caller can perform one without the other. The
-    /// window's handle is returned when there was one to raise.
+    /// change, the focus change and the reveal together, so no caller can perform one without the
+    /// others. The reveal is not optional bookkeeping: a window which komorebi hid to show
+    /// another one is hidden until something shows it again, and the record of what komorebi is
+    /// hiding is what tells a later minimize event apart from komorebi's own work. The window's
+    /// handle is returned when there was one to raise.
     pub fn raise_next_stack_window(&mut self) -> Option<isize> {
         let hwnd = self.next_stack_window()?;
 
         self.raise_window(hwnd);
         self.focus_window_by_hwnd(hwnd);
+        self.load_focused_window();
 
         Some(hwnd)
     }

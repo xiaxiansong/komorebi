@@ -1434,6 +1434,11 @@ impl Workspace {
 
         container.windows_mut()[window_idx].set_floating(current_rect);
 
+        // The floating window keeps the ring focus - it is the window the user is working in -
+        // but it is no longer the window its container draws in its slot. Revealing here is what
+        // leaves the next stored window on screen instead of the desktop.
+        container.load_focused_window();
+
         Ok(())
     }
 
@@ -2751,12 +2756,20 @@ impl Workspace {
 
         let changed = container.windows_mut()[window_idx].set_minimized();
 
-        if changed && container.focused_window_idx() == window_idx {
-            let successor = container.first_focusable_window().map(|window| window.hwnd);
+        if changed {
+            if container.focused_window_idx() == window_idx {
+                let successor = container.first_focusable_window().map(|window| window.hwnd);
 
-            if let Some(successor) = successor {
-                container.focus_window_by_hwnd(successor);
+                if let Some(successor) = successor {
+                    container.focus_window_by_hwnd(successor);
+                }
             }
+
+            // The container was showing the window which has just gone to the taskbar, so
+            // something has to be shown in its place: whatever the container is left holding, or
+            // nothing at all when it is left holding no visible stored window, which is exactly
+            // when it stops occupying a slot and the arrangement closes over it.
+            container.load_focused_window();
         }
 
         self.record_minimized_window(hwnd);
@@ -9087,6 +9100,163 @@ mod tests {
 
         // And the container it came from goes on showing exactly what it was showing.
         assert!(!is_programmatically_hidden(TOP));
+    }
+
+    /// A workspace holding one container whose stack is `hwnds`, bottom first, arranged in `area`.
+    ///
+    /// The windows go in through the ordinary path, so the container arrives showing the top of
+    /// its stack with everything under it hidden, exactly as it would on the desktop.
+    fn arranged_workspace_with_stack(hwnds: &[isize], area: Rect) -> Workspace {
+        let mut workspace = Workspace::default();
+        let mut container = Container::default();
+
+        for hwnd in hwnds {
+            container.add_window(Window::from(*hwnd));
+        }
+
+        workspace.add_container_to_back(container);
+        workspace.record_logical_slots(area);
+        workspace
+    }
+
+    #[test]
+    fn minimizing_the_shown_window_shows_the_next_window_in_the_container() {
+        // Handles no other test uses: the hidden set is global.
+        const BOTTOM: isize = 9_201;
+        const MIDDLE: isize = 9_202;
+        const TOP: isize = 9_203;
+
+        let area = work_area(1920, 1080);
+        let mut workspace = arranged_workspace_with_stack(&[BOTTOM, MIDDLE, TOP], area);
+        let id = workspace.containers()[0].id.clone();
+
+        assert!(workspace.minimize_window(TOP).unwrap());
+
+        // The window under the one which went to the taskbar is on screen in its place, rather
+        // than the container drawing nothing over the desktop.
+        assert!(!is_programmatically_hidden(MIDDLE));
+        assert!(is_programmatically_hidden(BOTTOM));
+
+        // Minimizing moved nothing between containers and cost the container no slot: it still
+        // owns all three windows and it is still active.
+        assert_eq!(workspace.containers()[0].windows().len(), 3);
+        assert!(workspace.containers()[0].is_active());
+        assert_eq!(slot_of(&workspace, &id), LogicalRect::from(area));
+        assert_eq!(
+            workspace.containers()[0].focused_window().unwrap().hwnd,
+            MIDDLE
+        );
+
+        // And the window itself is remembered as the one to bring back.
+        assert_eq!(workspace.minimize_history.most_recent(), Some(&TOP));
+        assert_eq!(workspace.take_last_minimized_window(), Some(TOP));
+    }
+
+    #[test]
+    fn minimizing_the_last_visible_window_hides_the_container_instead() {
+        const ONLY: isize = 9_211;
+
+        let area = work_area(1920, 1080);
+        let mut workspace = arranged_workspace_with_stack(&[ONLY], area);
+        let id = workspace.containers()[0].id.clone();
+
+        assert!(workspace.minimize_window(ONLY).unwrap());
+        workspace.record_logical_slots(area);
+
+        // Nothing was left to show, so the container gives its slot up rather than keeping an
+        // empty one - and it keeps its window, because a hidden container is not a destroyed one.
+        assert!(workspace.containers()[0].is_hidden());
+        assert!(!workspace.logical_slots.contains(&id));
+        assert_eq!(workspace.containers()[0].windows().len(), 1);
+    }
+
+    #[test]
+    fn floating_the_shown_window_shows_the_next_window_in_the_container() {
+        const BELOW: isize = 9_221;
+        const TOP: isize = 9_222;
+
+        let area = work_area(1920, 1080);
+        let mut workspace = arranged_workspace_with_stack(&[BELOW, TOP], area);
+        let id = workspace.containers()[0].id.clone();
+
+        workspace
+            .float_window(
+                TOP,
+                Rect {
+                    left: 10,
+                    top: 10,
+                    right: 400,
+                    bottom: 300,
+                },
+            )
+            .unwrap();
+
+        // The floating window stays on screen with its own rectangle, and the window it was
+        // covering is drawn in the container's slot rather than the desktop.
+        assert!(!is_programmatically_hidden(TOP));
+        assert!(!is_programmatically_hidden(BELOW));
+
+        assert!(workspace.containers()[0].is_active());
+        assert_eq!(slot_of(&workspace, &id), LogicalRect::from(area));
+        assert_eq!(workspace.containers()[0].windows().len(), 2);
+
+        // The floating window keeps the ring focus - it is the window the user is working in -
+        // and the container shows the stored window underneath it anyway.
+        assert_eq!(
+            workspace.containers()[0].focused_window().unwrap().hwnd,
+            TOP
+        );
+        assert_eq!(
+            workspace.containers()[0]
+                .focused_visible_stored_window()
+                .unwrap()
+                .hwnd,
+            BELOW
+        );
+    }
+
+    #[test]
+    fn floating_the_only_window_hides_its_container_and_leaves_it_on_screen() {
+        const ONLY: isize = 9_231;
+
+        let area = work_area(1920, 1080);
+        let mut workspace = arranged_workspace_with_stack(&[ONLY], area);
+        let id = workspace.containers()[0].id.clone();
+
+        workspace
+            .float_window(
+                ONLY,
+                Rect {
+                    left: 10,
+                    top: 10,
+                    right: 400,
+                    bottom: 300,
+                },
+            )
+            .unwrap();
+        workspace.record_logical_slots(area);
+
+        assert!(workspace.containers()[0].is_hidden());
+        assert!(!workspace.logical_slots.contains(&id));
+        assert!(!is_programmatically_hidden(ONLY));
+    }
+
+    #[test]
+    fn raising_the_next_stack_window_puts_it_on_screen() {
+        const BELOW: isize = 9_241;
+        const TOP: isize = 9_242;
+
+        let area = work_area(1920, 1080);
+        let mut workspace = arranged_workspace_with_stack(&[BELOW, TOP], area);
+
+        assert!(is_programmatically_hidden(BELOW));
+
+        assert_eq!(workspace.raise_next_stack_window(), Some(BELOW));
+
+        // The raise is a reveal as well as a reorder: the window komorebi had hidden is drawn
+        // again and leaves the hidden set, and the window it was under takes its place there.
+        assert!(!is_programmatically_hidden(BELOW));
+        assert!(is_programmatically_hidden(TOP));
     }
 
     #[test]
