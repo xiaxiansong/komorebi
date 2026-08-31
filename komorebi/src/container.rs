@@ -3,6 +3,8 @@ use std::fmt::Display;
 use std::fmt::Formatter;
 use std::ops::Deref;
 use std::ops::DerefMut;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use serde::Deserialize;
 use serde::Deserializer;
@@ -45,12 +47,41 @@ impl Display for ContainerState {
     }
 }
 
+/// The source of container creation order.
+///
+/// A container's identity is a nanoid, which says nothing about when it was made, and its position
+/// in the ring is an arrangement rather than a history. The operations which change a workspace's
+/// container *count* are ordered by age - the oldest container is the one destroyed, the newest is
+/// the one which wins a tie between equally large slots - so every container is stamped with a
+/// number as it is made, and that stamp is the only thing which answers "which of these came
+/// first".
+static CONTAINER_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+/// Stamp the next container. Zero is never issued, so it can mean "unstamped" on the way in.
+fn next_container_sequence() -> u64 {
+    CONTAINER_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Lift the stamp above a value which has just been read back from a state document.
+///
+/// A restored container keeps the stamp it was written with, so a restart cannot reorder a
+/// workspace's containers; without this the counter would start again at one and hand a newly
+/// created container an age older than everything already on the desktop.
+fn observe_container_sequence(sequence: u64) {
+    CONTAINER_SEQUENCE.fetch_max(sequence.saturating_add(1), Ordering::Relaxed);
+}
+
 /// Serialization and the schema go through [`ContainerRepr`] and [`ContainerView`] rather than a
 /// derive, because the serialized shape carries one field this type deliberately does not store:
 /// the container's derived [`ContainerState`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Container {
     pub id: ContainerId,
+    /// When this container was created, relative to every other container in this process.
+    ///
+    /// Monotonic and never reused. It travels with the container across workspaces and monitors,
+    /// because the container is the same container wherever it is shown.
+    sequence: u64,
     pub locked: bool,
     windows: Ring<ManagedWindow>,
     /// Most-recently-used order of this container's window handles.
@@ -72,6 +103,10 @@ pub struct Container {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 struct ContainerRepr {
     id: ContainerId,
+    /// Creation order. Absent or zero in a document written before this existed, which is stamped
+    /// afresh on the way in rather than left to collide with every other unstamped container.
+    #[serde(default)]
+    sequence: u64,
     #[serde(default)]
     locked: bool,
     windows: Ring<ManagedWindow>,
@@ -86,6 +121,7 @@ struct ContainerRepr {
 #[derive(Serialize)]
 struct ContainerView<'a> {
     id: &'a ContainerId,
+    sequence: u64,
     locked: bool,
     windows: &'a Ring<ManagedWindow>,
     focus_history: &'a Mru<isize>,
@@ -99,6 +135,7 @@ impl Serialize for Container {
     {
         ContainerView {
             id: &self.id,
+            sequence: self.sequence,
             locked: self.locked,
             windows: &self.windows,
             focus_history: &self.focus_history,
@@ -178,8 +215,17 @@ impl<'de> Deserialize<'de> for Container {
         D: Deserializer<'de>,
     {
         let repr = ContainerRepr::deserialize(deserializer)?;
+
+        let sequence = if repr.sequence == 0 {
+            next_container_sequence()
+        } else {
+            observe_container_sequence(repr.sequence);
+            repr.sequence
+        };
+
         let mut container = Self {
             id: repr.id,
+            sequence,
             locked: repr.locked,
             windows: repr.windows,
             focus_history: repr.focus_history,
@@ -202,6 +248,7 @@ impl Default for Container {
     fn default() -> Self {
         Self {
             id: ContainerId::new(),
+            sequence: next_container_sequence(),
             locked: false,
             windows: Ring::default(),
             focus_history: Mru::default(),
@@ -221,6 +268,14 @@ impl Lockable for Container {
 }
 
 impl Container {
+    /// When this container was created, relative to every other container in this process.
+    ///
+    /// Smaller is older. This is the ordering the count operations use: `destroy-container`
+    /// destroys the smallest, and a tie between equally large slots is won by the largest.
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
     pub const fn windows(&self) -> &VecDeque<ManagedWindow> {
         self.windows.elements()
     }
@@ -256,6 +311,7 @@ impl Container {
     pub fn preselect() -> Self {
         Self {
             id: ContainerId::from("PRESELECT"),
+            sequence: next_container_sequence(),
             locked: false,
             windows: Default::default(),
             focus_history: Mru::default(),

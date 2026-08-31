@@ -305,6 +305,7 @@ impl From<&WindowManager> for State {
                             name: workspace.name.clone(),
                             containers: workspace.containers.clone(),
                             container_focus_history: workspace.container_focus_history.clone(),
+                            window_focus_history: workspace.window_focus_history.clone(),
                             minimize_history: workspace.minimize_history.clone(),
                             monocle_container_id: workspace.monocle_container_id.clone(),
                             layout: workspace.layout.clone(),

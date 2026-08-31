@@ -2371,6 +2371,54 @@ produces it rather than in the original order, which is the documented behaviour
 The runtime log holds one ERROR for the whole day, ten seconds before the new process started, so
 it belongs to the binary being replaced.
 
+### Phase 20 - Container count as an operation of its own
+
+Added on 2026-08-31 after the model went into service. The request separates *how many containers
+a workspace has* from *where windows go*, and makes both halves of the count - adding and removing -
+explicit operations with their own selection rules. Four points were undecided in the request and
+were settled by the user before any code was written:
+
+- The automatic threshold stays, but becomes configurable. `N <= 2` splitting remains the default
+  because it is the behaviour in service; a configured `0` gives the "never split automatically"
+  model, where the count is decided by hand alone.
+- Destroying a container which holds the focused window keeps that window focused: it is raised to
+  the top of whichever recipient it is dealt to, while every other window arrives at the bottom as
+  before. Focus is a window, not a position.
+- The window a manual split takes is the first window in the workspace's window focus history which
+  is not the top of its own container, starting from the second most recent. When the history does
+  not cover the workspace - straight after a restart, or after an import - the stack order is the
+  fallback: the first window below the top of the container holding the most windows.
+- `create-container` and `destroy-container` keep their names and change meaning, both gaining an
+  optional count. The old "destroy the focused container" is kept as `destroy-focused-container`.
+
+The rules this phase implements, over and above what Phases 7 and 8 established:
+
+- A workspace may never hold more containers than windows, and may never hold zero containers while
+  it holds a window.
+- A manual split divides the *largest* active logical slot, the most recently created container
+  winning a tie - not the container the window came from, which may be a different one.
+- A manual destroy destroys the *oldest* container, by creation order rather than by focus.
+- Neither operation changes which window is focused.
+
+- [ ] 20A: the two model facts these rules need and the workspace does not yet record - a
+  workspace-level window focus history, and a creation order for containers. Both serialized, both
+  defaulted, both maintained by every path which already maintains the histories beside them.
+- [ ] 20B: `create_container_from_donor` rewritten around the new donor and window selection, with
+  the geometry donor and the window donor allowed to be different containers, and focus untouched.
+- [ ] 20C: destroy by creation order, with the focused window raised in its recipient, and the
+  container-count invariants added to `validate_invariants`.
+- [ ] 20D: socket and `komorebic` wiring: `--count` on both commands, `destroy-focused-container`,
+  and outcomes which distinguish "no window can be moved" from "nothing to destroy".
+- [ ] 20E: `auto_split_threshold` configuration field with a serde default of 2, applied to the
+  new-window placement path, plus the regenerated schema.
+- [ ] 20F: AutoHotkey bindings, `docs/window-model.md`, this plan, and live verification on the
+  desktop, including that startup adoption still opens with one container in workspace one.
+
+Planned files: `komorebi/src/container.rs`, `komorebi/src/workspace.rs`,
+`komorebi/src/window_manager.rs`, `komorebi/src/process_command.rs`, `komorebi/src/core/mod.rs`,
+`komorebi/src/static_config.rs`, `komorebi/src/lib.rs`, `komorebic/src/main.rs`, `schema.json`,
+`komorebi.ahk`, `docs/window-model.md`, this plan.
+
 ## Provisional affected-file inventory
 
 This list is updated from actual diffs, not treated as permission to change every file.
