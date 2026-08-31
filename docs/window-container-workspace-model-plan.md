@@ -2570,11 +2570,42 @@ a cause.
 - [x] 21A: `ABSORPTION_DIRECTIONS` becomes up, down, left, right; `NEIGHBOUR_DIRECTIONS` keeps the
   old order for new-window joining; tests and `docs/window-model.md` follow.
 - [x] 21B: restoring a minimized window takes it out of the minimized state Win32 holds it in.
-- [ ] 21C: the bar's layout widget draws the focused workspace's active logical slots.
+- [x] 21C: the bar's layout widget draws the focused workspace's active logical slots.
 
 Planned files: `komorebi/src/geometry.rs`, `komorebi/src/window.rs`,
 `komorebi/src/window_manager.rs`, `komorebi-bar/src/widgets/komorebi_layout.rs`,
 `komorebi-bar/src/widgets/komorebi.rs`, `docs/window-model.md`, this plan.
+
+21C actual files: `komorebi-client/src/lib.rs`, `komorebi-bar/src/widgets/komorebi_layout.rs`,
+`komorebi-bar/src/widgets/komorebi.rs`.
+
+The icon was a fixed glyph per layout kind, so it drew the same two cells whether the workspace held
+one container or six, and nothing about it could change when a container was created or destroyed.
+It now draws the workspace's own active logical slots: one cell per active container, in the
+proportions the workspace actually holds, with the focused container's cell filled. Hidden containers
+hold no slot and so are not drawn, which is the rule the tiling itself follows.
+
+Only the interior edges are painted, because the icon's border is already the work area's outline: a
+cell contributes its left edge unless that edge is the frame's own, and its top edge on the same
+rule, so every dividing line is drawn exactly once whatever the arrangement - no per-layout drawing
+code, and nothing to add when a new layout appears.
+
+Monocle, the floating layer and a pause keep their glyphs. Those are modes rather than arrangements,
+and a monocle in particular is showing one container over an arrangement which still exists
+underneath it; drawing the slots there would say the workspace holds one container when it does not.
+
+The slots reach the bar because they are already in the state document the bar subscribes to, keyed
+by container ID. They are normalized against `logical_work_area` into the unit square on the way in,
+with the slots' own bounding box standing in for a workspace which has not been arranged yet.
+`komorebi-client` gained the four exports this needs - `LogicalRect`, `LogicalSlots`, `SlotOrder`,
+`ContainerId` and `WorkspaceId` - which is the first time the geometry model has been part of the
+client's surface.
+
+Verification: four bar tests added, komorebi-bar 3 -> 7 passing; komorebi 561 passing, full serial
+suite green; fmt clean; Clippy clean apart from the pre-existing warning. The parallel runner's
+failures remain the pre-existing isolation defect recorded in Phase 18 and vary run to run - nine on
+the unchanged tree, five with this change - which is what says they are scheduling rather than
+regression.
 
 21B actual files: `komorebi/src/window.rs`, `komorebi/src/managed_window.rs`,
 `komorebi/src/window_manager.rs`.

@@ -7,6 +7,7 @@ use crate::config::WorkspacesDisplayFormat;
 use crate::render::RenderConfig;
 use crate::selected_frame::SelectableFrame;
 use crate::ui::CustomUi;
+use crate::widgets::komorebi_layout::KomorebiArrangement;
 use crate::widgets::komorebi_layout::KomorebiLayout;
 use crate::widgets::widget::BarWidget;
 use eframe::egui::Align;
@@ -284,9 +285,10 @@ impl Komorebi {
         {
             let monitor_info = &mut *self.monitor_info.borrow_mut();
             let workspace_idx = monitor_info.focused_workspace_idx;
+            let arrangement = monitor_info.arrangement.clone();
             monitor_info
                 .layout
-                .show(ctx, ui, config, layout_config, workspace_idx);
+                .show(ctx, ui, config, layout_config, workspace_idx, &arrangement);
         }
     }
 
@@ -762,6 +764,8 @@ impl LockedContainerBar {
 pub struct MonitorInfo {
     pub workspaces: Vec<WorkspaceInfo>,
     pub layout: KomorebiLayout,
+    /// The active logical slots of the focused workspace, for the layout icon to draw.
+    pub arrangement: KomorebiArrangement,
     pub mouse_follows_focus: bool,
     pub work_area_offset: Option<Rect>,
     pub monitor_index: usize,
@@ -776,6 +780,7 @@ impl Default for MonitorInfo {
         Self {
             workspaces: Vec::new(),
             layout: KomorebiLayout::Default(komorebi_client::DefaultLayout::BSP),
+            arrangement: KomorebiArrangement::default(),
             mouse_follows_focus: true,
             work_area_offset: None,
             monitor_index: MONITOR_INDEX.load(Ordering::SeqCst),
@@ -831,6 +836,7 @@ impl MonitorInfo {
         // Layout
         let focused_ws = &monitor.workspaces()[monitor.focused_workspace_idx()];
         self.layout = Self::resolve_layout(focused_ws, state.is_paused);
+        self.arrangement = KomorebiArrangement::from_workspace(focused_ws);
 
         self.workspaces.clear();
         self.workspaces.extend(Self::workspaces(
