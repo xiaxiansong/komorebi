@@ -68,6 +68,20 @@ A container's state is derived from its windows on every read and is never store
   windows, its stack order, its window focus history and its place in the workspace's container
   history. It simply holds no slot, so the active containers cover the area it had.
 
+### What a container shows
+
+A container draws one of its stored windows at a time and hides the rest, and floating windows are
+drawn beside that one from their own rectangles. The window it draws is the ring focus while that
+window is visible and stored, then the most recently focused window which is, then the top of the
+stack. The ring focus is allowed to sit on a floating or a minimized window - the user is working in
+it - and the container goes on showing a stored window underneath.
+
+Revealing is part of the transition which changed what the container shows, not part of the retile:
+a retile positions windows which are already on screen. So minimizing the shown window, floating it,
+and raising the window under the top of the stack each show what the container is left showing.
+A container which is left with no window it can show is exactly a container which has become Hidden,
+and it draws nothing because its slot is being given up.
+
 ### Giving a slot up and getting it back
 
 When the last visible stored window of an Active container floats or is minimized:

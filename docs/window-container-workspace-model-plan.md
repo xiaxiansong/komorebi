@@ -2673,6 +2673,73 @@ constants otherwise read as a copy of each other.
 Verification: komorebi 559 -> 561 passing, full serial suite green; `cargo fmt --check` clean;
 Clippy clean apart from the pre-existing `items after a test module` warning.
 
+### Phase 22 - The window a container is left showing
+
+Added on 2026-08-31 from live use. One report with two faces, and the two faces have two causes.
+
+Minimizing the focused window of a container holding three windows either left the container drawing
+nothing - the desktop showed through its slot - or left another window of the container on screen but
+made `Alt+Shift+M` refuse to bring back the window which had just gone to the taskbar. Floating the
+window a container was showing produced the first face as well. What the user asks for is one rule:
+a container which stops showing a window shows the next window it owns, and only becomes hidden when
+it has no window left to show.
+
+- [x] 22A: the reveal is part of the transition. `Container::load_focused_window` draws the stored
+  window the container *should* be showing rather than whichever window holds the ring focus;
+  `Workspace::minimize_window`, `Workspace::float_window` and `Container::raise_next_stack_window`
+  perform the reveal they each imply.
+- [x] 22B: a minimize event is read as the user's unless komorebi is hiding by minimizing.
+- [ ] 22C: build, deploy and verify both on the live desktop.
+
+Planned files: `komorebi/src/container.rs`, `komorebi/src/workspace.rs`,
+`komorebi/src/process_event.rs`, `docs/window-model.md`, this plan.
+
+The first cause is that komorebi only draws one stored window of a container at a time and hides the
+rest, so the window a container is left showing has to be *shown* by whatever stopped the previous
+one from being drawn. A retile does not do it: `Workspace::update` positions the windows a container
+already has on screen and never reveals one. Three transitions ended without their reveal.
+Minimizing moved the ring focus to the successor and left it cloaked. Floating left the ring focus on
+the floating window, and `load_focused_window` showed the focused window and hid every other stored
+window - so with the focus on a window it no longer draws, the container hid all of them. Raising the
+window under the top of a stack reordered and focused it without showing it, which is the one whose
+consequences reach furthest: the raised window stayed in `HIDDEN_HWNDS`.
+
+So `load_focused_window` now asks which stored window the container should be drawing rather than
+which window holds the ring focus. That question already had an answer -
+`focused_visible_stored_managed_window`, which `Container::restore` and `Workspace::visible_windows`
+use - and it is now the only answer: the ring focus while it can be shown, then the container's own
+focus history, then the top of the stack, which is the order `first_focusable_window` selects with.
+The three transitions call the reveal next to the state change, not in the retile, because it is a
+property of the transition.
+
+The second cause is the failing `Alt+Shift+M`, and it is one condition. The minimize event handler
+asked whether the window was in `HIDDEN_HWNDS` and treated membership as proof komorebi had caused
+the minimize. komorebi only minimizes a window itself under `HidingBehaviour::Minimize`; under the
+default `Cloak` the windows in that set are cloaked, not iconic, so a real minimize of a window a
+stack was covering was discarded. Nothing was recorded: the model went on believing the window was
+visible, its container kept its slot, and `take_last_minimized_window` had nothing to return. The two
+faces of the report are the same event seen through the two possible states of the hidden set, which
+is why the report reads as intermittent. Membership is now consulted only under the behaviour which
+can produce a self-inflicted minimize, in `minimize_event_is_the_users` with its own tests.
+
+The runtime log is what separated the two causes. In the failing case the minimize event carried no
+`focus_window` line, and the restore two seconds later answered `no-op: this workspace has no
+minimized window left to restore`; in the working case the same key on the same window logged the
+focus move and restored. That is the model not being told, rather than the model being wrong.
+
+22A actual files: `komorebi/src/container.rs`, `komorebi/src/workspace.rs`.
+22B actual files: `komorebi/src/process_event.rs`.
+
+Five tests added for 22A and two for 22B. Three of the five were confirmed to fail on the unfixed
+code before being kept - the minimize, float and raise reveals - and the other two cover the
+derivation either side of them: minimizing or floating the last window a container can show leaves
+the container hidden and holding its window rather than destroyed. The reveal tests assert on
+`HIDDEN_HWNDS`, which is the set that says whether a window is actually being drawn, so they observe
+the reveal itself rather than the model's opinion of it.
+
+Verification: komorebi 561 -> 568 passing, full serial suite green; `cargo fmt --check` clean; Clippy
+clean apart from the pre-existing `items after a test module` warning.
+
 ## Provisional affected-file inventory
 
 This list is updated from actual diffs, not treated as permission to change every file.
