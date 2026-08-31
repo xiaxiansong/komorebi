@@ -74,8 +74,12 @@ When the last visible stored window of an Active container floats or is minimize
 
 1. The slot it held is recorded, along with the direction it was absorbed from, the containers which
    absorbed it and the rectangles they held before they did.
-2. A *complete edge group* is chosen in left, right, up, down order: a set of active containers
+2. A *complete edge group* is chosen in up, down, left, right order: a set of active containers
    which touch the whole of the freed edge, whose contact intervals do not overlap and leave no gap.
+   The container above a freed slot therefore grows down into it before the container beside it
+   grows across. This is not the order a new window uses to pick a neighbour to join, which is left,
+   right, up, down: one decides which container's area grows, the other which container a window
+   joins.
 3. Those containers grow over the freed slot, each along one axis only.
 4. If no direction can absorb it, the whole workspace is relaid out from the layout instead and the
    record is marked as not exactly restorable.

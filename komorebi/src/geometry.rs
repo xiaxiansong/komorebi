@@ -372,8 +372,25 @@ pub fn sort_slots(slots: &mut [(ContainerId, LogicalRect)], order: SlotOrder) {
 ///
 /// The order is fixed rather than chosen per situation so that hiding, restoring and deleting a
 /// container all redistribute its area the same way, and so that the same topology always produces
-/// the same result.
+/// the same result. Vertical first: the container above a freed slot grows down into it before the
+/// container beside it grows across, which is what a stacked arrangement reads as.
+///
+/// This is deliberately not the order [`LogicalSlots::adjacent_neighbour`] uses. Absorption decides
+/// which container's *area* grows; that decides which container a *window* joins, and they are two
+/// different questions with two separately specified answers.
 pub const ABSORPTION_DIRECTIONS: [OperationDirection; 4] = [
+    OperationDirection::Up,
+    OperationDirection::Down,
+    OperationDirection::Left,
+    OperationDirection::Right,
+];
+
+/// The directions a container looks in for a neighbour to hand a new window to, in priority order.
+///
+/// Horizontal first, unlike [`ABSORPTION_DIRECTIONS`]: no area changes hands here, so the choice is
+/// about which container the user reads as "next to" this one rather than about which one is
+/// entitled to the space.
+pub const NEIGHBOUR_DIRECTIONS: [OperationDirection; 4] = [
     OperationDirection::Left,
     OperationDirection::Right,
     OperationDirection::Up,
@@ -801,7 +818,7 @@ impl LogicalSlots {
 
     /// The neighbour a container hands work to when it is not going to be split.
     ///
-    /// Directions are tried in [`ABSORPTION_DIRECTIONS`] order and the first neighbour found in the
+    /// Directions are tried in [`NEIGHBOUR_DIRECTIONS`] order and the first neighbour found in the
     /// deterministic order for that direction wins, so the same topology always chooses the same
     /// container. Unlike an absorption this does not require the neighbours to cover a whole edge:
     /// no area changes hands, so a partial neighbour is a perfectly good recipient.
@@ -809,7 +826,7 @@ impl LogicalSlots {
     pub fn adjacent_neighbour(&self, container: &ContainerId) -> Option<ContainerId> {
         let slot = self.get(container)?;
 
-        ABSORPTION_DIRECTIONS.into_iter().find_map(|direction| {
+        NEIGHBOUR_DIRECTIONS.into_iter().find_map(|direction| {
             self.neighbours_on_edge(slot, direction, container)
                 .into_iter()
                 .next()
@@ -1496,7 +1513,7 @@ mod tests {
     }
 
     #[test]
-    fn absorption_tries_left_before_right_before_up_before_down() {
+    fn absorption_tries_up_before_down_before_left_before_right() {
         // A slot with a complete neighbour on every one of its four edges.
         let mut slots = LogicalSlots::default();
         slots.set(id("middle"), LogicalRect::new(100, 100, 100, 100));
@@ -1507,10 +1524,46 @@ mod tests {
 
         let shift = slots.plan_absorption(&id("middle")).unwrap();
 
+        assert!(matches!(shift.direction, OperationDirection::Up));
+        assert_eq!(
+            mover_rects(&shift),
+            vec![("up".to_string(), LogicalRect::new(100, 0, 100, 200))]
+        );
+    }
+
+    #[test]
+    fn absorption_falls_through_to_the_side_when_no_container_is_above_or_below() {
+        let mut slots = LogicalSlots::default();
+        slots.set(id("middle"), LogicalRect::new(100, 0, 100, 300));
+        slots.set(id("left"), LogicalRect::new(0, 0, 100, 300));
+        slots.set(id("right"), LogicalRect::new(200, 0, 100, 300));
+
+        let shift = slots.plan_absorption(&id("middle")).unwrap();
+
         assert!(matches!(shift.direction, OperationDirection::Left));
         assert_eq!(
             mover_rects(&shift),
-            vec![("left".to_string(), LogicalRect::new(0, 100, 200, 100))]
+            vec![("left".to_string(), LogicalRect::new(0, 0, 200, 300))]
+        );
+    }
+
+    #[test]
+    fn the_container_above_absorbs_the_bottom_right_of_a_quartered_work_area() {
+        // The arrangement three manual splits leave on a landscape work area, and the report which
+        // set the priority order: deleting the bottom right hands its area to the container above
+        // it, not to the one beside it, even though both cover a whole edge.
+        let mut slots = LogicalSlots::default();
+        slots.set(id("top left"), LogicalRect::new(0, 0, 960, 540));
+        slots.set(id("bottom left"), LogicalRect::new(0, 540, 960, 540));
+        slots.set(id("top right"), LogicalRect::new(960, 0, 960, 540));
+        slots.set(id("bottom right"), LogicalRect::new(960, 540, 960, 540));
+
+        let shift = slots.plan_absorption(&id("bottom right")).unwrap();
+
+        assert!(matches!(shift.direction, OperationDirection::Up));
+        assert_eq!(
+            mover_rects(&shift),
+            vec![("top right".to_string(), LogicalRect::new(960, 0, 960, 1080))]
         );
     }
 
@@ -1778,6 +1831,8 @@ mod tests {
 
     #[test]
     fn a_neighbour_is_chosen_left_before_right_before_up_before_down() {
+        // Deliberately the opposite priority to an absorption: a new window joins the container
+        // beside this one first, while a freed slot goes to the container above it first.
         let mut slots = LogicalSlots::default();
         slots.set(id("focused"), LogicalRect::new(960, 540, 960, 540));
         slots.set(id("left"), LogicalRect::new(0, 540, 960, 540));

@@ -2552,6 +2552,41 @@ Verification: komorebi 558 -> 559 passing, full serial suite green; `cargo fmt -
 Clippy clean apart from the pre-existing `items after a test module` warning; the installed
 `komorebic --version` reporting `adffe0ac`; live desktop as above.
 
+### Phase 21 - Three reports from the desktop
+
+Added on 2026-08-31 from live use. Three independent reports, one per sub-phase; none of them share
+a cause.
+
+- The absorption priority order. Deleting the bottom right of four containers handed its area to the
+  container beside it, because [`ABSORPTION_DIRECTIONS`] is left, right, up, down - the order in
+  section 14 of the task. The user's expectation is vertical first, and confirmed it before any code
+  was written: the order becomes up, down, left, right. The order a *new window* uses to pick a
+  neighbour to join is section 9's separate rule and stays left, right, up, down, so the one
+  constant which served both becomes two.
+- The bar's layout icon is a fixed glyph per layout kind, so it says the same thing whether the
+  workspace holds one container or six. It should draw the arrangement the workspace actually holds.
+- `Alt+Shift+M` restored the container's slot but left the window minimized on the taskbar.
+
+- [x] 21A: `ABSORPTION_DIRECTIONS` becomes up, down, left, right; `NEIGHBOUR_DIRECTIONS` keeps the
+  old order for new-window joining; tests and `docs/window-model.md` follow.
+- [ ] 21B: restoring a minimized window takes it out of the minimized state Win32 holds it in.
+- [ ] 21C: the bar's layout widget draws the focused workspace's active logical slots.
+
+Planned files: `komorebi/src/geometry.rs`, `komorebi/src/window.rs`,
+`komorebi/src/window_manager.rs`, `komorebi-bar/src/widgets/komorebi_layout.rs`,
+`komorebi-bar/src/widgets/komorebi.rs`, `docs/window-model.md`, this plan.
+
+21A actual files: `komorebi/src/geometry.rs`, `docs/window-model.md`, this plan.
+
+One existing test changed, which is the old order written down, and two were added: the fall-through
+to a side edge when nothing is above or below, and the reported arrangement itself - four containers
+quartering a landscape work area, deleting the bottom right, the top right growing down. The
+new-window neighbour test gained a comment saying it is deliberately the other order, because the two
+constants otherwise read as a copy of each other.
+
+Verification: komorebi 559 -> 561 passing, full serial suite green; `cargo fmt --check` clean;
+Clippy clean apart from the pre-existing `items after a test module` warning.
+
 ## Provisional affected-file inventory
 
 This list is updated from actual diffs, not treated as permission to change every file.
