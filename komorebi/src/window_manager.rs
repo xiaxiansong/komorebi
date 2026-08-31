@@ -3687,6 +3687,41 @@ impl WindowManager {
         Ok(())
     }
 
+    /// Merge the container in `direction` into the focused container.
+    ///
+    /// Deliberately distinct from [`Self::add_window_to_container`], which moves one window into a
+    /// neighbouring container: this moves every window the neighbour holds and leaves one container
+    /// where there were two.
+    #[tracing::instrument(skip(self))]
+    pub fn merge_container_in_direction(
+        &mut self,
+        direction: OperationDirection,
+    ) -> eyre::Result<CommandResponse> {
+        self.handle_unmanaged_window_behaviour()?;
+
+        tracing::info!("merging container");
+
+        let merged = match self
+            .focused_workspace_mut()?
+            .merge_container_in_direction(direction)
+        {
+            Ok(merged) => merged,
+            Err(error) => {
+                return Ok(CommandResponse::new(
+                    CommandOutcome::NoTarget,
+                    error.to_string(),
+                ));
+            }
+        };
+
+        self.update_focused_workspace(false, false)?;
+
+        Ok(CommandResponse::new(
+            CommandOutcome::Success,
+            format!("merged container {merged}"),
+        ))
+    }
+
     #[tracing::instrument(skip(self))]
     pub fn add_window_to_container(&mut self, direction: OperationDirection) -> eyre::Result<()> {
         self.handle_unmanaged_window_behaviour()?;

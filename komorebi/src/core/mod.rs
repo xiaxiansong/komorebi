@@ -70,6 +70,11 @@ pub enum SocketMessage {
     CycleFocusWindow(CycleDirection),
     CycleMoveWindow(CycleDirection),
     StackWindow(OperationDirection),
+    /// Merge the container in this direction into the focused container.
+    ///
+    /// Deliberately distinct from `StackWindow`, which moves one window into a neighbouring
+    /// container. Every window of the neighbour moves and the neighbour is destroyed.
+    MergeContainer(OperationDirection),
     UnstackWindow,
     CycleStack(CycleDirection),
     CycleStackIndex(CycleDirection),
@@ -973,6 +978,10 @@ mod tests {
             (
                 SocketMessage::RaiseNextStackWindow,
                 r#"{"type":"RaiseNextStackWindow"}"#,
+            ),
+            (
+                SocketMessage::MergeContainer(OperationDirection::Left),
+                r#"{"type":"MergeContainer","content":"Left"}"#,
             ),
             (
                 SocketMessage::MoveWindowToMonitorNumber(1, true),

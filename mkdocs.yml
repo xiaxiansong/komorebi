@@ -124,6 +124,7 @@ nav:
       - cli/cycle-move.md
       - cli/eager-focus.md
       - cli/stack.md
+      - cli/merge-container.md
       - cli/unstack.md
       - cli/cycle-stack.md
       - cli/cycle-stack-index.md

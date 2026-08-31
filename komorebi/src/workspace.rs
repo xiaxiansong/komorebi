@@ -2522,6 +2522,81 @@ impl Workspace {
 
         let recipients = self.distribution_recipients(&source);
 
+        self.destroy_container_into(idx, recipients)
+    }
+
+    /// Merge the container which lies in `direction` into the focused container.
+    ///
+    /// The neighbour's windows arrive underneath what the focused container is already showing and
+    /// the neighbour is destroyed, so its slot is released through the ordinary deletion path: the
+    /// focused container borders it, which is what usually makes the focused container the one
+    /// which grows over it.
+    ///
+    /// Both containers have to be active. A hidden container owns no slot, so there is no
+    /// direction in which it lies and no slot for it to hand over; a focused container which is
+    /// hidden hands the geometry over to the workspace's first active container, which is the same
+    /// rule every other directional operation uses.
+    ///
+    /// The focus does not move. The window the user was looking at is the focused container's and
+    /// it stays on top of it; nothing about the merge asks for a different window.
+    pub fn merge_container_in_direction(
+        &mut self,
+        direction: OperationDirection,
+    ) -> eyre::Result<ContainerId> {
+        let focused_idx = self
+            .active_container_idx_for_geometry()
+            .ok_or_eyre("there is no active container to merge into")?;
+
+        let focused = self
+            .containers()
+            .get(focused_idx)
+            .ok_or_eyre("there is no container at that index")?
+            .id
+            .clone();
+
+        let slot = self
+            .logical_slots
+            .get(&focused)
+            .ok_or_eyre("the container to merge into has no slot")?;
+
+        let (target, _) = self
+            .logical_slots
+            .neighbours_on_edge(slot, direction, &focused)
+            .into_iter()
+            .next()
+            .ok_or_eyre("there is no container in this direction")?;
+
+        let target_idx = self
+            .container_idx_for_id(&target)
+            .ok_or_eyre("the container in this direction is not in this workspace")?;
+
+        self.destroy_container_into(target_idx, vec![focused])?;
+
+        Ok(target)
+    }
+
+    /// Destroy the container at `idx`, dealing its windows out to `recipients`.
+    ///
+    /// This is the one removal path. [`Self::destroy_container`] shares the windows out among the
+    /// containers the arrangement offers; a merge names a single recipient. Everything else - the
+    /// stack order the windows arrive in, both histories, the slot release and where the focus
+    /// ends up - is the same operation either way.
+    fn destroy_container_into(
+        &mut self,
+        idx: usize,
+        recipients: Vec<ContainerId>,
+    ) -> eyre::Result<()> {
+        let source = self
+            .containers()
+            .get(idx)
+            .ok_or_eyre("there is no container at that index")?
+            .id
+            .clone();
+
+        if recipients.contains(&source) {
+            eyre::bail!("{source} cannot receive its own windows");
+        }
+
         if recipients.is_empty() && !self.containers()[idx].windows().is_empty() {
             eyre::bail!("this workspace has nowhere to send the windows of {source}");
         }
@@ -5949,6 +6024,106 @@ mod tests {
             + usize::from(before.top != after.top)
             + usize::from(before.right() != after.right())
             + usize::from(before.bottom() != after.bottom())
+    }
+
+    #[test]
+    fn merging_a_container_moves_every_window_of_the_neighbour_into_the_focused_one() {
+        let mut workspace = workspace_with_containers(&[1, 2]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        // Two containers side by side; the second one is the right hand slot.
+        let left = workspace.containers()[0].id.clone();
+        let right = workspace.containers()[1].id.clone();
+        let left_slot = workspace.logical_slots.get(&left).unwrap();
+        let right_slot = workspace.logical_slots.get(&right).unwrap();
+        assert!(right_slot.left > left_slot.left);
+
+        workspace.focus_container(0);
+
+        assert_eq!(
+            workspace
+                .merge_container_in_direction(OperationDirection::Right)
+                .unwrap(),
+            right
+        );
+
+        // One container is left, it holds every window, and its identity is the focused one's.
+        assert_eq!(workspace.containers().len(), 1);
+        assert_eq!(workspace.containers()[0].id, left);
+        assert_eq!(workspace.containers()[0].windows().len(), 3);
+        assert!(!workspace.logical_slots.contains(&right));
+
+        // The survivor has taken the whole work area, and the window it was showing is still the
+        // one on top of its stack.
+        assert_eq!(
+            workspace.logical_slots.get(&left).unwrap(),
+            LogicalRect::from(area)
+        );
+        assert_eq!(workspace.containers()[0].focused_window().unwrap().hwnd, 0);
+        assert!(
+            workspace
+                .logical_slots
+                .validate_coverage(LogicalRect::from(area))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn merging_towards_nothing_leaves_the_workspace_exactly_as_it_was() {
+        let mut workspace = workspace_with_containers(&[1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+        workspace.focus_container(0);
+
+        let before = slot_map(&workspace);
+        let ids: Vec<_> = workspace
+            .containers()
+            .iter()
+            .map(|container| container.id.clone())
+            .collect();
+
+        // The left container has no container above it, so there is nothing to merge with.
+        assert!(
+            workspace
+                .merge_container_in_direction(OperationDirection::Up)
+                .is_err()
+        );
+
+        assert_eq!(slot_map(&workspace), before);
+        assert_eq!(
+            workspace
+                .containers()
+                .iter()
+                .map(|container| container.id.clone())
+                .collect::<Vec<_>>(),
+            ids
+        );
+    }
+
+    #[test]
+    fn a_merged_window_keeps_its_placement_and_its_rectangle() {
+        let mut workspace = workspace_with_containers(&[1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        let carried = floating_rect(300);
+        workspace.containers_mut()[1].windows_mut()[0].set_floating(carried);
+        workspace.focus_container(0);
+
+        workspace
+            .merge_container_in_direction(OperationDirection::Right)
+            .unwrap();
+
+        let survivor = &workspace.containers()[0];
+        let merged = survivor
+            .windows()
+            .iter()
+            .find(|window| window.hwnd == 1)
+            .unwrap();
+
+        assert_eq!(merged.placement, ManagedPlacement::Floating);
+        assert_eq!(merged.floating_rect, Some(carried));
     }
 
     #[test]

@@ -377,6 +377,10 @@ impl WindowManager {
                 self.move_container_in_cycle_direction(direction)?;
             }
             SocketMessage::StackWindow(direction) => self.add_window_to_container(direction)?,
+            SocketMessage::MergeContainer(direction) => {
+                let response = self.merge_container_in_direction(direction)?;
+                Self::respond(&mut reply, &response);
+            }
             SocketMessage::UnstackWindow => self.remove_window_from_container()?,
             SocketMessage::StackAll => self.stack_all()?,
             SocketMessage::UnstackAll => self.unstack_all(true)?,

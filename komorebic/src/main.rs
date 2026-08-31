@@ -166,6 +166,7 @@ gen_enum_subcommand_args! {
     CycleMoveWorkspaceToMonitor: CycleDirection,
     CycleMoveWorkspace: CycleDirection,
     Stack: OperationDirection,
+    MergeContainer: OperationDirection,
     CycleStack: CycleDirection,
     CycleStackIndex: CycleDirection,
     FlipLayout: Axis,
@@ -1227,6 +1228,10 @@ enum SubCommand {
     /// Stack the focused window in the specified direction
     #[clap(arg_required_else_help = true)]
     Stack(Stack),
+    /// Merge the container in the specified direction into the focused container
+    #[clap(arg_required_else_help = true)]
+    #[clap(alias = "merge")]
+    MergeContainer(MergeContainer),
     /// Unstack the focused window
     Unstack,
     /// Cycle the focused stack in the specified cycle direction
@@ -3112,6 +3117,9 @@ if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
         }
         SubCommand::Stack(args) => {
             send_message(&SocketMessage::StackWindow(args.operation_direction))?;
+        }
+        SubCommand::MergeContainer(args) => {
+            send_command(&SocketMessage::MergeContainer(args.operation_direction))?;
         }
         SubCommand::StackAll => {
             send_message(&SocketMessage::StackAll)?;
