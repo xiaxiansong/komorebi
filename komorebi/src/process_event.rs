@@ -7,6 +7,7 @@ use color_eyre::eyre::OptionExt;
 use crossbeam_utils::atomic::AtomicConsume;
 use parking_lot::Mutex;
 
+use crate::core::HidingBehaviour;
 use crate::core::OperationDirection;
 use crate::core::Rect;
 use crate::core::Sizing;
@@ -16,6 +17,7 @@ use crate::CURRENT_VIRTUAL_DESKTOP;
 use crate::DefaultLayout;
 use crate::FLOATING_APPLICATIONS;
 use crate::HIDDEN_HWNDS;
+use crate::HIDING_BEHAVIOUR;
 use crate::Layout;
 use crate::Notification;
 use crate::NotificationEvent;
@@ -57,6 +59,18 @@ fn should_skip_focus_change(foreground_hwnd: Option<isize>, window_hwnd: isize) 
 /// focus.
 fn should_refocus_after_destroy(foreground_hwnd: Option<isize>) -> bool {
     matches!(foreground_hwnd, None | Some(0))
+}
+
+/// Whether a minimize event reports something the user asked for.
+///
+/// komorebi only ever minimizes a window itself under [`HidingBehaviour::Minimize`]: the other
+/// two behaviours hide or cloak the window, and neither of those makes Windows report
+/// `SystemMinimizeStart`. So membership of the hidden set only says anything about the origin of
+/// a minimize event while komorebi is hiding by minimizing, and asking about it unconditionally
+/// discards a real minimize of a window a stack happens to be covering - which leaves the model
+/// believing the window is still on screen and the restore command with nothing to bring back.
+const fn minimize_event_is_the_users(hiding_behaviour: HidingBehaviour, hidden: bool) -> bool {
+    !matches!(hiding_behaviour, HidingBehaviour::Minimize) || !hidden
 }
 
 /// Whether this event is about a temporarily unmanaged window and must therefore change nothing.
@@ -123,6 +137,31 @@ mod destroy_focus_tests {
     #[test]
     fn defers_when_a_successor_took_the_foreground() {
         assert!(!should_refocus_after_destroy(Some(12345)));
+    }
+}
+
+#[cfg(test)]
+mod minimize_origin_tests {
+    use super::*;
+
+    #[test]
+    #[allow(deprecated)]
+    fn a_minimize_is_the_users_unless_komorebi_hides_by_minimizing() {
+        // The two behaviours which do not minimize cannot have caused this event, whatever the
+        // hidden set says: a window a stack is covering is cloaked or hidden, not iconic.
+        for behaviour in [HidingBehaviour::Cloak, HidingBehaviour::Hide] {
+            assert!(minimize_event_is_the_users(behaviour, true));
+            assert!(minimize_event_is_the_users(behaviour, false));
+        }
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn a_minimize_of_a_window_komorebi_minimized_is_komorebis_own() {
+        let behaviour = HidingBehaviour::Minimize;
+
+        assert!(!minimize_event_is_the_users(behaviour, true));
+        assert!(minimize_event_is_the_users(behaviour, false));
     }
 }
 
@@ -561,14 +600,12 @@ impl WindowManager {
                         window.hwnd
                     );
                 } else {
-                    let mut user_minimized = false;
+                    let user_minimized = {
+                        let hidden = HIDDEN_HWNDS.lock().contains(&window.hwnd);
+                        let hiding_behaviour = *HIDING_BEHAVIOUR.lock();
 
-                    {
-                        let programmatically_hidden_hwnds = HIDDEN_HWNDS.lock();
-                        if !programmatically_hidden_hwnds.contains(&window.hwnd) {
-                            user_minimized = true;
-                        }
-                    }
+                        minimize_event_is_the_users(hiding_behaviour, hidden)
+                    };
 
                     // A minimize is trusted as reported rather than confirmed against
                     // `IsIconic` here. The confirmation is not reliably true yet at
