@@ -896,6 +896,15 @@ impl WindowManager {
             .and_then(|monitor| monitor.workspaces_mut().get_mut(workspace_idx))
             .ok_or_eyre("there is no workspace")?;
 
+        // Whether the window which is going to the taskbar is the one the workspace was working
+        // in. It has to be asked before the transition, because minimizing moves the container's
+        // focus off it.
+        let held_focus = minimized
+            && workspace
+                .focused_container()
+                .and_then(Container::focused_window)
+                .is_some_and(|window| window.hwnd == hwnd);
+
         let changed = if minimized {
             workspace.minimize_window(hwnd)?
         } else {
@@ -906,12 +915,37 @@ impl WindowManager {
             return Ok(false);
         }
 
+        // The window the container is left showing, when the minimized window was the focused
+        // one and its container still has something to show. Windows hands the foreground to
+        // whatever is next in its own z-order after a minimize, which is as likely to be the bar
+        // or the desktop as the window which just took the slot over.
+        let successor = held_focus
+            .then(|| {
+                self.monitors()
+                    .get(monitor_idx)
+                    .and_then(|monitor| monitor.workspaces().get(workspace_idx))
+                    .and_then(Workspace::focused_container)
+                    .and_then(Container::first_focusable_window)
+                    .map(|window| window.window)
+            })
+            .flatten();
+
         if self
             .monitors()
             .get(monitor_idx)
             .is_some_and(|monitor| monitor.focused_workspace_idx() == workspace_idx)
         {
             self.update_focused_workspace_by_monitor_idx(monitor_idx)?;
+
+            if monitor_idx == self.focused_monitor_idx()
+                && let Some(successor) = successor
+                && let Err(error) = successor.focus(self.mouse_follows_focus)
+            {
+                // The model transition has already committed and is what the next retile draws
+                // from; a window which refused the foreground is worth reporting, not worth
+                // failing the whole event over.
+                tracing::warn!("could not focus hwnd {}: {error}", successor.hwnd);
+            }
         }
 
         Ok(true)
@@ -6179,6 +6213,34 @@ mod tests {
         }
 
         (wm, context)
+    }
+
+    #[test]
+    fn minimizing_the_focused_window_leaves_its_container_showing_the_next_one() {
+        let (mut wm, _test_context) = window_manager_with_container(&[42, 43]);
+        wm.focused_workspace_mut()
+            .unwrap()
+            .focus_container_by_window(43)
+            .unwrap();
+
+        assert!(wm.minimize_managed_window(43).unwrap());
+
+        let workspace = wm.focused_workspace().unwrap();
+        let container = &workspace.containers()[0];
+
+        // The window keeps its container and its place in the stack, the container keeps its
+        // slot, and what it shows is the window underneath the one which went to the taskbar.
+        assert_eq!(container.windows().len(), 2);
+        assert!(container.is_active());
+        assert_eq!(container.focused_window().unwrap().hwnd, 42);
+        assert_eq!(
+            container.windows()[1].visibility,
+            crate::managed_window::Visibility::Minimized
+        );
+        assert_eq!(workspace.minimize_history.most_recent(), Some(&43));
+
+        // A repeated event for the same minimize changes nothing.
+        assert!(!wm.minimize_managed_window(43).unwrap());
     }
 
     #[test]
