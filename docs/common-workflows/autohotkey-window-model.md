@@ -59,6 +59,14 @@ script can tell "you asked to move a tiled window" apart from "komorebi is not r
   A floating window still belongs to its container, still holds its place in the stack and still
   travels with the container; komorebi simply stops positioning it. `Win+arrow` moves it and
   `Win+Shift/Ctrl+arrow` resizes one of its edges, and neither touches a container or a slot.
+- **Adding and removing containers are two keys each, and none of them moves the focus.** `Alt+C`
+  adds one by dividing the largest slot, `Alt+Shift+C` and `Alt+Ctrl+C` force the dividing line.
+  The window the created container gets is the second most recent one in the workspace's focus
+  history which is not the window its own container is showing, so no container changes what it is
+  drawing and the operation refuses when there are as many containers as there are windows. `Alt+D`
+  removes the container created most recently, which is exactly the inverse of `Alt+C`, and
+  `Alt+Shift+D` removes the focused one instead. Both deal their windows out to the containers
+  which remain.
 - **Containers, not windows, are what the direction keys move.** `Alt+Shift+H/J/K/L` swaps whole
   containers, `Alt+arrow` merges the focused window into the container in that direction, and
   `Alt+N` raises the next window in the current stack to the top.

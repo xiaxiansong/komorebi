@@ -26,6 +26,16 @@
         }
       ]
     },
+    "auto_split_threshold": {
+      "description": "Number of active containers a workspace may hold before a new window joins one instead of\nmaking its own; 0 stops new windows ever adding a container (default: 2)",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "default": 2,
+      "minimum": 0
+    },
     "bar_configurations": {
       "description": "Komorebi status bar configuration files for multiple instances on different monitors",
       "type": [

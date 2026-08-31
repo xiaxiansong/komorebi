@@ -1,12 +1,12 @@
 # destroy-container
 
 ```
-Destroy the focused container, sharing its windows out among the containers which remain
+Destroy the most recently created container, sharing its windows out among those which remain
 
-Usage: komorebic.exe destroy-container
+Usage: komorebic.exe destroy-container [OPTIONS]
 
 Options:
-  -h, --help
-          Print help
+      --count <COUNT>  How many containers to remove [default: 1]
+  -h, --help           Print help
 
 ```

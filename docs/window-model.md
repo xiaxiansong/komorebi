@@ -122,17 +122,55 @@ A komorebi which is restarting from a dumped state document applies that state i
 arrangement a crash interrupted is restored rather than replaced by a fresh adoption. Passing
 `--clean-state` to `komorebic start` is what makes a start a cold one.
 
+## How many containers a workspace has
+
+The container count is a thing in its own right, changed in four ways: two automatic and two by
+hand.
+
+**A new window adds one automatically** while the workspace holds `auto_split_threshold` active
+containers or fewer - two by default, so the first three windows each get a container. Past that a
+new window joins a neighbour instead. A threshold of `0` gives the other model whole: a workspace
+which already has an active container never grows another one on its own.
+
+**A container destroys itself automatically** when its last window is closed or suspended.
+
+**`komorebic create-container` adds one by hand.** It divides the *largest* active logical slot, the
+most recently created container winning a tie, so repeated splits walk across the workspace instead
+of cutting the same half over and over. The window put into the created container is chosen
+separately, and may come from a different container entirely: it is the second most recent window in
+the workspace's window focus history which is not the window its own container is currently showing.
+Skipping the shown windows is what keeps every container drawing what it was drawing, and it is also
+why the operation refuses when there are already as many containers as there are windows - the only
+window left to move would be one somebody is looking at. When the history says nothing, which is the
+state a restart or an adoption leaves behind, the largest stack answers instead: the window directly
+below the one it is showing. `--count` repeats the operation.
+
+**`komorebic destroy-container` removes one by hand**: the container created most recently, which
+makes it exactly the inverse of `create-container`. `komorebic destroy-focused-container` removes
+the one holding the focus instead. Both deal the windows out to the containers which remain, at the
+bottom of each recipient's stack.
+
+Neither half of the count moves the focus. A created container is shown but not focused; a destroyed
+container which was not holding the focus leaves it where it was. The single exception is the
+focused window in a container being destroyed: it is dealt out like the rest, then raised to the top
+of whichever container received it and focused there, so the window being worked on stays the window
+being worked on.
+
+Two rules hold throughout, and are checked by `validate_invariants`: a workspace never holds more
+containers than windows, and never holds no container at all while it holds a window.
+
 ## Configuration
 
 | Field | Meaning | Default |
 | --- | --- | --- |
 | `default_workspace_count` | Workspaces every monitor is given, named in the configuration or not | `4` |
+| `auto_split_threshold` | Active containers a workspace may hold before a new window joins one instead of adding one; `0` never adds | `2` |
 | `window_adoption_behaviour` | What happens to the windows already open when komorebi starts | `SingleContainer` |
 | `floating_move_delta` | Step used by `komorebic move-floating-window` when no delta is passed | `50` |
 | `floating_resize_delta` | Step used by `komorebic resize-floating-window` when no delta is passed | `50` |
 
 The two deltas are steps in logical units, scaled to the DPI of the monitor the window is on. All
-four are ordinary `komorebi.json` fields with serde defaults, so a configuration written for an
+five are ordinary `komorebi.json` fields with serde defaults, so a configuration written for an
 older komorebi still loads, and a configuration which does not mention one leaves it at its
 default. The deltas are deliberately separate from `resize_delta`, which is the step for resizing a
 *container*.
@@ -152,7 +190,7 @@ before this model existed reads back as version `0` and is not applied; komorebi
 it finds instead.
 
 The state output publishes, for every workspace: its stable ID, its layout, its container focus
-history, its minimize history, its logical slots with their geometry generation, the work area those
+history, its window focus history, its minimize history, its logical slots with their geometry generation, the work area those
 slots were calculated against, and the hidden restore records with their `old_rect` and
 `exact_restore_valid`. For every container: its stable ID, its derived `state`, its stack and its
 window focus history. For every window: its owning container ID, placement, visibility, presentation
@@ -182,6 +220,7 @@ randomized sequences.
 | 13 | Minimize, maximize, fullscreen and float do not change ownership | `managed_window.rs`, `workspace.rs::enter_presentation` | `workspace.rs::maximizing_keeps_the_window_in_its_container`, `workspace.rs::a_floating_window_keeps_the_container_which_owns_it` |
 | 14 | Deleting an object clears every history and index which named it | `workspace.rs::prune_histories`, `focus_history.rs::Mru::remove`, `window_manager.rs::forget_window` | `invariants.rs::history_entries_for_removed_objects_are_reported`, `invariants.rs::removal_paths_leave_a_workspace_consistent`, `window_manager.rs::forgetting_a_window_clears_every_runtime_table_the_destroy_path_clears`, `model_harness.rs` |
 | 15 | A compound operation either succeeds completely or changes nothing | `window_manager.rs::commit_workspace_change`, `window_manager.rs::restore_workspace_snapshot` | `window_manager.rs::creating_a_container_without_an_eligible_donor_refuses`, `model_harness.rs` refusal property |
+| 17 | A workspace never holds more containers than windows, nor none while it holds a window | `invariants.rs` (`ContainerCount`), `workspace.rs::split_window_hwnd` | `invariants.rs::more_containers_than_windows_is_reported`, `workspace.rs::a_manual_split_is_refused_when_every_window_is_the_one_its_container_shows` |
 | 16 | Switching layout changes no container ID, ownership or stack order | `workspace.rs::recalculate_logical_slots` | `workspace.rs::a_layout_change_drops_the_restore_records_and_relays_out`, `workspace.rs::a_layout_change_discards_a_manual_resize` |
 
 ## Differences from upstream komorebi
@@ -197,3 +236,8 @@ randomized sequences.
 - Every monitor opens with four workspaces rather than one, and the windows already open are
   adopted into a single container rather than one container each. Both are configurable, and
   `window_adoption_behaviour: "SeparateContainers"` restores upstream's adoption.
+- `destroy-container` destroys the container created most recently rather than the focused one;
+  upstream's behaviour is `destroy-focused-container`. Neither moves the focus, where upstream's
+  moved it to the container which expanded.
+- A manual split divides the largest slot and takes a window nobody is looking at, where upstream
+  split the focused container and took the window it was showing.

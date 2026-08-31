@@ -2407,17 +2407,17 @@ The rules this phase implements, over and above what Phases 7 and 8 established:
   focused container is destroyed by its own separate command.
 - Neither operation changes which window is focused.
 
-- [ ] 20A: the two model facts these rules need and the workspace does not yet record - a
+- [x] 20A: the two model facts these rules need and the workspace does not yet record - a
   workspace-level window focus history, and a creation order for containers. Both serialized, both
   defaulted, both maintained by every path which already maintains the histories beside them.
-- [ ] 20B: `create_container_from_donor` rewritten around the new donor and window selection, with
+- [x] 20B: `create_container_from_donor` rewritten around the new donor and window selection, with
   the geometry donor and the window donor allowed to be different containers, and focus untouched.
-- [ ] 20C: destroy the newest container, keep destroying the focused one as a command of its own,
+- [x] 20C: destroy the newest container, keep destroying the focused one as a command of its own,
   raise the focused window in whichever recipient it is dealt to, and add the container-count
   invariants to `validate_invariants`.
-- [ ] 20D: socket and `komorebic` wiring: `--count` on both commands, `destroy-focused-container`,
+- [x] 20D: socket and `komorebic` wiring: `--count` on both commands, `destroy-focused-container`,
   and outcomes which distinguish "no window can be moved" from "nothing to destroy".
-- [ ] 20E: `auto_split_threshold` configuration field with a serde default of 2, applied to the
+- [x] 20E: `auto_split_threshold` configuration field with a serde default of 2, applied to the
   new-window placement path, plus the regenerated schema.
 - [ ] 20F: AutoHotkey bindings, `docs/window-model.md`, this plan, and live verification on the
   desktop, including that startup adoption still opens with one container in workspace one.
@@ -2426,6 +2426,74 @@ Planned files: `komorebi/src/container.rs`, `komorebi/src/workspace.rs`,
 `komorebi/src/window_manager.rs`, `komorebi/src/process_command.rs`, `komorebi/src/core/mod.rs`,
 `komorebi/src/static_config.rs`, `komorebi/src/lib.rs`, `komorebic/src/main.rs`, `schema.json`,
 `komorebi.ahk`, `docs/window-model.md`, this plan.
+
+20A actual files: `komorebi/src/container.rs`, `komorebi/src/workspace.rs`, `komorebi/src/state.rs`.
+Commit `c5ad24ba`.
+
+The container stamp is a process-wide atomic rather than a workspace-level list, because a container
+keeps its identity across workspaces and monitors and its age has to travel with it. It is
+serialized, and a document which carries one lifts the counter above it, so a restart cannot hand a
+new container an age older than everything already on the desktop; a document written before the
+stamp existed carries zero, which is never issued, and is stamped afresh on the way in. The window
+history is recorded by `record_focused_window`, the one call which already records the other two, and
+is preserved explicitly wherever a container leaves a workspace its windows are staying in -
+`destroy_container` and `consolidate_containers` - because `forget_container` drops the entries of
+windows which leave with it.
+
+Verification: komorebi 540 -> 549 passing, full serial suite green; `cargo fmt --check` clean;
+Clippy clean apart from the pre-existing `items after a test module` warning.
+
+20B actual files: `komorebi/src/workspace.rs`, `komorebi/src/container.rs`,
+`komorebi/src/window_manager.rs`. Commit `4f247ad0`.
+
+`donor_container_idx` became two selectors which answer two different questions, and
+`Container::donor_window_idx` was deleted with the rule it existed for. The tie-break is
+`max_by_key` on `(area, sequence)`, which is the newest of the largest, and the fallback when no
+slot has been recorded yet is the geometry-start container, because a workspace which has not been
+arranged is about to be rearranged and the choice only decides an insertion position.
+
+Six tests changed rather than being deleted: they were the old rule written down. One consequence
+worth recording is that the container which gives a window up can no longer be hidden by the split,
+because the window it keeps showing is by definition a visible stored window - the test which
+asserted the opposite now asserts that.
+
+Verification: komorebi 549 -> 548 passing (nine added, ten of the old rule's removed or folded
+in), full serial suite green; fmt clean; Clippy unchanged.
+
+20C actual files: `komorebi/src/workspace.rs`, `komorebi/src/invariants.rs`. Commit `e7f785b4`.
+
+`destroy_container` captures the focused container and window before it writes anything and puts
+the focus back afterwards, by identity rather than by index. The travelling case is the only one
+which moves anything: `raise_window` + `focus_window_by_hwnd` + `load_focused_window` on the
+recipient, which is the one place a recipient's shown window is allowed to change. Natural
+destruction - the last window of a container closing - still goes through `remove_window` and keeps
+the Phase 8 post-removal focus, because that is a window disappearing rather than a count being
+changed.
+
+The count invariant is implied by "no empty container" plus "one owner per window" and is checked
+directly anyway; it turned two existing invariant tests into two-violation tests, which is correct
+and is recorded in them.
+
+Verification: komorebi 548 -> 553 passing, full serial suite green; fmt clean; Clippy unchanged.
+
+20D actual files: `komorebi/src/core/mod.rs`, `komorebi/src/process_command.rs`,
+`komorebi/src/window_manager.rs`, `komorebic/src/main.rs`. Commit `356208db`.
+
+`DestroyContainer` keeps its wire form and changes meaning; `DestroyFocusedContainer` is new and is
+the old meaning. `--count` is sent as N messages rather than as a payload: each is validated and
+committed on its own, `send_command` already exits on the first refusal with that outcome's code,
+and no existing message shape changes.
+
+Verification: komorebi 553 -> 555 passing, full serial suite green; fmt clean; Clippy unchanged.
+
+20E actual files: `komorebi/src/lib.rs`, `komorebi/src/static_config.rs`,
+`komorebi/src/workspace.rs`. Commit `1b4b1998`.
+
+`AUTO_SPLIT_THRESHOLD` is a global read on every new window, so a reload changes where the next one
+goes - unlike `window_adoption_behaviour`, which is read once. An empty workspace is still a special
+case above the threshold: there is nothing to join.
+
+Verification: komorebi 555 -> 558 passing, full serial suite green; fmt clean; Clippy unchanged.
 
 ## Provisional affected-file inventory
 

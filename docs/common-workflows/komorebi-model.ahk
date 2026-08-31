@@ -250,10 +250,16 @@ ResizeFloating(Edge, Sizing) {
 ; 容器：手动创建与销毁
 ; ============================================================================
 
+; 增加容器：切分当前最大的活动槽位，新容器领走工作区聚焦历史里"次新且不在任何
+; 容器最上层"的那个窗口。焦点不动。
 !c::Komorebic("create-container")                 ; 自动方向切分出新容器
 !+c::Komorebic("create-container left-right")     ; 强制左右切分
 !^c::Komorebic("create-container top-bottom")     ; 强制上下切分
-!d::Komorebic("destroy-container")                ; 销毁当前容器并分发它的窗口
+
+; 减少容器：Alt+D 销毁"最新建立"的容器，正好是 Alt+C 的逆操作；要销毁当前聚焦
+; 的容器请用 Alt+Shift+D。两者都把窗口分发给其余容器，都不改变焦点窗口。
+!d::Komorebic("destroy-container")                ; 销毁最新建立的容器并分发窗口
+!+d::Komorebic("destroy-focused-container")       ; 销毁当前聚焦的容器并分发窗口
 
 ; ============================================================================
 ; 工作区：切换、新建、删除、重排
@@ -353,8 +359,9 @@ global ShortcutTable := [
     ["Win+方向键", "移动浮动窗口", "move-floating-window"],
     ["Win+Shift 或 Ctrl+方向键", "浮动窗口按边缘扩 / 收", "resize-floating-window"],
     ["Alt+Ctrl(+Shift)+方向键", "活动容器边界外扩 / 内收", "resize-edge"],
-    ["Alt+C / Alt+Shift+C / Alt+Ctrl+C", "自动 / 左右 / 上下创建容器", "create-container"],
-    ["Alt+D", "销毁容器并分发窗口", "destroy-container"],
+    ["Alt+C / Alt+Shift+C / Alt+Ctrl+C", "自动 / 左右 / 上下创建容器（切分最大槽位）", "create-container"],
+    ["Alt+D", "销毁最新建立的容器并分发窗口", "destroy-container"],
+    ["Alt+Shift+D", "销毁当前聚焦的容器并分发窗口", "destroy-focused-container"],
     ["Alt+1..8", "切换工作区", "focus-workspace"],
     ["Alt+W / Alt+Shift+W", "新建 / 删除并合并工作区", "new-workspace / merge-workspace"],
     ["Alt+[ 与 Alt+]", "工作区左移 / 右移", "cycle-move-workspace"],
