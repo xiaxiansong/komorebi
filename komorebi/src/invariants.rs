@@ -26,6 +26,9 @@ pub enum Invariant {
     UnmanagedExclusion,
     /// Every container owns at least one managed window.
     NonEmptyContainer,
+    /// A workspace never holds more containers than windows, and never holds no container at all
+    /// while it holds a window.
+    ContainerCount,
     /// Every monitor owns at least one workspace.
     NonEmptyMonitor,
     /// A workspace focuses at most one container and a container focuses at most one window.
@@ -43,6 +46,7 @@ impl fmt::Display for Invariant {
             Self::WindowOwnership => "window ownership",
             Self::UnmanagedExclusion => "unmanaged exclusion",
             Self::NonEmptyContainer => "non-empty container",
+            Self::ContainerCount => "container count",
             Self::NonEmptyMonitor => "non-empty monitor",
             Self::FocusSelection => "focus selection",
             Self::HistoryIntegrity => "history integrity",
@@ -198,6 +202,35 @@ impl ValidateInvariants for Workspace {
             }
         }
 
+        // Implied by "every container owns at least one window" and "every window belongs to
+        // exactly one container", and checked directly all the same: it is the rule the count
+        // commands are written against, and a direct check names it when one of them goes wrong.
+        let container_count = self
+            .containers()
+            .iter()
+            .filter(|container| !container.is_preselect())
+            .count();
+
+        if container_count > owners.len() {
+            violations.push(InvariantViolation::new(
+                Invariant::ContainerCount,
+                format!(
+                    "workspace {id} holds {container_count} containers for {} windows",
+                    owners.len()
+                ),
+            ));
+        }
+
+        if container_count == 0 && !owners.is_empty() {
+            violations.push(InvariantViolation::new(
+                Invariant::ContainerCount,
+                format!(
+                    "workspace {id} holds {} windows in no container",
+                    owners.len()
+                ),
+            ));
+        }
+
         if !self.containers().is_empty() && self.focused_container_idx() >= self.containers().len()
         {
             violations.push(InvariantViolation::new(
@@ -266,6 +299,24 @@ impl ValidateInvariants for Workspace {
                 violations.push(InvariantViolation::new(
                     Invariant::HistoryIntegrity,
                     format!("workspace {id} minimize history repeats window {hwnd}"),
+                ));
+            }
+        }
+
+        let mut focused = HashSet::new();
+
+        for hwnd in self.window_focus_history.iter() {
+            if !owners.contains_key(hwnd) {
+                violations.push(InvariantViolation::new(
+                    Invariant::HistoryIntegrity,
+                    format!("workspace {id} window focus history references unowned window {hwnd}"),
+                ));
+            }
+
+            if !focused.insert(*hwnd) {
+                violations.push(InvariantViolation::new(
+                    Invariant::HistoryIntegrity,
+                    format!("workspace {id} window focus history repeats window {hwnd}"),
                 ));
             }
         }
@@ -436,10 +487,35 @@ mod tests {
     fn an_empty_container_is_reported() {
         let workspace = workspace_with(vec![Container::default()]);
 
+        // One container and no window is also one container too many, and both are reported: the
+        // count rule is the one the container commands are written against.
         assert_eq!(
             invariants(&workspace.validate_invariants()),
-            vec![Invariant::NonEmptyContainer]
+            vec![Invariant::NonEmptyContainer, Invariant::ContainerCount]
         );
+    }
+
+    #[test]
+    fn more_containers_than_windows_is_reported() {
+        let mut workspace = workspace_with(vec![container_with(&[1]), container_with(&[2])]);
+        workspace.containers_mut()[1].windows_mut().clear();
+
+        assert!(
+            invariants(&workspace.validate_invariants()).contains(&Invariant::ContainerCount),
+            "two containers cannot share one window"
+        );
+    }
+
+    #[test]
+    fn a_workspace_which_loses_its_last_container_loses_its_windows_with_it() {
+        let mut workspace = workspace_with(vec![container_with(&[1])]);
+        let container = workspace.remove_container_by_idx(0).unwrap();
+
+        // A window lives inside a container, so "windows and no container to hold them" is a state
+        // the model cannot be put into from here. The count rule still checks for it, because a
+        // rule which is structurally true is exactly the kind which stops being true quietly.
+        assert_eq!(container.windows().len(), 1);
+        assert_eq!(invariants(&workspace.validate_invariants()), vec![]);
     }
 
     #[test]
@@ -465,9 +541,10 @@ mod tests {
     fn a_window_in_two_containers_is_reported() {
         let workspace = workspace_with(vec![container_with(&[1]), container_with(&[1])]);
 
+        // Two containers holding the same window are also two containers holding one window.
         assert_eq!(
             invariants(&workspace.validate_invariants()),
-            vec![Invariant::WindowOwnership]
+            vec![Invariant::WindowOwnership, Invariant::ContainerCount]
         );
     }
 

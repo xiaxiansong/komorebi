@@ -2487,6 +2487,13 @@ impl Workspace {
     /// floating rectangle, and the workspace's minimize history keeps its order, because the
     /// windows have not left the workspace - only the container they belonged to has.
     ///
+    /// Focus does not move. Destroying a container changes how many there are, not what the user
+    /// is working on, so a container which was not holding the focus leaves the focus where it
+    /// was. The one case where something has to happen is the container which *was* holding it:
+    /// its focused window is dealt out like every other, and is then raised to the top of whichever
+    /// container received it and focused there, so the window the user was working on is still the
+    /// window they are working on.
+    ///
     /// Refuses without changing anything when the container still holds windows and there is
     /// nowhere to send them, which is the last container of a workspace.
     pub fn destroy_container(&mut self, idx: usize) -> eyre::Result<()> {
@@ -2505,6 +2512,15 @@ impl Workspace {
 
         // Nothing above this point has written anything, and nothing below it can fail.
         let expansion = self.expansion_focus_target(idx);
+
+        let focused_container = self
+            .focused_container()
+            .map(|container| container.id.clone());
+        let focus_travels = focused_container.as_ref() == Some(&source);
+        let focused_hwnd = self
+            .focused_container()
+            .and_then(Container::focused_managed_window)
+            .map(|window| window.hwnd);
 
         // Both window histories are about windows, not containers, and these windows are staying
         // in this workspace; removing their container must not silently drop or reorder them.
@@ -2532,14 +2548,71 @@ impl Workspace {
         self.minimize_history = minimize_history;
         self.window_focus_history = window_focus_history;
         self.prune_histories();
-        self.focus_after_removal(expansion);
+
+        match (focus_travels, focused_hwnd) {
+            // The focused window has been dealt to one of the recipients, underneath what that
+            // container was showing. It is raised there and focused, which is the one place a
+            // recipient's shown window is allowed to change.
+            (true, Some(hwnd)) => match self.container_idx_for_window(hwnd) {
+                Some(recipient_idx) => {
+                    if let Some(recipient) = self.containers_mut().get_mut(recipient_idx) {
+                        recipient.raise_window(hwnd);
+                        recipient.focus_window_by_hwnd(hwnd);
+                        recipient.load_focused_window();
+                    }
+
+                    self.focus_container(recipient_idx);
+                    self.window_focus_history.record(hwnd);
+                }
+                None => self.focus_after_removal(expansion),
+            },
+            // An empty container was holding the focus, so there is no window to follow and the
+            // ordinary post-removal selection decides.
+            (true, None) => self.focus_after_removal(expansion),
+            (false, _) => {
+                if let Some(id) = focused_container {
+                    self.restore_container_focus(&id);
+                }
+            }
+        }
 
         Ok(())
     }
 
     /// Destroy the focused container, sharing out every window it still holds.
+    ///
+    /// The focus is on this container by definition, so its focused window travels with the focus
+    /// into whichever container receives it.
     pub fn destroy_focused_container(&mut self) -> eyre::Result<()> {
         self.destroy_container(self.focused_container_idx())
+    }
+
+    /// The container this workspace made most recently.
+    ///
+    /// A preselect container is an insertion marker rather than a container the user asked for, so
+    /// it is never the newest one for this purpose.
+    #[must_use]
+    fn newest_container_idx(&self) -> Option<usize> {
+        self.containers()
+            .iter()
+            .enumerate()
+            .filter(|(_, container)| !container.is_preselect())
+            .max_by_key(|(_, container)| container.sequence())
+            .map(|(idx, _)| idx)
+    }
+
+    /// Destroy the container this workspace made most recently.
+    ///
+    /// This is the inverse of the manual split: a workspace which has just had a container added
+    /// gives that same container back, so the pair of keys can be pressed in either order and
+    /// leave the workspace where it started. Which container holds the focus has nothing to do
+    /// with it - destroying the focused container is a command of its own.
+    pub fn destroy_newest_container(&mut self) -> eyre::Result<()> {
+        let idx = self
+            .newest_container_idx()
+            .ok_or_eyre("this workspace has no container to destroy")?;
+
+        self.destroy_container(idx)
     }
 
     pub fn preselect_container_idx(&mut self, insertion_idx: usize) {
@@ -6257,12 +6330,14 @@ mod tests {
     }
 
     #[test]
-    fn focus_after_a_destruction_does_not_follow_the_distributed_windows() {
+    fn destroying_a_container_which_does_not_hold_the_focus_leaves_the_focus_alone() {
         let mut workspace = workspace_with_containers(&[2, 1, 1, 1]);
         let area = work_area(1920, 1080);
         workspace.record_logical_slots(area);
 
-        let expected = workspace.expansion_focus_target(1).unwrap();
+        workspace.focus_container(3);
+        let focused_container = workspace.containers()[3].id.clone();
+        let focused_window = workspace.containers()[3].focused_window().unwrap().hwnd;
         let moved: Vec<isize> = workspace.containers()[1]
             .windows()
             .iter()
@@ -6271,12 +6346,99 @@ mod tests {
 
         workspace.destroy_container(1).unwrap();
 
+        // Changing how many containers there are is not a focus change.
         let idx = workspace.focused_container_idx();
-        assert_eq!(workspace.containers()[idx].id, expected);
+        assert_eq!(workspace.containers()[idx].id, focused_container);
+        assert_eq!(
+            workspace.containers()[idx].focused_window().unwrap().hwnd,
+            focused_window
+        );
 
-        // The recipient shows what it was already showing, not a window which has just arrived.
-        let focused = workspace.containers()[idx].focused_window().unwrap().hwnd;
-        assert!(!moved.contains(&focused));
+        // And every recipient goes on showing what it was already showing.
+        for container in workspace.containers() {
+            let shown = container.focused_window().unwrap().hwnd;
+            assert!(!moved.contains(&shown));
+        }
+    }
+
+    #[test]
+    fn destroying_the_focused_container_carries_its_window_to_the_top_of_its_recipient() {
+        let mut workspace = workspace_with_containers(&[1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        workspace.focus_container(1);
+        let focused_window = workspace.containers()[1].focused_window().unwrap().hwnd;
+
+        workspace.destroy_container(1).unwrap();
+
+        // The window the user was working on is still the window they are working on, and it is on
+        // top of the stack it landed in rather than hidden underneath it.
+        assert_eq!(workspace.containers().len(), 1);
+        let container = &workspace.containers()[0];
+        assert_eq!(container.focused_window().unwrap().hwnd, focused_window);
+        assert_eq!(
+            container.windows().back().map(|window| window.hwnd),
+            Some(focused_window)
+        );
+        assert_eq!(
+            workspace.window_focus_history.most_recent(),
+            Some(&focused_window)
+        );
+    }
+
+    #[test]
+    fn destroying_the_newest_container_undoes_a_manual_split() {
+        let area = work_area(1920, 1080);
+        let mut workspace = arranged_workspace(&[2], area);
+        let original = workspace.containers()[0].id.clone();
+        let hwnds: Vec<isize> = workspace.containers()[0]
+            .windows()
+            .iter()
+            .map(|window| window.hwnd)
+            .collect();
+
+        let created = workspace.create_container_from_donor(None).unwrap();
+        workspace.destroy_newest_container().unwrap();
+
+        // The created container is the one which goes, whoever holds the focus, and the workspace
+        // is back to one container holding the same windows over the whole work area.
+        assert!(workspace.container_idx_for_id(&created).is_none());
+        assert_eq!(workspace.containers().len(), 1);
+        assert_eq!(workspace.containers()[0].id, original);
+
+        let mut left: Vec<isize> = workspace.containers()[0]
+            .windows()
+            .iter()
+            .map(|window| window.hwnd)
+            .collect();
+        left.sort_unstable();
+        let mut expected = hwnds;
+        expected.sort_unstable();
+        assert_eq!(left, expected);
+
+        workspace.record_logical_slots(area);
+        assert_eq!(slot_of(&workspace, &original), LogicalRect::from(area));
+    }
+
+    #[test]
+    fn destroying_the_newest_container_is_not_destroying_the_focused_one() {
+        let area = work_area(1920, 1080);
+        let mut workspace = arranged_workspace(&[2, 1], area);
+        let focused = workspace.containers()[0].id.clone();
+        workspace.focus_container(0);
+
+        let newest = workspace.containers()[1].id.clone();
+
+        workspace.destroy_newest_container().unwrap();
+
+        assert!(workspace.container_idx_for_id(&newest).is_none());
+        assert_eq!(
+            workspace
+                .focused_container()
+                .map(|container| container.id.clone()),
+            Some(focused)
+        );
     }
 
     #[test]
