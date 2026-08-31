@@ -2689,10 +2689,14 @@ it has no window left to show.
   `Workspace::minimize_window`, `Workspace::float_window` and `Container::raise_next_stack_window`
   perform the reveal they each imply.
 - [x] 22B: a minimize event is read as the user's unless komorebi is hiding by minimizing.
-- [ ] 22C: build, deploy and verify both on the live desktop.
+- [x] 22C: the window a container is left showing after a minimize is focused.
+- [x] 22D: the window the user has just floated keeps the foreground, and unfloating shows the
+  window it returns to the arrangement.
+- [x] 22E: build, deploy and verify all of it on the live desktop.
 
 Planned files: `komorebi/src/container.rs`, `komorebi/src/workspace.rs`,
-`komorebi/src/process_event.rs`, `docs/window-model.md`, this plan.
+`komorebi/src/process_event.rs`, `komorebi/src/window_manager.rs`, `docs/window-model.md`,
+this plan.
 
 The first cause is that komorebi only draws one stored window of a container at a time and hides the
 rest, so the window a container is left showing has to be *shown* by whatever stopped the previous
@@ -2737,8 +2741,47 @@ the container hidden and holding its window rather than destroyed. The reveal te
 `HIDDEN_HWNDS`, which is the set that says whether a window is actually being drawn, so they observe
 the reveal itself rather than the model's opinion of it.
 
-Verification: komorebi 561 -> 568 passing, full serial suite green; `cargo fmt --check` clean; Clippy
-clean apart from the pre-existing `items after a test module` warning.
+22C and 22D are what the first deployment found, and both are consequences of the reveal rather
+than defects it uncovered. Windows hands the foreground to whatever is next in its own z-order when
+a window is minimized, and on this desktop that was the bar: the container drew the right window and
+no keystroke reached it. So a minimize of the window the workspace was working in focuses what its
+container is left showing, asked before the transition because minimizing moves the container's
+focus off the window, and skipped entirely for a background window, a window on another monitor, or
+one whose container has nothing left to show.
+
+22D is the same thing seen from the other side. Uncloaking a window makes the shell activate it -
+the runtime log shows the `ObjectUncloaked` for the revealed window followed immediately by a
+`SystemForeground` for it - and that arrives after the float command has returned, so the window the
+user had just floated lost the foreground to the window which appeared behind it. The fix is
+ordering rather than timing: a `Raise` event queued on the event channel is processed after the
+events already in flight, and komorebi already uses that channel for exactly this. Unfloating gained
+the reveal it implies at the same time, which is the same rule read backwards.
+
+22C and 22D actual files: `komorebi/src/window_manager.rs`, `komorebi/src/workspace.rs`. Two more
+tests: the workspace-level minimize through the window manager, and the unfloat reveal.
+
+Verification: komorebi 561 -> 570 passing, full serial suite green; `cargo fmt --check` clean; Clippy
+clean apart from the pre-existing `items after a test module` warning; installed `komorebic
+--version` reporting `d0610e60`.
+
+Live verification, on a workspace holding one container with four windows - the reported shape - and
+chosen so the desktop ends where it began, which it did:
+
+- Before: three windows cloaked, one drawn and focused, which is what a stack looks like.
+- `minimize` on the focused window: the window is genuinely iconic, the model records it `Minimized`
+  with the minimize history holding it, the container keeps its slot, and the next window is
+  uncloaked *and* focused. Before this phase the window was drawn but the bar held the foreground,
+  and before 22B nothing was recorded at all.
+- `restore-last-minimized-window`: the same window comes back on top of its stack, not iconic, in the
+  foreground, and the history is empty. This is the `Alt+Shift+M` which was answering `no-op`.
+- `toggle-float`: the floated window keeps the foreground with its own centred rectangle, and the
+  next stored window is uncloaked in the container's slot instead of the desktop showing through.
+  `toggle-float` again returns the desktop to exactly the arrangement it started from.
+- With two containers: minimizing the only window of one leaves two containers and one slot, and the
+  survivor takes the whole 3816-wide work area; restoring brings both 1908-wide halves back exactly.
+
+The one ERROR in the runtime log across the whole session belongs to a PowerShell console window of
+the deployment shell arriving during the previous instance's shutdown, and is not from this work.
 
 ## Provisional affected-file inventory
 
