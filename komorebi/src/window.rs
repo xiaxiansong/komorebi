@@ -743,6 +743,22 @@ impl Window {
         self.restore_with_border(true);
     }
 
+    /// Take a window out of the minimized state Win32 itself holds it in.
+    ///
+    /// [`Window::restore`] is not that. Under the default `Cloak` hiding behaviour it only clears
+    /// the cloak komorebi applied, and cloaking and minimizing are independent: a window which was
+    /// genuinely minimized stays on the taskbar however many times it is uncloaked. Only a caller
+    /// which knows the window is meant to be on screen may ask for this, because un-minimizing a
+    /// window the user minimized is exactly the thing komorebi must not do on its own.
+    ///
+    /// Nothing happens to a window which is not minimized, so this is safe to call unconditionally
+    /// and cheap enough to leave in the reveal path.
+    pub fn unminimize(self) {
+        if self.is_miminized() {
+            WindowsApi::restore_window(self.hwnd);
+        }
+    }
+
     pub fn minimize(self) {
         let exe = self.exe().unwrap_or_default();
         if !exe.contains("komorebi-bar") {

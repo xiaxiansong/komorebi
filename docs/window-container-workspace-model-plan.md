@@ -2569,12 +2569,34 @@ a cause.
 
 - [x] 21A: `ABSORPTION_DIRECTIONS` becomes up, down, left, right; `NEIGHBOUR_DIRECTIONS` keeps the
   old order for new-window joining; tests and `docs/window-model.md` follow.
-- [ ] 21B: restoring a minimized window takes it out of the minimized state Win32 holds it in.
+- [x] 21B: restoring a minimized window takes it out of the minimized state Win32 holds it in.
 - [ ] 21C: the bar's layout widget draws the focused workspace's active logical slots.
 
 Planned files: `komorebi/src/geometry.rs`, `komorebi/src/window.rs`,
 `komorebi/src/window_manager.rs`, `komorebi-bar/src/widgets/komorebi_layout.rs`,
 `komorebi-bar/src/widgets/komorebi.rs`, `docs/window-model.md`, this plan.
+
+21B actual files: `komorebi/src/window.rs`, `komorebi/src/managed_window.rs`,
+`komorebi/src/window_manager.rs`.
+
+`Window::restore` is not the opposite of a minimize and never has been: under the default `Cloak`
+hiding behaviour it clears the cloak komorebi applied and nothing else, and cloaking and minimizing
+are independent states. So `Alt+Shift+M` did every model thing correctly - the window became
+`Visible`, its container became Active again and took its slot back - and then told Windows to
+uncloak a window which was not cloaked. The window stayed on the taskbar. Only `Cloak` is affected;
+the two other hiding behaviours restore the window as part of their own reveal.
+
+`Window::unminimize` is the missing half, and it is deliberately a separate call rather than a change
+to `restore`: un-minimizing a window the user minimized is the one thing komorebi must not do on its
+own, so only a caller which knows the window is meant to be on screen may ask for it. Two callers
+qualify. `restore_last_minimized_window` is the command itself, and it un-minimizes before the retile
+because a window Windows is not drawing cannot be positioned. `ManagedWindow::show` is the general
+reveal, guarded on the recorded visibility being `Visible` - a window the model believes minimized
+never reaches that path at all - which covers a workspace switch or a reconciliation arriving at the
+same disagreement. A maximized window needed neither, because `SW_MAXIMIZE` restores on its way.
+
+No unit test: every step of this is a Win32 call on a real window handle, and the model half was
+already correct and already covered. Verified on the desktop instead, recorded in 21D.
 
 21A actual files: `komorebi/src/geometry.rs`, `docs/window-model.md`, this plan.
 

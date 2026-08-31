@@ -988,7 +988,12 @@ impl WindowManager {
             return Ok(None);
         };
 
+        // Both halves, in this order: the window comes off the taskbar first, because the retile
+        // which follows positions a window it can only position once Windows is drawing it again.
+        // `restore` alone is not enough - under the default `Cloak` hiding behaviour it clears a
+        // cloak this window never had.
         let window = Window::from(hwnd);
+        window.unminimize();
         window.restore();
 
         self.update_focused_workspace_by_monitor_idx(monitor_idx)?;

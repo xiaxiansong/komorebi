@@ -279,6 +279,14 @@ impl ManagedWindow {
     /// maximized window is shown by maximizing it instead. A fullscreen window is restored, not
     /// maximized: its presentation is a rectangle rather than a Win32 window state, and the
     /// retile which follows is what puts it back on the monitor bounds.
+    ///
+    /// A window this model records as `Visible` may still be minimized as far as Win32 is
+    /// concerned - it has just been restored, or its state was reconciled from elsewhere - and
+    /// under the default `Cloak` hiding behaviour uncloaking it would leave it on the taskbar. The
+    /// recorded visibility is what licenses [`Window::unminimize`] here: a window the model
+    /// believes minimized is never shown through this path at all, so this cannot un-minimize a
+    /// window the user put away. Maximizing already restores, so only the other presentations need
+    /// it.
     pub fn show(&self, with_border: bool) {
         match self.presentation {
             Presentation::Maximized => {
@@ -289,6 +297,10 @@ impl ManagedWindow {
                 }
             }
             Presentation::Normal | Presentation::Fullscreen => {
+                if self.visibility == Visibility::Visible {
+                    self.window.unminimize();
+                }
+
                 self.window.restore_with_border(with_border);
             }
         }
