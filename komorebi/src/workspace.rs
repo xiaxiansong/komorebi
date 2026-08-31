@@ -98,6 +98,12 @@ pub struct Workspace {
     /// here by the same call which records it in the other two, so the three cannot disagree.
     #[serde(default)]
     pub window_focus_history: Mru<isize>,
+    /// Where a walk through [`Workspace::container_focus_history`] has got to, if one is running.
+    ///
+    /// Runtime state which never reaches a state document: it describes a key the user is still
+    /// pressing rather than anything about the arrangement, and a restart ends the walk.
+    #[serde(skip)]
+    pub container_history_walk: Option<ContainerHistoryWalk>,
     /// Most-recently-minimized window handles owned by this workspace.
     ///
     /// Minimizing keeps the window in its container, so this history is the only record of the
@@ -326,6 +332,7 @@ impl Default for Workspace {
             containers: Ring::default(),
             container_focus_history: Mru::default(),
             window_focus_history: Mru::default(),
+            container_history_walk: None,
             minimize_history: Mru::default(),
             monocle_container_id: None,
             layout: Layout::Default(DefaultLayout::BSP),
@@ -367,6 +374,18 @@ pub enum WorkspaceWindowLocation {
     Monocle(usize),          // window_idx
     Container(usize, usize), // container_idx, window_idx
     Floating(usize),         // idx in the derived floating window order
+}
+
+/// A step through a workspace's container history which is not allowed to rewrite it.
+///
+/// The container-level twin of [`crate::container::HistoryWalk`], and for the same reason: a walk
+/// which recorded every container it visited could only ever reach the two most recent ones.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerHistoryWalk {
+    /// Position in the walked history, so the next step continues rather than restarting.
+    pub position: usize,
+    /// The container this walk selected. It is the one focus this workspace will not record.
+    pub container: ContainerId,
 }
 
 #[derive(Debug, Default, Copy, Clone, Serialize, Deserialize, PartialEq)]
@@ -4272,8 +4291,83 @@ impl Workspace {
             && !container.is_preselect()
         {
             let id = container.id.clone();
+
+            // A walk selected this container and the focus it asked for has arrived here. The
+            // history it is walking must not be rewritten by its own step; every other focus ends
+            // the walk and is recorded.
+            if self
+                .container_history_walk
+                .as_ref()
+                .is_some_and(|walk| walk.container == id)
+            {
+                return;
+            }
+
+            self.container_history_walk = None;
             self.container_focus_history.record(id);
         }
+    }
+
+    /// Step through this workspace's container history, focusing the container the step selects.
+    ///
+    /// The history is read, never written: see [`ContainerHistoryWalk`]. The selected container's
+    /// own stack is left exactly as it is - this moves focus between containers, and the window it
+    /// lands on is the one that container would focus anyway.
+    ///
+    /// Only containers this workspace still holds and which have a window that can take focus are
+    /// walked. Fewer than two of them means there is nowhere to walk to.
+    pub fn walk_container_history(&mut self, direction: CycleDirection) -> Option<(usize, isize)> {
+        let candidates: Vec<ContainerId> = self
+            .container_focus_history
+            .iter()
+            .filter(|id| {
+                self.containers()
+                    .iter()
+                    .any(|container| &&container.id == id && container.has_focusable_window())
+            })
+            .cloned()
+            .collect();
+
+        if candidates.len() < 2 {
+            return None;
+        }
+
+        let focused = self
+            .focused_container()
+            .map(|container| container.id.clone());
+
+        let current = self
+            .container_history_walk
+            .as_ref()
+            .and_then(|walk| candidates.iter().position(|id| *id == walk.container))
+            .or_else(|| {
+                focused
+                    .as_ref()
+                    .and_then(|id| candidates.iter().position(|candidate| candidate == id))
+            })
+            .unwrap_or(0);
+
+        let position = match direction {
+            CycleDirection::Next => (current + 1) % candidates.len(),
+            CycleDirection::Previous => (current + candidates.len() - 1) % candidates.len(),
+        };
+
+        let container = candidates[position].clone();
+        let idx = self.container_idx_for_id(&container)?;
+        let hwnd = self.containers()[idx].first_focusable_window()?.hwnd;
+
+        self.container_history_walk = Some(ContainerHistoryWalk {
+            position,
+            container,
+        });
+        self.focus_container(idx);
+
+        Some((idx, hwnd))
+    }
+
+    /// End any container history walk in progress, so the next focus is recorded again.
+    pub fn end_container_history_walk(&mut self) {
+        self.container_history_walk = None;
     }
 
     /// Record a window focus at every history level and move the ring focus to match.
@@ -7041,6 +7135,91 @@ mod tests {
         }
 
         workspace
+    }
+
+    #[test]
+    fn walking_a_container_history_does_not_rewrite_it() {
+        let mut workspace = workspace_with_containers(&[1, 1, 1]);
+        let ids: Vec<_> = workspace
+            .containers()
+            .iter()
+            .map(|container| container.id.clone())
+            .collect();
+
+        for idx in 0..3 {
+            workspace.focus_container(idx);
+        }
+
+        let history: Vec<_> = workspace.container_focus_history.iter().cloned().collect();
+        assert_eq!(
+            history,
+            vec![ids[2].clone(), ids[1].clone(), ids[0].clone()]
+        );
+
+        // One step back through the history, and the history itself is untouched.
+        let (idx, hwnd) = workspace
+            .walk_container_history(CycleDirection::Next)
+            .unwrap();
+        assert_eq!(idx, 1);
+        assert_eq!(hwnd, 1);
+        assert_eq!(workspace.focused_container_idx(), 1);
+        assert_eq!(
+            workspace
+                .container_focus_history
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            history
+        );
+
+        let (idx, _) = workspace
+            .walk_container_history(CycleDirection::Next)
+            .unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(
+            workspace
+                .container_focus_history
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            history
+        );
+    }
+
+    #[test]
+    fn a_container_focus_from_anywhere_else_ends_the_walk_and_is_recorded() {
+        let mut workspace = workspace_with_containers(&[1, 1, 1]);
+        let ids: Vec<_> = workspace
+            .containers()
+            .iter()
+            .map(|container| container.id.clone())
+            .collect();
+
+        for idx in 0..3 {
+            workspace.focus_container(idx);
+        }
+
+        workspace
+            .walk_container_history(CycleDirection::Next)
+            .unwrap();
+        assert!(workspace.container_history_walk.is_some());
+
+        workspace.focus_container(2);
+
+        assert!(workspace.container_history_walk.is_none());
+        assert_eq!(
+            workspace.container_focus_history.most_recent(),
+            Some(&ids[2])
+        );
+    }
+
+    #[test]
+    fn a_workspace_with_one_focusable_container_has_nowhere_to_walk() {
+        let mut workspace = workspace_with_containers(&[1]);
+        workspace.focus_container(0);
+
+        assert_eq!(workspace.walk_container_history(CycleDirection::Next), None);
+        assert!(workspace.container_history_walk.is_none());
     }
 
     #[test]

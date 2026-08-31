@@ -11,6 +11,7 @@ use serde::Deserializer;
 use serde::Serialize;
 
 use crate::Lockable;
+use crate::core::CycleDirection;
 use crate::core::Rect;
 use crate::floating_geometry;
 use crate::focus_history::Mru;
@@ -90,6 +91,25 @@ pub struct Container {
     /// be focused after the current one goes away. This history can, and it is the only source
     /// used for that decision.
     focus_history: Mru<isize>,
+    /// Where a walk through [`Self::focus_history`] has got to, if one is in progress.
+    ///
+    /// Runtime state, deliberately outside the serialized shape: it describes a key the user is
+    /// still pressing, not anything about the arrangement.
+    history_walk: Option<HistoryWalk>,
+}
+
+/// A step through a container's window history which is not allowed to rewrite it.
+///
+/// Walking a most-recently-used list has to leave the list alone. A walk which recorded each
+/// window it visited would put that window at the front, so the next step would come straight
+/// back to where it started and the third window of the history would be unreachable - which is
+/// why `Alt+Tab` also holds its order until the key is released.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryWalk {
+    /// Position in the walked history, so the next step continues rather than restarting.
+    pub position: usize,
+    /// The window this walk selected. It is the one focus this container will not record.
+    pub hwnd: isize,
 }
 
 /// The serialized shape of a container.
@@ -229,6 +249,7 @@ impl<'de> Deserialize<'de> for Container {
             locked: repr.locked,
             windows: repr.windows,
             focus_history: repr.focus_history,
+            history_walk: None,
         };
 
         // The container is the authority for ownership. This both migrates legacy serialized
@@ -252,6 +273,7 @@ impl Default for Container {
             locked: false,
             windows: Ring::default(),
             focus_history: Mru::default(),
+            history_walk: None,
         }
     }
 }
@@ -315,6 +337,7 @@ impl Container {
             locked: false,
             windows: Default::default(),
             focus_history: Mru::default(),
+            history_walk: None,
         }
     }
 
@@ -785,8 +808,92 @@ impl Container {
 
         if let Some(window) = self.windows.elements().get(idx) {
             let hwnd = window.hwnd;
+
+            // A walk selected this window, and the focus it asked for has come back here. The
+            // history it is walking must not be rewritten by its own step. Every other focus ends
+            // the walk and is recorded, which is what makes a walk last exactly as long as the
+            // user keeps walking.
+            if self
+                .history_walk
+                .as_ref()
+                .is_some_and(|walk| walk.hwnd == hwnd)
+            {
+                return;
+            }
+
+            self.history_walk = None;
             self.focus_history.record(hwnd);
         }
+    }
+
+    /// Step through this container's window history, raising the window the step selects.
+    ///
+    /// The history is read, never written: see [`HistoryWalk`]. What does change is the stack -
+    /// the selected window is raised to the top of the container, which is what the container
+    /// then draws - and the ring focus.
+    ///
+    /// Only windows this container still owns and which are not minimized are walked. A container
+    /// with fewer than two of them has nothing to walk to and answers `None`.
+    pub fn walk_focus_history(&mut self, direction: CycleDirection) -> Option<isize> {
+        let candidates = self.walkable_windows();
+
+        if candidates.len() < 2 {
+            return None;
+        }
+
+        // Where the walk is now: the step it last took while it is still going, and otherwise the
+        // window the container is currently focused on.
+        let current = self
+            .history_walk
+            .as_ref()
+            .and_then(|walk| candidates.iter().position(|hwnd| *hwnd == walk.hwnd))
+            .or_else(|| {
+                self.focused_window()
+                    .and_then(|window| candidates.iter().position(|hwnd| *hwnd == window.hwnd))
+            })
+            .unwrap_or(0);
+
+        let position = match direction {
+            CycleDirection::Next => (current + 1) % candidates.len(),
+            CycleDirection::Previous => (current + candidates.len() - 1) % candidates.len(),
+        };
+
+        let hwnd = candidates[position];
+
+        self.history_walk = Some(HistoryWalk { position, hwnd });
+        self.raise_window(hwnd);
+        self.focus_window_by_hwnd(hwnd);
+        self.load_focused_window();
+
+        Some(hwnd)
+    }
+
+    /// The windows a history walk may select, most recent first.
+    ///
+    /// A window the history no longer matches to an owned, visible window is skipped rather than
+    /// ending the walk, and a window which never entered the history is still reachable through
+    /// the stack order the repair uses.
+    fn walkable_windows(&self) -> Vec<isize> {
+        self.focus_history
+            .iter()
+            .copied()
+            .filter(|hwnd| {
+                self.windows()
+                    .iter()
+                    .any(|window| window.hwnd == *hwnd && window.visibility == Visibility::Visible)
+            })
+            .collect()
+    }
+
+    /// Where a walk through this container's history has got to.
+    #[must_use]
+    pub const fn history_walk(&self) -> Option<&HistoryWalk> {
+        self.history_walk.as_ref()
+    }
+
+    /// End any walk in progress, so the next focus is recorded again.
+    pub fn end_history_walk(&mut self) {
+        self.history_walk = None;
     }
 
     /// Focus the window with `hwnd` if this container owns it.
@@ -858,6 +965,93 @@ impl Container {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn walking_a_container_history_does_not_rewrite_it() {
+        let mut container = Container::default();
+        for hwnd in [1, 2, 3] {
+            container.add_window(Window::from(hwnd));
+        }
+
+        // Used most recently last, so the history reads 3, 2, 1.
+        for hwnd in [1, 2, 3] {
+            container.focus_window_by_hwnd(hwnd);
+        }
+
+        let history: Vec<isize> = container.focus_history().iter().copied().collect();
+        assert_eq!(history, vec![3, 2, 1]);
+
+        // Each step goes one further back and each one is drawn, and the history the walk is
+        // reading is exactly the history it started with.
+        assert_eq!(
+            container.walk_focus_history(CycleDirection::Next),
+            Some(2),
+            "the first step goes to the window used before this one"
+        );
+        assert_eq!(container.focused_window().unwrap().hwnd, 2);
+        assert_eq!(container.windows().back().unwrap().hwnd, 2);
+        assert_eq!(
+            container
+                .focus_history()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            history
+        );
+
+        assert_eq!(container.walk_focus_history(CycleDirection::Next), Some(1));
+        assert_eq!(
+            container
+                .focus_history()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            history
+        );
+
+        // And it wraps rather than stopping at the end.
+        assert_eq!(container.walk_focus_history(CycleDirection::Next), Some(3));
+        assert_eq!(
+            container.walk_focus_history(CycleDirection::Previous),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn a_focus_from_anywhere_else_ends_the_walk_and_is_recorded() {
+        let mut container = Container::default();
+        for hwnd in [1, 2, 3] {
+            container.add_window(Window::from(hwnd));
+        }
+        for hwnd in [1, 2, 3] {
+            container.focus_window_by_hwnd(hwnd);
+        }
+
+        container.walk_focus_history(CycleDirection::Next);
+        assert!(container.history_walk().is_some());
+
+        // The user clicks a different window: the walk is over and the ordinary recording resumes.
+        container.focus_window_by_hwnd(3);
+
+        assert!(container.history_walk().is_none());
+        assert_eq!(container.focus_history().most_recent(), Some(&3));
+    }
+
+    #[test]
+    fn a_container_with_one_walkable_window_has_nowhere_to_walk() {
+        let mut container = Container::default();
+        container.add_window(Window::from(1));
+
+        assert_eq!(container.walk_focus_history(CycleDirection::Next), None);
+        assert!(container.history_walk().is_none());
+
+        // A minimized window is not a place to walk to either.
+        container.add_window(Window::from(2));
+        container.focus_window_by_hwnd(1);
+        container.windows_mut()[1].set_minimized();
+
+        assert_eq!(container.walk_focus_history(CycleDirection::Next), None);
+    }
     use crate::core::Rect;
     use serde_json;
 

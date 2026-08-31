@@ -78,6 +78,14 @@ pub enum SocketMessage {
     UnstackWindow,
     CycleStack(CycleDirection),
     CycleStackIndex(CycleDirection),
+    /// Walk the focused container's window focus history, raising the window walked to.
+    ///
+    /// Deliberately distinct from `CycleStack`, which walks the stack order. Walking a history
+    /// does not rewrite it, so successive steps keep going back rather than returning to where
+    /// the first step started.
+    CycleWindowHistory(CycleDirection),
+    /// Walk the focused workspace's container focus history, focusing the container walked to.
+    CycleContainerHistory(CycleDirection),
     FocusStackWindow(usize),
     /// Raise the window under the top of the focused container's stack and focus it.
     ///
@@ -982,6 +990,14 @@ mod tests {
             (
                 SocketMessage::MergeContainer(OperationDirection::Left),
                 r#"{"type":"MergeContainer","content":"Left"}"#,
+            ),
+            (
+                SocketMessage::CycleWindowHistory(CycleDirection::Next),
+                r#"{"type":"CycleWindowHistory","content":"Next"}"#,
+            ),
+            (
+                SocketMessage::CycleContainerHistory(CycleDirection::Previous),
+                r#"{"type":"CycleContainerHistory","content":"Previous"}"#,
             ),
             (
                 SocketMessage::MoveWindowToMonitorNumber(1, true),

@@ -128,6 +128,8 @@ nav:
       - cli/unstack.md
       - cli/cycle-stack.md
       - cli/cycle-stack-index.md
+      - cli/cycle-window-history.md
+      - cli/cycle-container-history.md
       - cli/focus-stack-window.md
       - cli/raise-next-stack-window.md
       - cli/stack-all.md

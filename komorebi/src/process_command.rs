@@ -391,6 +391,14 @@ impl WindowManager {
                 let response = self.raise_next_stack_window()?;
                 Self::respond(&mut reply, &response);
             }
+            SocketMessage::CycleWindowHistory(direction) => {
+                let response = self.cycle_window_history(direction)?;
+                Self::respond(&mut reply, &response);
+            }
+            SocketMessage::CycleContainerHistory(direction) => {
+                let response = self.cycle_container_history(direction)?;
+                Self::respond(&mut reply, &response);
+            }
             SocketMessage::CycleStackIndex(direction) => {
                 self.cycle_container_window_index_in_direction(direction)?;
             }

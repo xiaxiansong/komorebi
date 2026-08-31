@@ -1060,6 +1060,66 @@ impl WindowManager {
         ))
     }
 
+    /// Step through the focused container's window history, raising the window it selects.
+    ///
+    /// Deliberately distinct from `CycleStack`, which walks the stack order, and from
+    /// `RaiseNextStackWindow`, which always takes the window under the top of the stack. This
+    /// walks the order the windows were last used in, and walking it does not rewrite it.
+    pub fn cycle_window_history(
+        &mut self,
+        direction: CycleDirection,
+    ) -> eyre::Result<CommandResponse> {
+        let monitor_idx = self.focused_monitor_idx();
+
+        let Some(hwnd) = self
+            .focused_workspace_mut()?
+            .focused_container_mut()
+            .and_then(|container| container.walk_focus_history(direction))
+        else {
+            return Ok(CommandResponse::new(
+                CommandOutcome::NoOp,
+                "this container has no other window to walk to",
+            ));
+        };
+
+        self.update_focused_workspace_by_monitor_idx(monitor_idx)?;
+        Window::from(hwnd).focus(self.mouse_follows_focus)?;
+
+        Ok(CommandResponse::new(
+            CommandOutcome::Success,
+            format!("raised hwnd {hwnd}"),
+        ))
+    }
+
+    /// Step through the focused workspace's container history, focusing the container it selects.
+    ///
+    /// The container-level twin of [`Self::cycle_window_history`]. It moves the focus between
+    /// containers and changes no stack, no slot and no window state.
+    pub fn cycle_container_history(
+        &mut self,
+        direction: CycleDirection,
+    ) -> eyre::Result<CommandResponse> {
+        let monitor_idx = self.focused_monitor_idx();
+
+        let Some((_, hwnd)) = self
+            .focused_workspace_mut()?
+            .walk_container_history(direction)
+        else {
+            return Ok(CommandResponse::new(
+                CommandOutcome::NoOp,
+                "this workspace has no other container to walk to",
+            ));
+        };
+
+        self.update_focused_workspace_by_monitor_idx(monitor_idx)?;
+        Window::from(hwnd).focus(self.mouse_follows_focus)?;
+
+        Ok(CommandResponse::new(
+            CommandOutcome::Success,
+            format!("focused hwnd {hwnd}"),
+        ))
+    }
+
     /// Where the workspace with this stable ID lives, as (monitor, workspace) indices.
     ///
     /// An index is a position in a list which reordering, merging and monitor moves all change; an

@@ -306,6 +306,9 @@ impl From<&WindowManager> for State {
                             containers: workspace.containers.clone(),
                             container_focus_history: workspace.container_focus_history.clone(),
                             window_focus_history: workspace.window_focus_history.clone(),
+                            // A history walk is a key the user is still pressing; the state
+                            // document describes the arrangement, so it never carries one.
+                            container_history_walk: None,
                             minimize_history: workspace.minimize_history.clone(),
                             monocle_container_id: workspace.monocle_container_id.clone(),
                             layout: workspace.layout.clone(),

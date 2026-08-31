@@ -169,6 +169,8 @@ gen_enum_subcommand_args! {
     MergeContainer: OperationDirection,
     CycleStack: CycleDirection,
     CycleStackIndex: CycleDirection,
+    CycleWindowHistory: CycleDirection,
+    CycleContainerHistory: CycleDirection,
     FlipLayout: Axis,
     ChangeLayout: DefaultLayout,
     CycleLayout: CycleDirection,
@@ -1240,6 +1242,14 @@ enum SubCommand {
     /// Cycle the index of the focused window in the focused stack in the specified cycle direction
     #[clap(arg_required_else_help = true)]
     CycleStackIndex(CycleStackIndex),
+    /// Walk the focused container's window focus history, raising the window walked to
+    #[clap(arg_required_else_help = true)]
+    #[clap(alias = "cycle-window-mru")]
+    CycleWindowHistory(CycleWindowHistory),
+    /// Walk the focused workspace's container focus history, focusing the container walked to
+    #[clap(arg_required_else_help = true)]
+    #[clap(alias = "cycle-container-mru")]
+    CycleContainerHistory(CycleContainerHistory),
     /// Focus the specified window index in the focused stack
     #[clap(arg_required_else_help = true)]
     FocusStackWindow(FocusStackWindow),
@@ -3117,6 +3127,12 @@ if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
         }
         SubCommand::Stack(args) => {
             send_message(&SocketMessage::StackWindow(args.operation_direction))?;
+        }
+        SubCommand::CycleWindowHistory(args) => {
+            send_command(&SocketMessage::CycleWindowHistory(args.cycle_direction))?;
+        }
+        SubCommand::CycleContainerHistory(args) => {
+            send_command(&SocketMessage::CycleContainerHistory(args.cycle_direction))?;
         }
         SubCommand::MergeContainer(args) => {
             send_command(&SocketMessage::MergeContainer(args.operation_direction))?;
