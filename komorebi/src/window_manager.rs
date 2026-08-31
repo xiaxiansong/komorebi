@@ -1968,6 +1968,18 @@ impl WindowManager {
         // A container resize moves a boundary two containers share. It has nothing to do with a
         // floating window, whose rectangle is its own and is changed only by the floating
         // commands, so the workspace layer does not redirect this command at one.
+        //
+        // A hidden container shares no boundary either, because it owns no slot. Recording a
+        // resize adjustment for one would store geometry against a container the arrangement
+        // does not contain, so the command changes nothing instead.
+        if workspace
+            .focused_container()
+            .is_some_and(|container| !container.is_active())
+        {
+            tracing::warn!("the focused container is hidden and has no boundary to resize");
+            return Ok(());
+        }
+
         match workspace.layout {
             Layout::Default(layout) => {
                 tracing::info!("resizing window");
@@ -3894,6 +3906,16 @@ impl WindowManager {
         let mut window = workspace
             .focused_floating_window()
             .ok_or_eyre("there is no floating window")?;
+
+        // A window Win32 still has maximized cannot be given a rectangle: `SetWindowPos` leaves a
+        // maximized window filling the work area, and a floating window the size of the work area
+        // is one every move command has to refuse because there is nowhere to move it to. The
+        // model's own presentation was left by `new_floating_window` above; this is the same
+        // window seen from Win32, which the model has not necessarily observed yet.
+        if window.is_maximized() {
+            tracing::info!("restoring a maximized window before floating it");
+            WindowsApi::restore_window(window.hwnd);
+        }
 
         if toggle_float_placement.should_center() {
             window.center(&work_area, toggle_float_placement.should_resize())?;
@@ -6201,6 +6223,42 @@ mod tests {
         }
 
         (wm, context)
+    }
+
+    #[test]
+    fn a_container_resize_refuses_a_hidden_container() {
+        let work_area = Rect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        let (mut wm, _test_context) = window_manager_with_work_area(&[42], work_area);
+
+        let floated = Rect {
+            left: 100,
+            top: 100,
+            right: 800,
+            bottom: 600,
+        };
+        wm.focused_workspace_mut()
+            .unwrap()
+            .float_window(42, floated)
+            .unwrap();
+
+        assert!(!wm.focused_workspace().unwrap().containers()[0].is_active());
+
+        wm.resize_window(OperationDirection::Left, Sizing::Increase, 50, false)
+            .unwrap();
+
+        // No slot, no shared boundary, no adjustment recorded - and the floating window which
+        // made the container hidden is exactly where it was.
+        let workspace = wm.focused_workspace().unwrap();
+        assert!(workspace.resize_dimensions.iter().all(Option::is_none));
+        assert_eq!(
+            workspace.containers()[0].windows()[0].floating_rect,
+            Some(floated)
+        );
     }
 
     #[test]
