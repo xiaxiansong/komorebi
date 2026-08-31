@@ -3962,6 +3962,14 @@ impl WindowManager {
 
         window.focus(self.mouse_follows_focus)?;
 
+        // Showing the stored window underneath uncloaks it, and the shell activates a window
+        // whose cloak it clears - after this command has returned, because that happens on its
+        // own thread. Queueing a raise behind the events already in flight is what leaves the
+        // window the user has just floated in the foreground rather than the one which appeared
+        // behind it.
+        self.has_pending_raise_op = true;
+        winevent_listener::event_tx().send(WindowManagerEvent::Raise(window))?;
+
         Ok(())
     }
 

@@ -1459,6 +1459,10 @@ impl Workspace {
 
         container.windows_mut()[window_idx].set_stored();
         container.focus_window(window_idx);
+
+        // The window is back under its container's control, so the container shows it and hides
+        // whichever stored window it was showing while this one floated above the arrangement.
+        container.load_focused_window();
         self.focus_container(container_idx);
 
         Ok(())
@@ -9239,6 +9243,39 @@ mod tests {
         assert!(workspace.containers()[0].is_hidden());
         assert!(!workspace.logical_slots.contains(&id));
         assert!(!is_programmatically_hidden(ONLY));
+    }
+
+    #[test]
+    fn unfloating_shows_the_window_returning_to_the_arrangement() {
+        const BELOW: isize = 9_251;
+        const TOP: isize = 9_252;
+
+        let area = work_area(1920, 1080);
+        let mut workspace = arranged_workspace_with_stack(&[BELOW, TOP], area);
+
+        workspace
+            .float_window(
+                TOP,
+                Rect {
+                    left: 10,
+                    top: 10,
+                    right: 400,
+                    bottom: 300,
+                },
+            )
+            .unwrap();
+        assert!(!is_programmatically_hidden(BELOW));
+
+        workspace.unfloat_window(TOP).unwrap();
+
+        // The window is back under its container's control, which means the container shows it
+        // and stops showing the one it was showing in its place.
+        assert!(!is_programmatically_hidden(TOP));
+        assert!(is_programmatically_hidden(BELOW));
+        assert_eq!(
+            workspace.containers()[0].focused_window().unwrap().hwnd,
+            TOP
+        );
     }
 
     #[test]
