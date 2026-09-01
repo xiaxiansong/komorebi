@@ -29,6 +29,7 @@ use windows::Win32::Graphics::Dwm::DWMWA_BORDER_COLOR;
 use windows::Win32::Graphics::Dwm::DWMWA_CLOAKED;
 use windows::Win32::Graphics::Dwm::DWMWA_COLOR_NONE;
 use windows::Win32::Graphics::Dwm::DWMWA_EXTENDED_FRAME_BOUNDS;
+use windows::Win32::Graphics::Dwm::DWMWA_TRANSITIONS_FORCEDISABLED;
 use windows::Win32::Graphics::Dwm::DWMWA_WINDOW_CORNER_PREFERENCE;
 use windows::Win32::Graphics::Dwm::DWMWCP_ROUND;
 use windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE;
@@ -1311,6 +1312,27 @@ impl WindowsApi {
         let dpi_b = Self::dpi_for_monitor(hmonitor_b)?;
 
         Ok((dpi_a - dpi_b).abs() < f32::EPSILON)
+    }
+
+    /// Turn the DWM minimize, restore and maximize animations for one window on or off.
+    ///
+    /// `SW_RESTORE` returns before the animation it starts has finished, so a caller which needs
+    /// the window to be drawn where it is going before it changes anything else - revealing a
+    /// window into a slot another window is still filling, for instance - has no way to wait for
+    /// it. Disabling the transition makes the show synchronous as far as the screen is concerned.
+    /// This is per window and reversible; nothing here changes a system animation setting.
+    pub fn set_transitions_disabled(hwnd: isize, disabled: bool) -> eyre::Result<()> {
+        let value = BOOL::from(disabled);
+
+        unsafe {
+            DwmSetWindowAttribute(
+                HWND(as_ptr!(hwnd)),
+                DWMWA_TRANSITIONS_FORCEDISABLED,
+                std::ptr::addr_of!(value).cast(),
+                u32::try_from(std::mem::size_of::<BOOL>())?,
+            )
+        }
+        .process()
     }
 
     pub fn round_corners(hwnd: isize) -> eyre::Result<()> {

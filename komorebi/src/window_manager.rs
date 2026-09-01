@@ -1011,26 +1011,57 @@ impl WindowManager {
     /// The window comes back with the placement and presentation it was minimized with, and both
     /// levels of focus history follow it. A workspace with no minimized window it still owns is
     /// left completely unchanged.
+    ///
+    /// The order here is the whole of what makes the restore look like alt-tab rather than a
+    /// flicker. A container shows one stored window at a time, so restoring into a stack means
+    /// hiding the window the container was showing - and hiding is a cloak, which is immediate,
+    /// while revealing is `SW_RESTORE`, which returns while Windows is still animating the window
+    /// out of the taskbar. Hidden first, the slot shows the desktop for the length of that
+    /// animation. So the animation is suppressed for this one window, the reveal happens before
+    /// the model changes anything, and the window it shadows is hidden last, once the retile has
+    /// put the revealed window in the slot and the focus has raised it over what it replaced.
     pub fn restore_last_minimized_window(&mut self) -> eyre::Result<Option<isize>> {
         let monitor_idx = self.focused_monitor_idx();
 
-        let Some(hwnd) = self
-            .focused_workspace_mut()?
-            .restore_last_minimized_window()
-        else {
+        // Asked before anything happens, so a workspace with nothing to restore is not touched at
+        // all: no window is taken off the taskbar for a model change which then cannot be made.
+        let Some(hwnd) = self.focused_workspace()?.last_minimized_window() else {
             return Ok(None);
         };
 
-        // Both halves, in this order: the window comes off the taskbar first, because the retile
-        // which follows positions a window it can only position once Windows is drawing it again.
-        // `restore` alone is not enough - under the default `Cloak` hiding behaviour it clears a
-        // cloak this window never had.
         let window = Window::from(hwnd);
-        window.unminimize();
-        window.restore();
 
-        self.update_focused_workspace_by_monitor_idx(monitor_idx)?;
-        window.focus(self.mouse_follows_focus)?;
+        {
+            let _transitions = window.without_transitions();
+
+            // Both halves, in this order: the window comes off the taskbar first, because the
+            // retile which follows positions a window it can only position once Windows is drawing
+            // it again. `restore` alone is not enough - under the default `Cloak` hiding behaviour
+            // it clears a cloak this window never had.
+            window.unminimize();
+            window.restore();
+
+            let Some(revealed) = self.focused_workspace_mut()?.reveal_last_minimized_window()
+            else {
+                return Ok(None);
+            };
+
+            debug_assert_eq!(
+                revealed, hwnd,
+                "the reveal took a different window than the one which was peeked"
+            );
+
+            self.update_focused_workspace_by_monitor_idx(monitor_idx)?;
+
+            // Last, and only now: the revealed window is drawn in the slot and holds the
+            // foreground, so the window it takes the slot from goes away underneath it and nothing
+            // is seen through the gap it used to leave. The focus result is answered after the
+            // hide rather than through it, because a container left showing two stored windows is
+            // the one outcome of this sequence the model does not describe.
+            let focused = window.focus(self.mouse_follows_focus);
+            self.focused_workspace_mut()?.hide_shadowed_windows_of(hwnd);
+            focused?;
+        }
 
         Ok(Some(hwnd))
     }

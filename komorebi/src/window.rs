@@ -743,6 +743,19 @@ impl Window {
         self.restore_with_border(true);
     }
 
+    /// Suppress this window's DWM minimize, restore and maximize animations while the returned
+    /// guard is alive.
+    ///
+    /// A reveal is the caller which needs this. `SW_RESTORE` returns while Windows is still
+    /// animating the window out of the taskbar, so a caller which has to know the window is drawn
+    /// before it hides whatever the window is replacing cannot get that from the call alone; with
+    /// the transition off, the window is simply there. A window or a system which will not take
+    /// the attribute just keeps its animation, which is the behaviour this replaces.
+    #[must_use]
+    pub fn without_transitions(self) -> TransitionsDisabled {
+        TransitionsDisabled::hold(self.hwnd)
+    }
+
     /// Take a window out of the minimized state Win32 itself holds it in.
     ///
     /// [`Window::restore`] is not that. Under the default `Cloak` hiding behaviour it only clears
@@ -1115,6 +1128,38 @@ impl RuleDebug {
     /// window otherwise eligible, but a normal resume operation must still respect these rules.
     pub fn is_explicitly_ignored(&self) -> bool {
         self.matches_permaignore_class.is_some() || self.matches_ignore_identifier.is_some()
+    }
+}
+
+/// One window's DWM transitions, held off for the lifetime of this value.
+///
+/// Created by [`Window::without_transitions`] and restored on drop, including on an early return,
+/// so a failure between the two halves cannot leave a window permanently un-animated. A window
+/// which refuses the attribute is logged at trace level and left alone: the transition is a
+/// nicety, and a reveal which animates is the behaviour this exists to improve on, not a fault.
+#[derive(Debug)]
+pub struct TransitionsDisabled {
+    hwnd: isize,
+}
+
+impl TransitionsDisabled {
+    fn hold(hwnd: isize) -> Self {
+        if let Err(error) = WindowsApi::set_transitions_disabled(hwnd, true) {
+            tracing::trace!("could not disable transitions for window {hwnd}: {error}");
+        }
+
+        Self { hwnd }
+    }
+}
+
+impl Drop for TransitionsDisabled {
+    fn drop(&mut self) {
+        if let Err(error) = WindowsApi::set_transitions_disabled(self.hwnd, false) {
+            tracing::trace!(
+                "could not restore transitions for window {}: {error}",
+                self.hwnd
+            );
+        }
     }
 }
 

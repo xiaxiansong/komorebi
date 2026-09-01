@@ -3055,6 +3055,51 @@ the installer and exercised offline against five monitor scenarios - two office 
 before pinning, and this machine's single panel. The package built is 36 files, 114.3 MB, 46.5 MB
 zipped.
 
+### Phase 26 - The desktop seen through a restore, and the key for showing it on purpose
+
+Added on 2026-09-01. Two reports, and both are about the same thing seen from opposite ends: what
+Windows does with a minimized window while komorebi is deciding what to show.
+
+1. `Alt+Shift+M` restores the last minimized window, and the slot it comes back into shows the
+   desktop for a moment first. The model half is already in the right order - the container shows
+   the restored window before it hides the one it replaces - but a hide is a cloak, which is
+   instant, and a reveal is `SW_RESTORE`, which returns before Windows has finished animating the
+   window back out of the taskbar. The sibling is therefore gone for the length of that animation
+   and nothing is drawn in the slot. Alt-tab has no such gap because it hides nothing.
+2. `Win+D` is unreliable here, both on the way out and on the way back. It is a shell-level bulk
+   minimize which komorebi sees as a stream of per-window `SystemMinimizeStart` events, and
+   komorebi answers each one on its own: the container which just lost its shown window shows the
+   next one it holds, and showing a window komorebi believes visible un-minimizes it. So while the
+   shell is still working down its list, komorebi is pulling windows the shell has already
+   minimized back out of the taskbar, and the events for those arrive later and are answered again.
+   The way back has the same shape plus one asymmetry of its own: the shell restores what it
+   minimized, which includes the stack members komorebi had cloaked and the windows of workspaces
+   which are not on screen, and the show handler only re-hides an other-workspace window when it is
+   on another monitor as well. A per-window race cannot be won by reacting to it one window at a
+   time, so this phase gives the operation to komorebi, where it is one model change and one
+   retile.
+
+- [x] 26A: split `Container::load_focused_window` into the show half and the hide half, and give
+  the reveal path a `Workspace::reveal_last_minimized_window` which runs the show half only. The
+  window manager peeks the candidate, disables the window's DWM transitions, un-minimizes it,
+  changes the model, retiles, focuses it, and only then hides the stored window it replaced -
+  restoring the transition setting afterwards. Nothing is hidden until the restored window is
+  drawn in the slot, and there is no animation to be drawn behind.
+- [ ] 26B: `SocketMessage::ToggleShowDesktop`, `MinimizeAllWindows` and `RestoreAllWindows`, with
+  `komorebic` subcommands. Minimizing is one model pass over every visible window of every
+  monitor's focused workspace, followed by the Win32 minimizes and one retile per monitor: the
+  events which come back find nothing left to change, so there is no window for komorebi to pull
+  back. Restoring takes the recorded set, or every minimized window of those workspaces when
+  there is no recorded set, which is also how a desktop left inconsistent by `Win+D` is repaired.
+  The recorded set is runtime state and is not serialized.
+- [ ] 26C: three keys in the AutoHotkey table, the documentation for the new commands, and the
+  progress log entry. Commit each part separately.
+
+Verification: unit tests for the show/hide split, the reveal, and the bulk minimize and restore
+model passes; the full serial suite, `cargo fmt --check` and Clippy; then the live desktop - a
+two-window stack minimized and restored while watching for the gap, and the desktop key pressed
+twice with the layout compared before and after.
+
 ## Provisional affected-file inventory
 
 This list is updated from actual diffs, not treated as permission to change every file.

@@ -1045,6 +1045,38 @@ impl Workspace {
     /// This function will only emit a focus on the window if it isn't the focused window of that
     /// container already.
     pub fn focus_container_by_window(&mut self, hwnd: isize) -> eyre::Result<()> {
+        self.focus_container_by_window_showing(hwnd, true)
+    }
+
+    /// [`Self::focus_container_by_window`] which shows the newly focused window without hiding the
+    /// stored window it takes the container's slot from.
+    ///
+    /// For a window arriving from the taskbar, where the show is not on screen yet and hiding the
+    /// window it replaces here would leave the slot empty for the length of the restore animation.
+    /// The caller owes the container a [`Self::hide_shadowed_windows_of`] once the revealed window
+    /// is actually drawn.
+    pub fn reveal_container_by_window(&mut self, hwnd: isize) -> eyre::Result<()> {
+        self.focus_container_by_window_showing(hwnd, false)
+    }
+
+    /// Hide the stored windows shadowed by whatever the container holding `hwnd` is showing.
+    ///
+    /// The deferred half of a reveal. Does nothing when no container owns `hwnd`, because a window
+    /// which has left the workspace between the reveal and this call has taken the question with
+    /// it.
+    pub fn hide_shadowed_windows_of(&mut self, hwnd: isize) {
+        if let Some(idx) = self.container_idx_for_window(hwnd)
+            && let Some(container) = self.containers_mut().get_mut(idx)
+        {
+            container.hide_shadowed_windows();
+        }
+    }
+
+    fn focus_container_by_window_showing(
+        &mut self,
+        hwnd: isize,
+        hide_shadowed: bool,
+    ) -> eyre::Result<()> {
         let container_idx = self
             .container_idx_for_window(hwnd)
             .ok_or_eyre("there is no container/window")?;
@@ -1067,7 +1099,11 @@ impl Workspace {
         container.focus_window(window_idx);
 
         if should_load {
-            container.load_focused_window();
+            if hide_shadowed {
+                container.load_focused_window();
+            } else {
+                container.show_focused_window();
+            }
         }
 
         self.focus_container(container_idx);
@@ -2992,6 +3028,20 @@ impl Workspace {
     /// to see, and its container becomes active again by the ordinary derivation if it was the
     /// only thing keeping it hidden. Both histories are updated through the ordinary focus path.
     pub fn restore_last_minimized_window(&mut self) -> Option<isize> {
+        self.take_last_minimized_window_showing(true)
+    }
+
+    /// [`Self::restore_last_minimized_window`] which leaves the stored window the restored one
+    /// replaces on screen.
+    ///
+    /// This is the model half of a reveal from the taskbar, where the window is not drawn at the
+    /// moment the model changes. The caller hides what it shadows with
+    /// [`Self::hide_shadowed_windows_of`] once it is.
+    pub fn reveal_last_minimized_window(&mut self) -> Option<isize> {
+        self.take_last_minimized_window_showing(false)
+    }
+
+    fn take_last_minimized_window_showing(&mut self, hide_shadowed: bool) -> Option<isize> {
         let hwnd = self.take_last_minimized_window()?;
 
         self.unminimize_window(hwnd).ok()?;
@@ -3000,7 +3050,8 @@ impl Workspace {
             self.containers_mut()[idx].raise_window(hwnd);
         }
 
-        self.focus_container_by_window(hwnd).ok()?;
+        self.focus_container_by_window_showing(hwnd, hide_shadowed)
+            .ok()?;
 
         Some(hwnd)
     }
@@ -4474,18 +4525,37 @@ impl Workspace {
         self.minimize_history.remove(&hwnd)
     }
 
+    /// The most recently minimized window this workspace still owns, without consuming it.
+    ///
+    /// The same question [`Self::take_last_minimized_window`] answers, asked by a caller which has
+    /// Win32 work to do before it may change the model - a reveal has to take the window off the
+    /// taskbar first - and must not have taken anything if that work fails. Stale entries are left
+    /// in place for the take to discard.
+    #[must_use]
+    pub fn last_minimized_window(&self) -> Option<isize> {
+        let minimized = self.minimized_window_handles();
+
+        self.minimize_history
+            .first_valid(|hwnd| minimized.contains(hwnd))
+            .copied()
+    }
+
+    /// Every window this workspace owns which its model records as minimized.
+    fn minimized_window_handles(&self) -> Vec<isize> {
+        self.containers()
+            .iter()
+            .flat_map(|container| container.windows().iter())
+            .filter(|window| window.visibility == Visibility::Minimized)
+            .map(|window| window.hwnd)
+            .collect()
+    }
+
     /// Take the most recently minimized window which this workspace still owns.
     ///
     /// Stale entries examined on the way are discarded, so a history full of closed windows
     /// leaves an empty history and no side effect.
     pub fn take_last_minimized_window(&mut self) -> Option<isize> {
-        let minimized = self
-            .containers()
-            .iter()
-            .flat_map(|container| container.windows().iter())
-            .filter(|window| window.visibility == Visibility::Minimized)
-            .map(|window| window.hwnd)
-            .collect::<Vec<_>>();
+        let minimized = self.minimized_window_handles();
 
         self.minimize_history
             .take_first_valid(|hwnd| minimized.contains(hwnd))
@@ -5694,6 +5764,65 @@ mod tests {
         assert_eq!(window.placement, ManagedPlacement::Floating);
         assert_eq!(window.presentation, Presentation::Maximized);
         assert_eq!(window.floating_rect, Some(floating_rect(3)));
+    }
+
+    #[test]
+    fn the_last_minimized_window_can_be_read_without_taking_it() {
+        let mut workspace = workspace_with_containers(&[2]);
+        workspace.minimize_window(0).unwrap();
+        workspace.minimize_window(1).unwrap();
+
+        // Asked twice, because the point of the peek is that a caller with Win32 work to do first
+        // can ask before it commits to anything.
+        assert_eq!(workspace.last_minimized_window(), Some(1));
+        assert_eq!(workspace.last_minimized_window(), Some(1));
+        assert_eq!(workspace.minimize_history.len(), 2);
+
+        assert_eq!(
+            workspace.take_last_minimized_window(),
+            Some(1),
+            "the take answers what the peek promised"
+        );
+        assert_eq!(workspace.last_minimized_window(), Some(0));
+    }
+
+    #[test]
+    fn nothing_to_restore_is_nothing_to_peek() {
+        let mut workspace = workspace_with_containers(&[1]);
+        assert_eq!(workspace.last_minimized_window(), None);
+
+        // A history entry for a window this workspace no longer holds is not a candidate, and the
+        // peek leaves it for the take to discard.
+        workspace.minimize_history.record(404);
+        assert_eq!(workspace.last_minimized_window(), None);
+        assert!(workspace.minimize_history.contains(&404));
+    }
+
+    #[test]
+    fn a_revealed_window_reaches_the_same_model_state_as_a_restored_one() {
+        let mut restoring = workspace_with_containers(&[2]);
+        restoring.minimize_window(0).unwrap();
+        let mut revealing = restoring.clone();
+
+        assert_eq!(restoring.restore_last_minimized_window(), Some(0));
+        assert_eq!(revealing.reveal_last_minimized_window(), Some(0));
+
+        // The two paths differ only in when the window they shadow is hidden, which is a Win32
+        // side effect; every model consequence of the restore has to be identical.
+        assert_eq!(revealing.containers(), restoring.containers());
+        assert_eq!(revealing.minimize_history, restoring.minimize_history);
+        assert_eq!(
+            revealing.window_focus_history,
+            restoring.window_focus_history
+        );
+        assert_eq!(
+            revealing.container_focus_history,
+            restoring.container_focus_history
+        );
+        assert_eq!(
+            revealing.focused_container_idx(),
+            restoring.focused_container_idx()
+        );
     }
 
     #[test]

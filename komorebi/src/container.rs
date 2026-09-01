@@ -440,6 +440,19 @@ impl Container {
     /// Floating windows are left alone unless they are minimized: their visibility does not
     /// depend on where they sit in the stack.
     pub fn load_focused_window(&mut self) {
+        self.show_focused_window();
+        self.hide_shadowed_windows();
+    }
+
+    /// The showing half of [`Self::load_focused_window`]: nothing is hidden.
+    ///
+    /// Separate because the two halves are not always wanted at the same moment. A window being
+    /// revealed from the taskbar is not on screen when `SW_RESTORE` returns, so hiding the stored
+    /// window it is replacing in the same pass leaves the slot empty until Windows has finished
+    /// drawing it - the desktop seen through a restore. A caller in that position shows first,
+    /// waits until the window is actually in the slot, and calls [`Self::hide_shadowed_windows`]
+    /// then. Every other caller wants both halves and uses [`Self::load_focused_window`].
+    pub fn show_focused_window(&mut self) {
         let showing_idx = self.showing_stored_window_idx();
 
         for (i, window) in self.windows_mut().iter_mut().enumerate() {
@@ -449,11 +462,30 @@ impl Container {
                 (ManagedPlacement::Stored, _) => {
                     if Some(i) == showing_idx {
                         window.show(false);
-                    } else {
-                        window.hide_with_border(false);
                     }
                 }
             }
+        }
+    }
+
+    /// The hiding half of [`Self::load_focused_window`]: every stored window of the stack except
+    /// the one this container is showing.
+    ///
+    /// Minimized windows are already off screen and floating windows are not part of the stack
+    /// for display purposes, so neither is touched. Idempotent, which is what lets a deferred
+    /// call after [`Self::show_focused_window`] stand in for the single pass.
+    pub fn hide_shadowed_windows(&mut self) {
+        let showing_idx = self.showing_stored_window_idx();
+
+        for (i, window) in self.windows_mut().iter_mut().enumerate() {
+            if window.visibility == Visibility::Minimized
+                || window.placement == ManagedPlacement::Floating
+                || Some(i) == showing_idx
+            {
+                continue;
+            }
+
+            window.hide_with_border(false);
         }
     }
 
@@ -1218,6 +1250,109 @@ mod tests {
             Some(2),
             "with nothing focusable below it, the search continues up the stack"
         );
+    }
+
+    /// A container of two windows with `hwnd` handles of its own, focused on the one which would
+    /// be revealed, and with neither handle left in the process-wide hidden set by the setup.
+    ///
+    /// The hidden set is what records which windows komorebi has cloaked, and it is the only
+    /// observable difference between the two halves of `load_focused_window` - the model does not
+    /// describe which of a stack's windows is currently drawn, only which one should be.
+    fn stack_ready_to_reveal(revealed: isize, shadowed: isize) -> Container {
+        let mut container = Container::default();
+        container.add_window(Window::from(shadowed));
+        container.add_window(Window::from(revealed));
+        container.focus_window_by_hwnd(revealed);
+        forget_hidden(&[revealed, shadowed]);
+
+        container
+    }
+
+    fn forget_hidden(hwnds: &[isize]) {
+        crate::HIDDEN_HWNDS
+            .lock()
+            .retain(|hidden| !hwnds.contains(hidden));
+    }
+
+    fn is_hidden(hwnd: isize) -> bool {
+        crate::HIDDEN_HWNDS.lock().contains(&hwnd)
+    }
+
+    #[test]
+    fn showing_the_focused_window_leaves_the_one_it_replaces_on_screen() {
+        let mut container = stack_ready_to_reveal(9101, 9102);
+
+        container.show_focused_window();
+
+        assert_eq!(container.showing_stored_window_idx(), Some(1));
+        assert!(
+            !is_hidden(9102),
+            "the window whose slot is being taken over is still drawn, so a window which is not              on screen yet cannot leave the slot empty"
+        );
+
+        container.hide_shadowed_windows();
+
+        assert!(is_hidden(9102), "the deferred half hides it");
+        assert!(!is_hidden(9101), "and never the window being shown");
+
+        forget_hidden(&[9101, 9102]);
+    }
+
+    #[test]
+    fn loading_the_focused_window_does_both_halves_at_once() {
+        let mut container = stack_ready_to_reveal(9111, 9112);
+
+        container.load_focused_window();
+
+        assert!(is_hidden(9112));
+        assert!(!is_hidden(9111));
+
+        forget_hidden(&[9111, 9112]);
+    }
+
+    #[test]
+    fn hiding_shadowed_windows_twice_changes_nothing() {
+        let mut container = stack_ready_to_reveal(9121, 9122);
+
+        container.show_focused_window();
+        container.hide_shadowed_windows();
+        container.hide_shadowed_windows();
+
+        let hidden = crate::HIDDEN_HWNDS.lock().clone();
+        assert_eq!(
+            hidden.iter().filter(|hwnd| **hwnd == 9122).count(),
+            1,
+            "the hidden set records a window once however many times it is hidden"
+        );
+        assert!(!hidden.contains(&9121));
+
+        forget_hidden(&[9121, 9122]);
+    }
+
+    #[test]
+    fn a_minimized_or_floating_window_is_never_shadowed() {
+        let mut container = Container::default();
+        container.add_window(Window::from(9131));
+        container.add_window(Window::from(9132));
+        container.add_window(Window::from(9133));
+        container.windows_mut()[1].set_minimized();
+        container.windows_mut()[2].set_floating(Rect::default());
+        container.focus_window_by_hwnd(9131);
+        forget_hidden(&[9131, 9132, 9133]);
+
+        container.hide_shadowed_windows();
+
+        assert!(!is_hidden(9131), "the shown window");
+        assert!(
+            !is_hidden(9132),
+            "a minimized window is off screen already and its visibility is not the stack's"
+        );
+        assert!(
+            !is_hidden(9133),
+            "a floating window is not part of the stack for display purposes"
+        );
+
+        forget_hidden(&[9131, 9132, 9133]);
     }
 
     #[test]
