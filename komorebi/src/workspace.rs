@@ -3844,17 +3844,27 @@ impl Workspace {
     /// it. Nothing is removed from a container here, which is why an emptied container can no
     /// longer appear as a side effect of floating a window.
     pub fn new_floating_window(&mut self) -> eyre::Result<()> {
-        if let Some(presented) = self.presented_window() {
-            self.leave_presentation(presented.hwnd)?;
-        } else if self.is_monocle() {
-            self.reintegrate_monocle_container()?;
-        }
-
         let hwnd = self
             .focused_container()
             .and_then(Container::focused_window)
             .ok_or_eyre("there is no window")?
             .hwnd;
+
+        self.float_managed_window(hwnd)
+    }
+
+    /// Float one named window, leaving any presentation or monocle first.
+    ///
+    /// The caller names the window because "the window the user is looking at" and "the window
+    /// the model has focused" are two different questions, and a reveal or a raise which produced
+    /// no focus event is enough to make them disagree. A command which asked one of them and then
+    /// acted on the other would float one window and report on another.
+    pub fn float_managed_window(&mut self, hwnd: isize) -> eyre::Result<()> {
+        if let Some(presented) = self.presented_window() {
+            self.leave_presentation(presented.hwnd)?;
+        } else if self.is_monocle() {
+            self.reintegrate_monocle_container()?;
+        }
 
         let current_rect = WindowsApi::window_rect(hwnd).unwrap_or_default();
 
@@ -7135,6 +7145,47 @@ mod tests {
         }
 
         workspace
+    }
+
+    #[test]
+    fn the_floating_command_subject_is_the_window_which_was_just_floated() {
+        // A container which draws one window at a time and holds three of them: floating the one
+        // on top reveals another, and the reveal is what used to leave the ring focus - and so the
+        // subject of every floating command - on the window which appeared underneath.
+        let mut workspace = workspace_with_containers(&[3]);
+        workspace.focus_container(0);
+        workspace.record_focused_window(2);
+
+        workspace.float_window(2, floating_rect(100)).unwrap();
+
+        // The reveal happens here, as an uncloak the model hears back about.
+        workspace.record_focused_window(0);
+        assert_eq!(
+            workspace.floating_geometry_subject().map(|w| w.hwnd),
+            Some(0),
+            "the revealed window is the subject, which is the defect"
+        );
+
+        // What komorebi's own raise of the floated window records.
+        workspace.record_focused_window(2);
+
+        let subject = workspace.floating_geometry_subject().unwrap();
+        assert_eq!(subject.hwnd, 2);
+        assert_eq!(subject.placement, ManagedPlacement::Floating);
+        assert_eq!(
+            subject.floating_geometry(None),
+            Ok(floating_rect(100)),
+            "the floated window is what a floating move or resize acts on"
+        );
+
+        // And the container still draws the stored window it revealed, because the ring focus
+        // being on a floating window is exactly when the shown window falls back.
+        assert_eq!(
+            workspace.containers()[0]
+                .focused_visible_stored_window()
+                .map(|window| window.hwnd),
+            Some(0)
+        );
     }
 
     #[test]

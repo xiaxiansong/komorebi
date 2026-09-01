@@ -174,8 +174,35 @@ focused window in a container being destroyed: it is dealt out like the rest, th
 of whichever container received it and focused there, so the window being worked on stays the window
 being worked on.
 
+**`komorebic merge-container <direction>` removes one by joining two.** Every window of the
+container in that direction moves into the focused container, underneath what it is already
+showing, and the neighbour is destroyed - so its slot is released through exactly the same
+expansion the ordinary deletion path uses, and the focused container, which borders it, is usually
+what grows over it. Both containers have to be active: a hidden container owns no slot, so there is
+no direction in which it lies. This is deliberately not `komorebic stack <direction>`, which moves
+one window into a neighbouring container and leaves both containers standing.
+
 Two rules hold throughout, and are checked by `validate_invariants`: a workspace never holds more
 containers than windows, and never holds no container at all while it holds a window.
+
+## Walking a focus history
+
+Every container keeps its windows in most-recently-used order and every workspace keeps its
+containers the same way. Those two histories answer which window to focus when the current one goes
+away, and `komorebic cycle-window-history` and `komorebic cycle-container-history` let the user walk
+them directly - the first raising the window it lands on to the top of its container, the second
+moving the focus to the container it lands on.
+
+Walking a history does not reorder it. A walk which recorded every entry it visited would put that
+entry at the front, so the next step would come straight back to where the walk started and the
+third entry would be unreachable; this is the same reason `Alt+Tab` holds its order until the key is
+released. Each walk holds a cursor into the history it is reading, the focus it asks for is the one
+focus that history does not record, and any other focus ends the walk and is recorded normally.
+The cursor is runtime state and never reaches a state document: it describes a key somebody is
+still pressing rather than anything about the arrangement.
+
+The stack *does* change under `cycle-window-history`, because the window walked to is raised to the
+top of its container - that is what makes the container draw it.
 
 ## Configuration
 
@@ -259,3 +286,11 @@ randomized sequences.
   moved it to the container which expanded.
 - A manual split divides the largest slot and takes a window nobody is looking at, where upstream
   split the focused container and took the window it was showing.
+- Dragging a floating window with the mouse records the rectangle it was dropped at. Upstream
+  measured every drag of a managed window against the arrangement and turned it into a container
+  swap or a container resize, which a floating window has no slot to be measured against.
+- `resize-edge` only ever moves a boundary two active containers share. Upstream redirected it at
+  the focused floating window whenever the workspace was on its floating layer; in this model a
+  floating window is resized by `resize-floating-window` and by nothing else, and a hidden
+  container - which owns no slot, so it shares no boundary - is refused rather than given a resize
+  adjustment nothing would apply.

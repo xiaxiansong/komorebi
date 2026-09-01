@@ -552,6 +552,15 @@ impl WindowManager {
             WindowManagerEvent::Raise(window) => {
                 window.focus(false)?;
                 self.has_pending_raise_op = false;
+
+                // A raise is komorebi putting one of its own windows in front. Win32 only reports
+                // a focus change when the foreground window actually changes, so raising the
+                // window which already holds the foreground produces no event at all and the model
+                // would keep whatever focus arrived from the reveal underneath it - which is how a
+                // window the user has just floated ends up not being the window the floating
+                // commands act on. Recording it here is what keeps the two in agreement.
+                self.focused_workspace_mut()?
+                    .record_focused_window(window.hwnd);
             }
             WindowManagerEvent::Destroy(_, window) => {
                 if let Some((monitor_idx, workspace_idx)) =

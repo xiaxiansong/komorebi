@@ -2820,22 +2820,28 @@ window which has been blown up to the size of the work area by that arm is pinne
 `clamp_position` in every direction, and `move-floating-window` correctly answers `no-op`. The
 `Win+方向键` bindings themselves reach komorebi; the log shows the commands arriving.
 
-- [ ] 23A: a drag of a floating window is a change to that window's own rectangle. `MoveResizeEnd`
-  records the observed rectangle, clamped back into the work area, and never enters the container
-  move/swap/resize path; `resize_window` loses its floating arm, because a container resize and a
-  floating resize are two commands in this model and only one of them may move a floating window.
-- [ ] 23B: `toggle-float` leaves a window with a rectangle it can be moved from - a maximized window
-  is restored before it is centred, and the recorded rectangle is clamped into the work area.
-- [ ] 23C: `merge-container <direction>`: the windows of the neighbouring container move into the
+- [x] 23A: a drag of a floating window is a change to that window's own rectangle. `MoveResizeEnd`
+  records the observed rectangle, pulled back into the work area only when the drag left the window
+  out of reach, and never enters the container move/swap/resize path; `resize_window` loses its
+  floating arm, because a container resize and a floating resize are two commands in this model and
+  only one of them may move a floating window.
+- [x] 23B: `toggle-float` leaves a window with a rectangle it can be moved from - a window Win32
+  still has maximized is restored before it is centred - and a container resize refuses a hidden
+  container, which owns no slot and so shares no boundary.
+- [x] 23C: `merge-container <direction>`: the windows of the neighbouring container move into the
   focused container, the neighbour is destroyed and its slot is absorbed by the ordinary deletion
   path.
-- [ ] 23D: history cycling which does not rewrite the history it walks:
-  `cycle-container-window previous|next` over the focused container's window MRU, raising the
-  selected window to the top of the stack, and `cycle-focus-container previous|next` over the
+- [x] 23D: history cycling which does not rewrite the history it walks:
+  `cycle-window-history previous|next` over the focused container's window MRU, raising the
+  selected window to the top of the stack, and `cycle-container-history previous|next` over the
   workspace's container MRU. A cursor walks the history; any focus which does not come from these
   commands resets it.
-- [ ] 23E: the AutoHotkey keymap, the panel and the documentation.
-- [ ] 23F: build, deploy and verify on the live desktop.
+- [x] 23E: the AutoHotkey keymap, the panel and the documentation.
+- [x] 23F: `toggle-float` acts on one window, decided once. Found on the live desktop after 23A-23E
+  were deployed: the model's focused window and the desktop's foreground window disagree after a
+  float, so every floating command answered `NotFloating` and a second `toggle-float` floated
+  instead of unfloating.
+- [x] 23G: build, deploy and verify on the live desktop.
 
 Planned files: `komorebi/src/process_event.rs`, `komorebi/src/window_manager.rs`,
 `komorebi/src/workspace.rs`, `komorebi/src/container.rs`, `komorebi/src/core/mod.rs`,
@@ -3389,3 +3395,52 @@ This list is updated from actual diffs, not treated as permission to change ever
   run to run - nine on the unchanged tree, five with this change - which is what says they are
   scheduling. All three were verified on the live desktop after deployment, on `fbc05192`, and the
   desktop ends where it began.
+- 2026-09-01: Phase 23 turn. Four reports, and the audit which opened the turn read the runtime
+  before it read the source: the log had `resizing with mouse` for every drag of a floating window,
+  and a live `GetWindowRect` probe found two of the user's floating windows entirely below a
+  2160-tall screen while the model still held the centred rectangle it had given them. That is one
+  chain and it explains all three floating symptoms. `MoveResizeEnd` handled every managed window
+  with the tiling path, measuring the drag against `latest_layout[focused_container_idx]` - which
+  for a floating window is another container's rectangle or nothing - so `is_move` came out false
+  and the meaningless delta became `resize_window` calls; `toggle_float` sets
+  `workspace.layer = Floating`, and `resize_window`'s floating arm then applied that delta straight
+  to the window, where `(Up, Decrease)` is `rect.top += delta`. That is how a window walks off the
+  bottom of the screen a drag at a time. Both halves are gone: the drag records the rectangle it was
+  dropped at, and a container resize no longer has any way to reach a floating window. The clamp for
+  a dropped rectangle is deliberately the laxer of the two - a window dropped half off an edge is a
+  placement, and moving it back would be the jump the fix is about - while the movement commands
+  keep the containment rule the task specifies.
+
+  The keymap is the fourth report and it settled a rule rather than a list: `Alt` is the model,
+  `Shift` reverses or takes the whole container, `Ctrl` is the floating window, and the arrow keys
+  never meet `Win`. Two commands had to exist for it. `merge-container <direction>` is built on the
+  removal path which already exists - the only thing a merge changes is that one container is named
+  as the recipient instead of the arrangement choosing several - so the stack order, both histories,
+  the slot release and the focus are the operations already tested. `cycle-window-history` and
+  `cycle-container-history` walk a most-recently-used list without rewriting it, which is the whole
+  design: a walk which recorded each entry it visited would return to its starting point on the
+  second step. Each level holds a cursor, the focus the walk asks for is the one focus that level
+  does not record, and any other focus ends the walk.
+
+  The turn's most interesting defect was found after 23A-23E were built, tested and deployed, by
+  running the commands on the live desktop rather than by reading the code again: `toggle-float`
+  decided its branch from `WindowsApi::foreground_window()` and then acted on the model's focused
+  window. Those disagree exactly when komorebi reveals a window underneath the one being floated -
+  the uncloak records the revealed window - so the floating commands' subject was the wrong window
+  and answered `NotFloating`, and pressing `Alt+F` twice floated rather than unfloated. The command
+  now resolves one window once. Its companion fix is in the `Raise` handler: Win32 reports a focus
+  change only when the foreground window actually changes, so raising the window which already has
+  it produces no event and leaves the model behind; the raise records the focus itself.
+
+  komorebi 570 -> 588 passing on the serial runner, fmt clean, Clippy clean apart from the
+  pre-existing `items after a test module`. Verified on the live desktop after deployment: the
+  history walk stepped three times with the container history unchanged and the stack reordered
+  each time; `create-container` then `merge-container left` left one container holding four windows
+  across the whole 3816-wide work area; `toggle-float` gave a window 1400x1050 centred and
+  `move-floating-window` / `resize-floating-window` moved and resized it by the DPI-scaled delta;
+  and a synthesized title-bar drag of a floating window moved it by exactly the drag, updated
+  `floating_rect` to match, left the tiled slot untouched and produced no `resizing with mouse`.
+  The desktop ends where it began. One thing this turn could not do: the commits were blocked
+  part-way by the 1Password SSH agent, whose vault locked - which is itself a symptom of the bug,
+  since the 1Password window was one of the two this defect had pushed off the bottom of the
+  screen. It was moved back on screen to unblock signing.

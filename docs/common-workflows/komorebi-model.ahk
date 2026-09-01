@@ -160,6 +160,18 @@ ResizeFloating(Edge, Sizing) {
 }
 
 ; ============================================================================
+; 键位约定
+;
+;   Alt          模型本身的操作
+;   Alt+Shift    反向、强化，或“整个容器”的版本
+;   Alt+Ctrl     浮动窗口
+;   方向键       容器之间的窗口，以及容器边界
+;   H J K L      左 下 上 右
+;
+; 方向键一律不与 Win 组合，因为 Win+方向键是 Windows 自带的贴靠快捷键。
+; ============================================================================
+
+; ============================================================================
 ; 窗口管理器：启动、停止、重启、配置、暂停与接管
 ; ============================================================================
 
@@ -171,10 +183,9 @@ ResizeFloating(Edge, Sizing) {
 !u::Komorebic("suspend-window")                   ; 暂停接管当前窗口
 !+u::Komorebic("resume-window")                   ; 恢复接管窗口（按新窗口重新处理）
 !i::ToggleShortcutPanel()                         ; 显示 / 隐藏快捷键面板
-!/::ToggleShortcutPanel()                         ; 面板的第二个入口
 
 ; ============================================================================
-; 布局与焦点
+; 布局与聚焦
 ; ============================================================================
 
 !y::Komorebic("cycle-layout next")                ; 循环到下一个布局
@@ -185,52 +196,76 @@ ResizeFloating(Edge, Sizing) {
 !k::Komorebic("focus up")                         ; 聚焦上方容器
 !l::Komorebic("focus right")                      ; 聚焦右侧容器
 
-!+h::Komorebic("move left")                       ; 与左侧容器交换
-!+j::Komorebic("move down")                       ; 与下方容器交换
-!+k::Komorebic("move up")                         ; 与上方容器交换
-!+l::Komorebic("move right")                      ; 与右侧容器交换
+!+h::Komorebic("move left")                       ; 与左侧容器交换位置
+!+j::Komorebic("move down")                       ; 与下方容器交换位置
+!+k::Komorebic("move up")                         ; 与上方容器交换位置
+!+l::Komorebic("move right")                      ; 与右侧容器交换位置
 
-!Left::Komorebic("stack left")                    ; 把当前窗口并入左侧容器
-!Down::Komorebic("stack down")                    ; 把当前窗口并入下方容器
-!Up::Komorebic("stack up")                        ; 把当前窗口并入上方容器
-!Right::Komorebic("stack right")                  ; 把当前窗口并入右侧容器
+; ============================================================================
+; 方向键：把窗口送进某个容器，或把两个容器合成一个
+;
+; Alt+方向键        只移动当前聚焦的那一个窗口，两个容器都还在。
+; Alt+Shift+方向键  把该方向整个容器的窗口并进当前容器，那个容器随之消失，
+;                   它的槽位按正常的删除扩张规则交还给邻居。
+; ============================================================================
+
+!Left::Komorebic("stack left")                    ; 当前窗口并入左侧容器
+!Down::Komorebic("stack down")                    ; 当前窗口并入下方容器
+!Up::Komorebic("stack up")                        ; 当前窗口并入上方容器
+!Right::Komorebic("stack right")                  ; 当前窗口并入右侧容器
+
+!+Left::Komorebic("merge-container left")         ; 与左侧容器融合
+!+Down::Komorebic("merge-container down")         ; 与下方容器融合
+!+Up::Komorebic("merge-container up")             ; 与上方容器融合
+!+Right::Komorebic("merge-container right")       ; 与右侧容器融合
+
+; ============================================================================
+; 聚焦历史：在“最近使用过的顺序”里前后走动
+;
+; 走动本身不改写它所走的那份历史 —— 一改写，第二下就会退回起点，第三个窗口
+; 永远走不到；这也是 Windows 的 Alt+Tab 在松手之前不排序的原因。停止走动
+; （任何别的聚焦）之后，历史照常记录。
+; ============================================================================
+
+![::Komorebic("cycle-window-history previous")     ; 容器内：走向较近使用的窗口，并提到最上层
+!]::Komorebic("cycle-window-history next")         ; 容器内：走向较早使用的窗口，并提到最上层
+!+[::Komorebic("cycle-container-history previous") ; 工作区：走向较近使用的容器
+!+]::Komorebic("cycle-container-history next")     ; 工作区：走向较早使用的容器
 
 !n::Komorebic("raise-next-stack-window")          ; 把堆栈中下一层窗口提到最高并聚焦
 
 ; ============================================================================
-; 窗口状态：浮动、最大化、全屏、最小化、关闭与恢复
+; 窗口状态：浮动、最大化、全屏、最小化与关闭
 ; ============================================================================
 
-!t::Komorebic("toggle-float")                     ; Stored / Floating 切换
-!+t::Komorebic("toggle-maximize")                 ; 最大化 / 取消最大化
-!^t::Komorebic("toggle-fullscreen")               ; 全屏 / 退出全屏
-!q::Komorebic("close")                            ; 关闭当前窗口
+!f::Komorebic("toggle-float")                     ; Stored / Floating 切换
+!+f::Komorebic("toggle-maximize")                 ; 最大化 / 取消最大化
+!^f::Komorebic("toggle-fullscreen")               ; 全屏 / 退出全屏
+!w::Komorebic("close")                            ; 关闭当前窗口
 !m::Komorebic("minimize")                         ; 最小化当前窗口
 !+m::Komorebic("restore-last-minimized-window")   ; 恢复本工作区最后最小化的窗口
 
 ; ============================================================================
-; 浮动窗口：独立移动
+; 浮动窗口：移动与按边缘缩放
+;
 ; 只对当前聚焦的浮动窗口生效，不改变任何容器、槽位或相邻窗口。
+; H J K L 是四个方向，正上方一排的 Y U I O 是同样四个方向的“收”。
 ; ============================================================================
 
-#Left::MoveFloating("left")                       ; 浮动窗口左移
-#Down::MoveFloating("down")                       ; 浮动窗口下移
-#Up::MoveFloating("up")                           ; 浮动窗口上移
-#Right::MoveFloating("right")                     ; 浮动窗口右移
+!^h::MoveFloating("left")                         ; 浮动窗口左移
+!^j::MoveFloating("down")                         ; 浮动窗口下移
+!^k::MoveFloating("up")                           ; 浮动窗口上移
+!^l::MoveFloating("right")                        ; 浮动窗口右移
 
-; ============================================================================
-; 浮动窗口：按边缘缩放
-; Shift 表示该边向外扩，Ctrl 表示该边向内收。
-; ============================================================================
+!^+h::ResizeFloating("left", "increase")          ; 左边缘向左扩
+!^+j::ResizeFloating("down", "increase")          ; 下边缘向下扩
+!^+k::ResizeFloating("up", "increase")            ; 上边缘向上扩
+!^+l::ResizeFloating("right", "increase")         ; 右边缘向右扩
 
-#+Left::ResizeFloating("left", "increase")        ; 左边缘向左扩
-#^Left::ResizeFloating("left", "decrease")        ; 左边缘向右收
-#+Right::ResizeFloating("right", "increase")      ; 右边缘向右扩
-#^Right::ResizeFloating("right", "decrease")      ; 右边缘向左收
-#+Up::ResizeFloating("up", "increase")            ; 上边缘向上扩
-#^Up::ResizeFloating("up", "decrease")            ; 上边缘向下收
-#+Down::ResizeFloating("down", "increase")        ; 下边缘向下扩
-#^Down::ResizeFloating("down", "decrease")        ; 下边缘向上收
+!^+y::ResizeFloating("left", "decrease")          ; 左边缘向右收
+!^+u::ResizeFloating("down", "decrease")          ; 下边缘向上收
+!^+i::ResizeFloating("up", "decrease")            ; 上边缘向下收
+!^+o::ResizeFloating("right", "decrease")         ; 右边缘向左收
 
 ; ============================================================================
 ; 活动容器尺寸：移动一条逻辑共享边
@@ -247,19 +282,18 @@ ResizeFloating(Edge, Sizing) {
 !^+Down::Komorebic("resize-edge down decrease")   ; 下边界内收
 
 ; ============================================================================
-; 容器：手动创建与销毁
+; 容器：手动增减
+;
+; Alt+X 切分当前最大的活动槽位，新容器领走工作区聚焦历史里“次新且不在任何
+; 容器最上层”的那个窗口；Alt+Z 正好是它的逆操作。两者都不改变焦点窗口。
 ; ============================================================================
 
-; 增加容器：切分当前最大的活动槽位，新容器领走工作区聚焦历史里"次新且不在任何
-; 容器最上层"的那个窗口。焦点不动。
-!c::Komorebic("create-container")                 ; 自动方向切分出新容器
-!+c::Komorebic("create-container left-right")     ; 强制左右切分
-!^c::Komorebic("create-container top-bottom")     ; 强制上下切分
+!x::Komorebic("create-container")                 ; 增加一个容器（自动方向切分）
+!+x::Komorebic("create-container left-right")     ; 增加一个容器（强制左右切分）
+!^x::Komorebic("create-container top-bottom")     ; 增加一个容器（强制上下切分）
 
-; 减少容器：Alt+D 销毁"最新建立"的容器，正好是 Alt+C 的逆操作；要销毁当前聚焦
-; 的容器请用 Alt+Shift+D。两者都把窗口分发给其余容器，都不改变焦点窗口。
-!d::Komorebic("destroy-container")                ; 销毁最新建立的容器并分发窗口
-!+d::Komorebic("destroy-focused-container")       ; 销毁当前聚焦的容器并分发窗口
+!z::Komorebic("destroy-container")                ; 减少一个容器（销毁最新建立的那个）
+!+z::Komorebic("destroy-focused-container")       ; 销毁当前聚焦的容器并分发窗口
 
 ; ============================================================================
 ; 工作区：切换、新建、删除、重排
@@ -274,13 +308,13 @@ ResizeFloating(Edge, Sizing) {
 !7::Komorebic("focus-workspace 6")                ; 切换到第 7 个工作区
 !8::Komorebic("focus-workspace 7")                ; 切换到第 8 个工作区
 
-!w::Komorebic("new-workspace")                    ; 在当前显示器新建工作区
-!+w::Komorebic("merge-workspace")                 ; 删除当前工作区并合并到相邻工作区
+!a::Komorebic("new-workspace")                    ; 在当前显示器新建工作区
+!+a::Komorebic("merge-workspace")                 ; 删除当前工作区并合并到相邻工作区
 
-![::Komorebic("cycle-move-workspace previous")    ; 当前工作区左移一位
-!]::Komorebic("cycle-move-workspace next")        ; 当前工作区右移一位
-!+[::PromptThen("把当前工作区移动到第几个位置？（从 0 开始）", "move-workspace-to-index {1}")
-!+]::PromptThen("与第几个位置的工作区交换？（从 0 开始）", "swap-workspace-with-index {1}")
+!^[::Komorebic("cycle-move-workspace previous")   ; 当前工作区左移一位
+!^]::Komorebic("cycle-move-workspace next")       ; 当前工作区右移一位
+!^+[::PromptThen("把当前工作区移动到第几个位置？（从 0 开始）", "move-workspace-to-index {1}")
+!^+]::PromptThen("与第几个位置的工作区交换？（从 0 开始）", "swap-workspace-with-index {1}")
 
 ; ============================================================================
 ; 把窗口 / 容器送到别处
@@ -349,23 +383,27 @@ global ShortcutTable := [
     ["Alt+P", "全局暂停 / 恢复", "toggle-pause"],
     ["Alt+U / Alt+Shift+U", "暂停接管 / 恢复接管窗口", "suspend-window / resume-window"],
     ["Alt+Y / Alt+Shift+Y", "循环布局", "cycle-layout next / previous"],
-    ["Alt+H J K L", "上下左右聚焦", "focus"],
-    ["Alt+Shift+H J K L", "上下左右交换容器", "move"],
-    ["Alt+方向键", "把窗口并入该方向的容器", "stack"],
+    ["Alt+H J K L", "聚焦左下上右容器", "focus"],
+    ["Alt+Shift+H J K L", "与该方向的容器交换位置", "move"],
+    ["Alt+方向键", "把当前窗口移入该方向的容器", "stack"],
+    ["Alt+Shift+方向键", "把该方向的容器与当前容器融合", "merge-container"],
+    ["Alt+[ 与 Alt+]", "在容器的窗口聚焦历史中走动并提到最上层", "cycle-window-history"],
+    ["Alt+Shift+[ 与 Alt+Shift+]", "在工作区的容器聚焦历史中走动", "cycle-container-history"],
     ["Alt+N", "把堆栈下一层窗口提到最高", "raise-next-stack-window"],
-    ["Alt+T", "Stored / Floating 切换", "toggle-float"],
-    ["Alt+Shift+T / Alt+Ctrl+T", "最大化 / 全屏", "toggle-maximize / toggle-fullscreen"],
-    ["Alt+Q / Alt+M / Alt+Shift+M", "关闭 / 最小化 / 恢复最小化", "close / minimize / restore-last-minimized-window"],
-    ["Win+方向键", "移动浮动窗口", "move-floating-window"],
-    ["Win+Shift 或 Ctrl+方向键", "浮动窗口按边缘扩 / 收", "resize-floating-window"],
+    ["Alt+F", "Stored / Floating 切换", "toggle-float"],
+    ["Alt+Shift+F / Alt+Ctrl+F", "最大化 / 全屏", "toggle-maximize / toggle-fullscreen"],
+    ["Alt+W / Alt+M / Alt+Shift+M", "关闭 / 最小化 / 恢复最小化", "close / minimize / restore-last-minimized-window"],
+    ["Alt+Ctrl+H J K L", "移动浮动窗口", "move-floating-window"],
+    ["Alt+Ctrl+Shift+H J K L", "浮动窗口对应边缘外扩", "resize-floating-window ... increase"],
+    ["Alt+Ctrl+Shift+Y U I O", "浮动窗口对应边缘内收", "resize-floating-window ... decrease"],
     ["Alt+Ctrl(+Shift)+方向键", "活动容器边界外扩 / 内收", "resize-edge"],
-    ["Alt+C / Alt+Shift+C / Alt+Ctrl+C", "自动 / 左右 / 上下创建容器（切分最大槽位）", "create-container"],
-    ["Alt+D", "销毁最新建立的容器并分发窗口", "destroy-container"],
-    ["Alt+Shift+D", "销毁当前聚焦的容器并分发窗口", "destroy-focused-container"],
+    ["Alt+X / Alt+Shift+X / Alt+Ctrl+X", "增加容器：自动 / 左右 / 上下切分", "create-container"],
+    ["Alt+Z", "减少容器：销毁最新建立的那个", "destroy-container"],
+    ["Alt+Shift+Z", "销毁当前聚焦的容器并分发窗口", "destroy-focused-container"],
     ["Alt+1..8", "切换工作区", "focus-workspace"],
-    ["Alt+W / Alt+Shift+W", "新建 / 删除并合并工作区", "new-workspace / merge-workspace"],
-    ["Alt+[ 与 Alt+]", "工作区左移 / 右移", "cycle-move-workspace"],
-    ["Alt+Shift+[ 与 Alt+Shift+]", "工作区移动到 / 交换指定位置", "move-workspace-to-index / swap-workspace-with-index"],
+    ["Alt+A / Alt+Shift+A", "新建 / 删除并合并工作区", "new-workspace / merge-workspace"],
+    ["Alt+Ctrl+[ 与 Alt+Ctrl+]", "工作区左移 / 右移", "cycle-move-workspace"],
+    ["Alt+Ctrl+Shift+[ 与 ]", "工作区移动到 / 交换指定位置", "move-workspace-to-index / swap-workspace-with-index"],
     ["Alt+Shift+1..4 / Alt+Ctrl+1..4", "容器送到工作区，跟随 / 不跟随", "move-to-workspace / send-to-workspace"],
     ["Alt+G / Alt+Shift+G", "窗口送到工作区 ID，不跟随 / 跟随", "move-to-workspace-id"],
     ["Alt+B / Alt+Shift+B", "窗口送到容器 ID，不跟随 / 跟随", "move-to-container-id"],
@@ -373,7 +411,7 @@ global ShortcutTable := [
     ["Alt+Shift+F1..F3", "窗口送到显示器", "move-window-to-monitor"],
     ["Alt+Ctrl+F1..F3", "容器送到显示器", "move-to-monitor"],
     ["Alt+Ctrl+Shift+F1..F3", "工作区送到显示器", "move-workspace-to-monitor"],
-    ["Alt+I 或 Alt+/", "显示 / 隐藏本面板", "（由本脚本提供，托盘菜单也能打开）"]
+    ["Alt+I", "显示 / 隐藏本面板", "（由本脚本提供，托盘菜单也能打开）"]
 ]
 
 ToggleShortcutPanel() {
@@ -387,12 +425,12 @@ ToggleShortcutPanel() {
     ShortcutPanel := Gui("+AlwaysOnTop +ToolWindow -MinimizeBox", "komorebi 快捷键")
     ShortcutPanel.SetFont("s10", "Microsoft YaHei UI")
 
-    list := ShortcutPanel.Add("ListView", "w900 r30", ["快捷键", "作用", "komorebic 命令"])
+    list := ShortcutPanel.Add("ListView", "w980 r34", ["快捷键", "作用", "komorebic 命令"])
     for entry in ShortcutTable
         list.Add(, entry[1], entry[2], entry[3])
 
-    list.ModifyCol(1, 260)
-    list.ModifyCol(2, 300)
+    list.ModifyCol(1, 280)
+    list.ModifyCol(2, 360)
     list.ModifyCol(3, 320)
 
     ShortcutPanel.OnEvent("Close", (*) => CloseShortcutPanel())

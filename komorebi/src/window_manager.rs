@@ -3951,27 +3951,36 @@ impl WindowManager {
 
     #[tracing::instrument(skip(self))]
     pub fn toggle_float(&mut self, force_float: bool) -> eyre::Result<()> {
-        let hwnd = WindowsApi::foreground_window()?;
+        let foreground = WindowsApi::foreground_window()?;
         let workspace = self.focused_workspace_mut()?;
         if workspace.monocle_container().is_some() {
             tracing::warn!("ignoring toggle-float command while workspace has a monocle container");
             return Ok(());
         }
 
-        let mut is_floating_window = false;
+        // One window, decided once. The desktop's answer wins when this workspace manages that
+        // window, because it is the window the user pressed the key at; the model's focused window
+        // is the fallback for a foreground window komorebi does not manage. Deciding the branch
+        // from one of these and then acting on the other is how the command came to float one
+        // window and answer about another.
+        let hwnd = if workspace.contains_managed_window(foreground) {
+            foreground
+        } else {
+            workspace
+                .focused_container()
+                .and_then(Container::focused_managed_window)
+                .map(|window| window.hwnd)
+                .ok_or_eyre("there is no window to float")?
+        };
 
-        for window in workspace.floating_windows() {
-            if window.hwnd == hwnd {
-                is_floating_window = true;
-            }
-        }
+        let is_floating_window = workspace.is_floating_window(hwnd);
 
         if is_floating_window && !force_float {
             workspace.layer = WorkspaceLayer::Tiling;
-            self.unfloat_window()?;
+            self.unfloat_window(hwnd)?;
         } else {
             workspace.layer = WorkspaceLayer::Floating;
-            self.float_window()?;
+            self.float_window(hwnd)?;
         }
 
         self.update_focused_workspace(is_floating_window, true)
@@ -3988,7 +3997,7 @@ impl WindowManager {
     }
 
     #[tracing::instrument(skip(self))]
-    pub fn float_window(&mut self) -> eyre::Result<()> {
+    pub fn float_window(&mut self, hwnd: isize) -> eyre::Result<()> {
         tracing::info!("floating window");
 
         let work_area = self.focused_monitor_work_area()?;
@@ -3996,11 +4005,9 @@ impl WindowManager {
         let toggle_float_placement = self.window_management_behaviour.toggle_float_placement;
 
         let workspace = self.focused_workspace_mut()?;
-        workspace.new_floating_window()?;
+        workspace.float_managed_window(hwnd)?;
 
-        let mut window = workspace
-            .focused_floating_window()
-            .ok_or_eyre("there is no floating window")?;
+        let mut window = Window::from(hwnd);
 
         // A window Win32 still has maximized cannot be given a rectangle: `SetWindowPos` leaves a
         // maximized window filling the work area, and a floating window the size of the work area
@@ -4036,11 +4043,11 @@ impl WindowManager {
     }
 
     #[tracing::instrument(skip(self))]
-    pub fn unfloat_window(&mut self) -> eyre::Result<()> {
+    pub fn unfloat_window(&mut self, hwnd: isize) -> eyre::Result<()> {
         tracing::info!("unfloating window");
 
         let workspace = self.focused_workspace_mut()?;
-        workspace.new_container_for_floating_window()
+        workspace.unfloat_window(hwnd)
     }
 
     #[tracing::instrument(skip(self))]
@@ -8026,7 +8033,7 @@ mod tests {
         }
 
         // Float the focused window
-        wm.float_window().ok();
+        wm.float_window(0).ok();
 
         {
             let workspace = wm.focused_workspace().unwrap();
@@ -8049,7 +8056,7 @@ mod tests {
             .unwrap()
             .focus_container_by_window(1)
             .unwrap();
-        wm.float_window().ok();
+        wm.float_window(1).ok();
 
         {
             let workspace = wm.focused_workspace().unwrap();
@@ -8068,7 +8075,7 @@ mod tests {
             .unwrap()
             .focus_container_by_window(2)
             .unwrap();
-        wm.float_window().ok();
+        wm.float_window(2).ok();
 
         {
             let workspace = wm.focused_workspace().unwrap();
@@ -8124,7 +8131,7 @@ mod tests {
         }
 
         // Should return an error when trying to float a non-existent window
-        let result = wm.float_window();
+        let result = wm.float_window(404);
         assert!(
             result.is_err(),
             "Expected an error when trying to float a non-existent window"
