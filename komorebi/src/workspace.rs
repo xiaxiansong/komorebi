@@ -4778,6 +4778,42 @@ mod tests {
         assert_eq!(workspace.containers().len(), 2);
     }
 
+    #[test]
+    fn focusing_a_floating_window_by_hwnd_makes_it_the_floating_command_subject() {
+        // What a click or an alt-tab onto a floating window arrives as. The window is owned by
+        // container 0 and the model is focused on container 1, which is the state the floating
+        // commands used to be offered: the subject was the tiled window and every one of them
+        // answered `NotFloating` about a window the user was looking at.
+        let mut workspace = workspace_with_containers(&[1, 1]);
+        workspace.float_window(0, floating_rect(100)).unwrap();
+        workspace.focus_container(1);
+
+        assert_eq!(
+            workspace.move_focused_floating_window(
+                OperationDirection::Right,
+                50,
+                floating_bounds(),
+                None
+            ),
+            Err(FloatingRejection::NotFloating)
+        );
+
+        workspace.focus_container_by_window(0).unwrap();
+
+        assert_eq!(
+            workspace.floating_geometry_subject().map(|w| w.hwnd),
+            Some(0)
+        );
+        assert_eq!(workspace.window_focus_history.iter().next(), Some(&0));
+
+        let change = workspace
+            .move_focused_floating_window(OperationDirection::Right, 50, floating_bounds(), None)
+            .unwrap();
+
+        assert_eq!(change.hwnd, 0);
+        assert_eq!(change.rect.left, floating_rect(100).left + 50);
+    }
+
     fn floating_bounds() -> FloatingBounds {
         FloatingBounds::new(work_area(1920, 1080))
     }

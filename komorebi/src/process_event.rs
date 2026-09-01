@@ -724,10 +724,18 @@ impl WindowManager {
                             self.update_focused_workspace(self.mouse_follows_focus, false)?;
                         }
                     }
-                    Some(idx) => {
-                        if let Some(_window) = workspace.floating_windows().get(idx) {
-                            workspace.layer = WorkspaceLayer::Floating;
-                        }
+                    Some(_) => {
+                        // A floating window is an ordinary member of a container in this model,
+                        // so a focus change onto one is a focus change like any other: the
+                        // container which owns it becomes the focused container, and both MRU
+                        // histories record the window. Only the layer used to be recorded here,
+                        // which is upstream's answer for a floating window nothing owned; it left
+                        // the model's focused window on whichever tiled window was focused before,
+                        // and that is the window the floating commands were then offered - which
+                        // is why they answered `NotFloating` about a window the user was looking
+                        // at and had just clicked.
+                        workspace.focus_container_by_window(window.hwnd)?;
+                        workspace.layer = WorkspaceLayer::Floating;
                     }
                 }
             }
@@ -1310,6 +1318,11 @@ impl WindowManager {
                     .iter()
                     .any(|w| w.hwnd == window.hwnd)
                 {
+                    // The same rule as the `FocusChange` handler: the container which owns the
+                    // floating window is the focused container, because in this model a floating
+                    // window has one. Recording only the layer here is what left an alt-tab onto
+                    // a floating window with the model still focused on a tiled one.
+                    workspace.focus_container_by_window(window.hwnd)?;
                     layer = WorkspaceLayer::Floating;
                 } else if !workspace.is_presented_window(window.hwnd) {
                     // If the window is the presented window do nothing, else we

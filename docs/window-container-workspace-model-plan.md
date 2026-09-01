@@ -2880,6 +2880,55 @@ strengthens, `Ctrl` means the floating window, and the arrow keys are never used
 | `Alt+A` / `Alt+Shift+A` | new workspace / delete and merge this workspace |
 | `Alt+I` | the shortcut panel; `Alt+/` is removed |
 
+### Phase 24 - The focus a floating window does not get, the border it leaves behind, and the second monitor
+
+Added on 2026-09-01 from live use and from a review the user asked for before taking this build to
+a two-monitor desk. Three reports; the audit which opened the turn found four causes, and all four
+are the same kind of defect: upstream code which reads a floating window the way upstream stored
+one, in a fork where a floating window is an ordinary member of a container.
+
+1. The floating move and resize keys answer `NotFloating` while the user is looking at the floating
+   window they just clicked. `process_event`'s `FocusChange` handler has two arms, and the floating
+   arm sets `workspace.layer = Floating` and nothing else - it never focuses the container which
+   owns the window. Upstream had nothing to focus, because a floating window was in a
+   workspace-level list. Here the model's focused container stays on whatever tiled container was
+   focused before, and `floating_geometry_subject` - which is deliberately the focused window and
+   only the focused window - correctly reports that this window is not floating. It is the wrong
+   window.
+2. A frame is left on the desktop after a floating window is dragged. `border_manager` gives each
+   container a border tracking `Container::focused_window`, which in this fork can be the
+   container's floating window; `handle_floating_borders` then creates a second border for that
+   same window and overwrites its entry in `WINDOWS_BORDERS`. Only the entry in that map receives
+   `EVENT_OBJECT_LOCATIONCHANGE`, so the floating border follows the drag and the container border
+   is stranded at the rectangle the window was dragged away from, with nothing inside it.
+3. Two monitors, first defect: `transfer_window` decides between "a container window" and "a
+   floating window" by asking whether the window has a container - and in this fork every managed
+   window has one, so the floating branch is unreachable and dragging a floating window to the
+   other monitor moves its whole container, tiled windows and all.
+4. Two monitors, second defect: arriving on a monitor by crossing its boundary focuses the
+   container at `cross_boundary_edge_index`, an index derived from the layout kind and the
+   container count. This fork's geometry authority is the ID-keyed logical slot map, which after a
+   split, an absorption or a manual resize does not agree with a fresh `layout.calculate`, and the
+   count passed in includes hidden containers while the arrangement was computed for the active
+   subset only. The index therefore names an arbitrary container. It never ran on the user's single
+   monitor and runs on every crossing on two.
+
+- [ ] 24A: a focus change onto a floating window is a focus change. The floating arm of
+  `FocusChange` focuses the container which owns the window, so both MRU histories record it and
+  the floating commands act on the window the user is looking at.
+- [ ] 24B: a container's border tracks the window the container draws in its slot
+  (`focused_visible_stored_window`), and a hidden container - which owns no slot - has no border at
+  all. A floating window keeps exactly one border, its own, which follows it.
+- [ ] 24C: a dragged floating window travels alone across a monitor boundary, and the rectangle it
+  was dropped at is recorded on the workspace which owns it rather than on whichever workspace
+  happens to be focused.
+- [ ] 24D: crossing a monitor boundary lands on the container whose slot is flush with the edge
+  being entered, chosen from the logical slots.
+- [ ] 24E: build, deploy and verify on the live desktop; documentation and this plan.
+
+Planned files: `komorebi/src/process_event.rs`, `komorebi/src/border_manager/mod.rs`,
+`komorebi/src/window_manager.rs`, `komorebi/src/workspace.rs`, `docs/window-model.md`, this plan.
+
 ## Provisional affected-file inventory
 
 This list is updated from actual diffs, not treated as permission to change every file.
