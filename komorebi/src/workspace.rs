@@ -2749,6 +2749,39 @@ impl Workspace {
         )
     }
 
+    /// The container to focus when a crossing arrives in this workspace moving `direction`.
+    ///
+    /// Arriving by moving `direction` means entering through the opposite edge: a focus which
+    /// moved Right came in over the left edge and belongs on the leftmost container. The answer
+    /// is read from the logical slots, which are this model's geometry authority. The layout's
+    /// own index order describes one freshly calculated arrangement of the active containers,
+    /// and a workspace which has been split, absorbed, resized or partly hidden since has moved
+    /// on from it - which is why an index derived from the layout kind and the container count
+    /// named an arbitrary container here.
+    ///
+    /// Hidden containers own no slot and so are never arrived on. A workspace with no active
+    /// container has no answer, and the crossing leaves its focus alone.
+    #[must_use]
+    pub fn edge_container_idx(&self, direction: OperationDirection) -> Option<usize> {
+        let slots = self
+            .logical_slots
+            .ordered(SlotOrder::for_direction(direction));
+
+        // `ordered` has already settled the secondary axis - top to bottom along a vertical
+        // edge, left to right along a horizontal one - and `min_by_key` keeps the first of
+        // equal keys, so the tie-break is that order rather than an arbitrary one.
+        let (id, _) = slots.into_iter().min_by_key(|(_, slot)| match direction {
+            // Entering over the right edge: the container whose slot reaches furthest right.
+            OperationDirection::Left => -slot.right(),
+            OperationDirection::Right => slot.left,
+            // Entering over the bottom edge.
+            OperationDirection::Up => -slot.bottom(),
+            OperationDirection::Down => slot.top,
+        })?;
+
+        self.container_idx_for_id(&id)
+    }
+
     pub fn new_idx_for_cycle_direction(&self, direction: CycleDirection) -> Option<usize> {
         Option::from(direction.next_idx(
             self.focused_container_idx(),
@@ -4812,6 +4845,79 @@ mod tests {
 
         assert_eq!(change.hwnd, 0);
         assert_eq!(change.rect.left, floating_rect(100).left + 50);
+    }
+
+    /// The slot the container at ring position `idx` currently occupies.
+    fn slot_at(workspace: &Workspace, idx: usize) -> LogicalRect {
+        workspace
+            .logical_slots
+            .get(&workspace.containers()[idx].id)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_crossing_arrives_on_the_container_at_the_edge_it_entered() {
+        // What focusing across a monitor boundary lands on. The arrangement here is whatever the
+        // layout gives three containers; the property is the same for any of them, which is why
+        // these assert the chosen container's slot rather than an index.
+        let mut workspace = workspace_with_containers(&[1, 1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        let entered_from_the_left = workspace
+            .edge_container_idx(OperationDirection::Right)
+            .unwrap();
+        assert_eq!(slot_at(&workspace, entered_from_the_left).left, 0);
+
+        let entered_from_the_right = workspace
+            .edge_container_idx(OperationDirection::Left)
+            .unwrap();
+        assert_eq!(slot_at(&workspace, entered_from_the_right).right(), 1920);
+
+        let entered_from_above = workspace
+            .edge_container_idx(OperationDirection::Down)
+            .unwrap();
+        assert_eq!(slot_at(&workspace, entered_from_above).top, 0);
+
+        let entered_from_below = workspace
+            .edge_container_idx(OperationDirection::Up)
+            .unwrap();
+        assert_eq!(slot_at(&workspace, entered_from_below).bottom(), 1080);
+    }
+
+    #[test]
+    fn a_crossing_never_arrives_on_a_container_which_owns_no_slot() {
+        let mut workspace = workspace_with_containers(&[1, 1]);
+        let area = work_area(1920, 1080);
+        workspace.record_logical_slots(area);
+
+        let leftmost = workspace
+            .edge_container_idx(OperationDirection::Right)
+            .unwrap();
+        let hidden = workspace.containers()[leftmost].id.clone();
+        let hwnd = workspace.containers()[leftmost].windows()[0].hwnd;
+
+        // Floating its only window hides that container: it keeps its windows and gives up its
+        // slot, and the neighbour expands over the area it was occupying.
+        workspace.float_window(hwnd, floating_rect(100)).unwrap();
+        workspace.record_logical_slots(area);
+        assert!(workspace.containers()[leftmost].is_hidden());
+
+        let arrival = workspace
+            .edge_container_idx(OperationDirection::Right)
+            .unwrap();
+        assert_ne!(workspace.containers()[arrival].id, hidden);
+        assert_eq!(slot_at(&workspace, arrival).left, 0);
+    }
+
+    #[test]
+    fn a_crossing_into_a_workspace_with_no_active_container_has_no_answer() {
+        let workspace = Workspace::default();
+
+        assert_eq!(
+            workspace.edge_container_idx(OperationDirection::Right),
+            None
+        );
     }
 
     fn floating_bounds() -> FloatingBounds {

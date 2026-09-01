@@ -2784,37 +2784,14 @@ impl WindowManager {
             if let Ok(focused_workspace) = self.focused_workspace_mut()
                 && focused_workspace.monocle_container().is_none()
             {
-                match direction {
-                    OperationDirection::Left => match focused_workspace.layout {
-                        Layout::Default(layout) => {
-                            let target_index = direction.cross_boundary_edge_index(
-                                layout,
-                                focused_workspace.containers().len(),
-                                focused_workspace.layout_flip,
-                            );
-                            focused_workspace.focus_container(target_index);
-                        }
-                        Layout::Custom(_) => {
-                            focused_workspace.focus_container(
-                                focused_workspace.containers().len().saturating_sub(1),
-                            );
-                        }
-                    },
-                    OperationDirection::Right => match focused_workspace.layout {
-                        Layout::Default(layout) => {
-                            let target_index = direction.cross_boundary_edge_index(
-                                layout,
-                                focused_workspace.containers().len(),
-                                focused_workspace.layout_flip,
-                            );
-                            focused_workspace.focus_container(target_index);
-                        }
-                        Layout::Custom(_) => {
-                            focused_workspace.focus_container(0);
-                        }
-                    },
-                    _ => {}
-                };
+                // The container whose slot is flush with the edge being entered, read from the
+                // logical slots rather than derived from the layout kind and the container count:
+                // those describe one freshly calculated arrangement, and this workspace may have
+                // been split, absorbed, resized or partly hidden since. A workspace with no active
+                // container has nothing to arrive on and keeps the focus it had.
+                if let Some(target_index) = focused_workspace.edge_container_idx(direction) {
+                    focused_workspace.focus_container(target_index);
+                }
             }
 
             return Ok(());
@@ -2838,37 +2815,14 @@ impl WindowManager {
                     cross_monitor_monocle_or_max = true;
                 }
             } else if focused_workspace.layer == WorkspaceLayer::Tiling {
-                match direction {
-                    OperationDirection::Left => match focused_workspace.layout {
-                        Layout::Default(layout) => {
-                            let target_index = direction.cross_boundary_edge_index(
-                                layout,
-                                focused_workspace.containers().len(),
-                                focused_workspace.layout_flip,
-                            );
-                            focused_workspace.focus_container(target_index);
-                        }
-                        Layout::Custom(_) => {
-                            focused_workspace.focus_container(
-                                focused_workspace.containers().len().saturating_sub(1),
-                            );
-                        }
-                    },
-                    OperationDirection::Right => match focused_workspace.layout {
-                        Layout::Default(layout) => {
-                            let target_index = direction.cross_boundary_edge_index(
-                                layout,
-                                focused_workspace.containers().len(),
-                                focused_workspace.layout_flip,
-                            );
-                            focused_workspace.focus_container(target_index);
-                        }
-                        Layout::Custom(_) => {
-                            focused_workspace.focus_container(0);
-                        }
-                    },
-                    _ => {}
-                };
+                // The container whose slot is flush with the edge being entered, read from the
+                // logical slots rather than derived from the layout kind and the container count:
+                // those describe one freshly calculated arrangement, and this workspace may have
+                // been split, absorbed, resized or partly hidden since. A workspace with no active
+                // container has nothing to arrive on and keeps the focus it had.
+                if let Some(target_index) = focused_workspace.edge_container_idx(direction) {
+                    focused_workspace.focus_container(target_index);
+                }
             }
         }
 
@@ -3011,37 +2965,14 @@ impl WindowManager {
             if let Ok(focused_workspace) = self.focused_workspace_mut()
                 && focused_workspace.monocle_container().is_none()
             {
-                match direction {
-                    OperationDirection::Left => match focused_workspace.layout {
-                        Layout::Default(layout) => {
-                            let target_index = direction.cross_boundary_edge_index(
-                                layout,
-                                focused_workspace.containers().len(),
-                                focused_workspace.layout_flip,
-                            );
-                            focused_workspace.focus_container(target_index);
-                        }
-                        Layout::Custom(_) => {
-                            focused_workspace.focus_container(
-                                focused_workspace.containers().len().saturating_sub(1),
-                            );
-                        }
-                    },
-                    OperationDirection::Right => match focused_workspace.layout {
-                        Layout::Default(layout) => {
-                            let target_index = direction.cross_boundary_edge_index(
-                                layout,
-                                focused_workspace.containers().len(),
-                                focused_workspace.layout_flip,
-                            );
-                            focused_workspace.focus_container(target_index);
-                        }
-                        Layout::Custom(_) => {
-                            focused_workspace.focus_container(0);
-                        }
-                    },
-                    _ => {}
-                };
+                // The container whose slot is flush with the edge being entered, read from the
+                // logical slots rather than derived from the layout kind and the container count:
+                // those describe one freshly calculated arrangement, and this workspace may have
+                // been split, absorbed, resized or partly hidden since. A workspace with no active
+                // container has nothing to arrive on and keeps the focus it had.
+                if let Some(target_index) = focused_workspace.edge_container_idx(direction) {
+                    focused_workspace.focus_container(target_index);
+                }
             }
 
             return Ok(());
@@ -3067,37 +2998,15 @@ impl WindowManager {
                             cross_monitor_monocle_or_max = true;
                         }
                     } else if focused_workspace.layer == WorkspaceLayer::Tiling {
-                        match direction {
-                            OperationDirection::Left => match focused_workspace.layout {
-                                Layout::Default(layout) => {
-                                    let target_index = direction.cross_boundary_edge_index(
-                                        layout,
-                                        focused_workspace.containers().len(),
-                                        focused_workspace.layout_flip,
-                                    );
-                                    focused_workspace.focus_container(target_index);
-                                }
-                                Layout::Custom(_) => {
-                                    focused_workspace.focus_container(
-                                        focused_workspace.containers().len().saturating_sub(1),
-                                    );
-                                }
-                            },
-                            OperationDirection::Right => match focused_workspace.layout {
-                                Layout::Default(layout) => {
-                                    let target_index = direction.cross_boundary_edge_index(
-                                        layout,
-                                        focused_workspace.containers().len(),
-                                        focused_workspace.layout_flip,
-                                    );
-                                    focused_workspace.focus_container(target_index);
-                                }
-                                Layout::Custom(_) => {
-                                    focused_workspace.focus_container(0);
-                                }
-                            },
-                            _ => {}
-                        };
+                        // The container whose slot is flush with the edge being entered, read from the
+                        // logical slots rather than derived from the layout kind and the container count:
+                        // those describe one freshly calculated arrangement, and this workspace may have
+                        // been split, absorbed, resized or partly hidden since. A workspace with no active
+                        // container has nothing to arrive on and keeps the focus it had.
+                        if let Some(target_index) = focused_workspace.edge_container_idx(direction)
+                        {
+                            focused_workspace.focus_container(target_index);
+                        }
                     }
                 }
             }
