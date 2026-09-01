@@ -1791,21 +1791,12 @@ impl WindowManager {
             .container_for_window(w_hwnd)
             .and_then(|c| origin_workspace.containers().iter().position(|cc| cc == c));
 
-        if let Some(origin_container_idx) = origin_container_idx {
-            // Moving normal container window
-            self.transfer_container(
-                (
-                    origin_monitor_idx,
-                    origin_workspace_idx,
-                    origin_container_idx,
-                ),
-                (
-                    target_monitor_idx,
-                    target_workspace_idx,
-                    target_container_idx,
-                ),
-            )?;
-        } else if origin_workspace.is_floating_window(w_hwnd) {
+        // A floating window is asked about first, and not by asking whether it has a container.
+        // Every managed window in this model has one, so the container question is answered yes
+        // for a floating window too, and answering it first is what sent a floating window's
+        // whole container - every tiled window in it included - to the other monitor when the
+        // user dragged one floating window there.
+        if origin_workspace.is_floating_window(w_hwnd) {
             // Moving floating window
             // There is no need to physically move the floating window between areas with
             // `move_to_area` because the user already did that, so we only need to transfer the
@@ -1820,10 +1811,24 @@ impl WindowManager {
 
                 target_workspace.adopt_managed_window(floating_window);
             }
+        } else if let Some(origin_container_idx) = origin_container_idx {
+            // Moving normal container window
+            self.transfer_container(
+                (
+                    origin_monitor_idx,
+                    origin_workspace_idx,
+                    origin_container_idx,
+                ),
+                (
+                    target_monitor_idx,
+                    target_workspace_idx,
+                    target_container_idx,
+                ),
+            )?;
         }
 
         // There are no separate monocle and maximized branches any more. Both are owned by a
-        // container in the ring like every other managed window, so the first branch above
+        // container in the ring like every other managed window, so the container branch above
         // already moves them, and the presentation travels with the window.
         Ok(())
     }
@@ -3241,8 +3246,28 @@ impl WindowManager {
     ///
     /// Nothing else changes: no container gains or loses a window, no slot is recomputed and no
     /// other window moves.
-    pub fn record_floating_drag(&mut self, hwnd: isize, dropped: Rect) -> eyre::Result<Rect> {
-        let bounds = FloatingBounds::new(self.focused_monitor_work_area()?);
+    ///
+    /// The rectangle is recorded on the workspace which owns the window and clamped to the work
+    /// area of the monitor that workspace is on, neither of which is always the focused one: a
+    /// drag which crossed a monitor boundary has already sent the window to the monitor it was
+    /// dropped on. A window which is not floating is left alone, which is what makes this safe to
+    /// offer for every drag.
+    pub fn record_floating_drag(
+        &mut self,
+        hwnd: isize,
+        dropped: Rect,
+    ) -> eyre::Result<Option<Rect>> {
+        let Some((monitor_idx, workspace_idx)) = self.floating_window_location(hwnd) else {
+            return Ok(None);
+        };
+
+        let work_area = self
+            .monitors()
+            .get(monitor_idx)
+            .ok_or_eyre("there is no monitor")?
+            .work_area_size;
+
+        let bounds = FloatingBounds::new(work_area);
         let reachable = clamp_reachable(dropped, bounds);
 
         let accepted = if reachable == dropped {
@@ -3254,10 +3279,29 @@ impl WindowManager {
             Self::apply_floating_geometry(hwnd, reachable)?
         };
 
-        self.focused_workspace_mut()?
+        self.workspace_at_mut((monitor_idx, workspace_idx))?
             .confirm_floating_geometry(hwnd, accepted);
 
-        Ok(accepted)
+        Ok(Some(accepted))
+    }
+
+    /// Where the floating window with this handle lives, if a workspace owns it as one.
+    ///
+    /// `known_hwnds` is rebuilt at the end of an event rather than during it, so it still
+    /// describes where a window was before the event being handled moved it. This reads the model
+    /// itself for that reason.
+    #[must_use]
+    fn floating_window_location(&self, hwnd: isize) -> Option<(usize, usize)> {
+        self.monitors()
+            .iter()
+            .enumerate()
+            .find_map(|(m_idx, monitor)| {
+                monitor
+                    .workspaces()
+                    .iter()
+                    .position(|workspace| workspace.is_floating_window(hwnd))
+                    .map(|w_idx| (m_idx, w_idx))
+            })
     }
 
     #[tracing::instrument(skip(self))]
@@ -5829,6 +5873,81 @@ mod tests {
     }
 
     #[test]
+    fn a_floating_window_dragged_to_another_monitor_travels_without_its_container() {
+        // The container on monitor 0 holds a tiled window and a floating one. Dragging the
+        // floating one across the boundary used to take the whole container with it, because
+        // `transfer_window` asked whether the window had a container - and in this model every
+        // managed window does.
+        let (mut wm, _test_context) = window_manager_with_two_monitors(&[42, 43]);
+        let floated = Rect {
+            left: 1100,
+            top: 100,
+            right: 400,
+            bottom: 300,
+        };
+        wm.monitors_mut()[0].workspaces_mut()[0]
+            .float_window(43, floated)
+            .unwrap();
+        let container_id = wm.monitors()[0].workspaces()[0].containers()[0].id.clone();
+
+        wm.transfer_window((0, 0, 43), (1, 0, 0)).unwrap();
+
+        // The tiled window stayed where it was, in the container which has always owned it.
+        let origin = &wm.monitors()[0].workspaces()[0];
+        assert_eq!(origin.containers().len(), 1);
+        assert_eq!(origin.containers()[0].id, container_id);
+        assert!(origin.contains_window(42));
+        assert!(!origin.contains_window(43));
+
+        // The floating window arrived alone, still floating, in a container of its own - which
+        // is hidden, so it takes no slot from the arrangement it joined.
+        let target = &wm.monitors()[1].workspaces()[0];
+        assert!(target.is_floating_window(43));
+        assert_eq!(
+            target
+                .container_for_window(43)
+                .map(|container| container.windows().len()),
+            Some(1)
+        );
+        assert!(target.container_for_window(43).unwrap().is_hidden());
+    }
+
+    #[test]
+    fn a_floating_drag_is_recorded_on_the_monitor_the_window_is_on() {
+        // The drag which crossed a boundary has already sent the window to the other monitor, so
+        // the workspace which owns it and the work area which bounds it are not the focused
+        // monitor's. Monitor 1's work area starts at x = 1000 here.
+        let (mut wm, _test_context) = window_manager_with_two_monitors(&[42]);
+        let floated = Rect {
+            left: 1100,
+            top: 100,
+            right: 400,
+            bottom: 300,
+        };
+        wm.monitors_mut()[1].workspaces_mut()[0].add_floating_window(Window::from(50));
+        wm.monitors_mut()[1].workspaces_mut()[0].set_floating_rect(50, floated);
+
+        let dropped = Rect {
+            left: 1500,
+            top: 400,
+            right: 400,
+            bottom: 300,
+        };
+
+        assert_eq!(wm.record_floating_drag(50, dropped).unwrap(), Some(dropped));
+        assert_eq!(
+            wm.monitors()[1].workspaces()[0]
+                .container_for_window(50)
+                .unwrap()
+                .windows()[0]
+                .floating_rect,
+            Some(dropped)
+        );
+        // A window which is not floating is not a floating drag, whichever monitor it is on.
+        assert_eq!(wm.record_floating_drag(42, dropped).unwrap(), None);
+    }
+
+    #[test]
     fn sending_a_window_to_a_monitor_which_does_not_exist_refuses() {
         let (mut wm, _test_context) = window_manager_with_two_monitors(&[42]);
 
@@ -6392,7 +6511,7 @@ mod tests {
             bottom: 600,
         };
 
-        assert_eq!(wm.record_floating_drag(43, dropped).unwrap(), dropped);
+        assert_eq!(wm.record_floating_drag(43, dropped).unwrap(), Some(dropped));
 
         let workspace = wm.focused_workspace().unwrap();
         let container = &workspace.containers()[0];
@@ -6439,7 +6558,7 @@ mod tests {
             bottom: 600,
         };
 
-        assert_eq!(wm.record_floating_drag(42, dropped).unwrap(), dropped);
+        assert_eq!(wm.record_floating_drag(42, dropped).unwrap(), Some(dropped));
         assert_eq!(
             wm.focused_workspace().unwrap().containers()[0].windows()[0].floating_rect,
             Some(dropped)

@@ -1111,6 +1111,12 @@ impl WindowManager {
                                 target_monitor.focus_workspace(target_workspace_idx)?;
                                 self.update_focused_workspace(false, false)?;
 
+                                // A floating window has travelled alone and keeps its own
+                                // rectangle: nothing on the receiving monitor will give it one,
+                                // so where the user dropped it is what the model records. This
+                                // does nothing at all for a window which is not floating.
+                                self.record_floating_drag(window.hwnd, new_position)?;
+
                                 // Make sure to give focus to the moved window again
                                 window.focus(self.mouse_follows_focus)?;
                             }
