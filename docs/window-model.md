@@ -294,3 +294,15 @@ randomized sequences.
   floating window is resized by `resize-floating-window` and by nothing else, and a hidden
   container - which owns no slot, so it shares no boundary - is refused rather than given a resize
   adjustment nothing would apply.
+- Focusing a floating window focuses the container which owns it, because in this model there is
+  one. Upstream recorded only that the workspace was on its floating layer, which is all a
+  workspace-level floating list allowed.
+- A container's border tracks the window the container is drawing in its slot, and a hidden
+  container has no border. Upstream's container border tracked the container's focused window,
+  which here can be a floating window - and a floating window has a border of its own.
+- Dragging a floating window onto another monitor moves that window. Upstream's cross-monitor drag
+  moved the container of any window which had one, which in this model is every managed window.
+- Crossing a monitor boundary lands on the container whose logical slot is flush with the edge
+  being entered, in all four directions. Upstream derived that container from the layout kind and
+  the container count, which describes a freshly calculated arrangement rather than this model's
+  slots, and answered only for the horizontal directions.

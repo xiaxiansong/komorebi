@@ -2913,21 +2913,98 @@ one, in a fork where a floating window is an ordinary member of a container.
    subset only. The index therefore names an arbitrary container. It never ran on the user's single
    monitor and runs on every crossing on two.
 
-- [ ] 24A: a focus change onto a floating window is a focus change. The floating arm of
+- [x] 24A: a focus change onto a floating window is a focus change. The floating arm of
   `FocusChange` focuses the container which owns the window, so both MRU histories record it and
   the floating commands act on the window the user is looking at.
-- [ ] 24B: a container's border tracks the window the container draws in its slot
+- [x] 24B: a container's border tracks the window the container draws in its slot
   (`focused_visible_stored_window`), and a hidden container - which owns no slot - has no border at
   all. A floating window keeps exactly one border, its own, which follows it.
-- [ ] 24C: a dragged floating window travels alone across a monitor boundary, and the rectangle it
+- [x] 24C: a dragged floating window travels alone across a monitor boundary, and the rectangle it
   was dropped at is recorded on the workspace which owns it rather than on whichever workspace
   happens to be focused.
-- [ ] 24D: crossing a monitor boundary lands on the container whose slot is flush with the edge
+- [x] 24D: crossing a monitor boundary lands on the container whose slot is flush with the edge
   being entered, chosen from the logical slots.
-- [ ] 24E: build, deploy and verify on the live desktop; documentation and this plan.
+- [x] 24E: build, deploy and verify on the live desktop; documentation and this plan.
 
 Planned files: `komorebi/src/process_event.rs`, `komorebi/src/border_manager/mod.rs`,
 `komorebi/src/window_manager.rs`, `komorebi/src/workspace.rs`, `docs/window-model.md`, this plan.
+
+24A actual files: `komorebi/src/process_event.rs`, `komorebi/src/workspace.rs` (test). Commit
+`23a737ae`. Two handlers recognise a floating window and both had the same hole: `FocusChange` and
+`perform_reconciliation`, which is the alt-tab path. The model half of the fix has a unit test; the
+handlers themselves are Win32-coupled and are covered by the live verification below.
+
+24B actual files: `komorebi/src/border_manager/mod.rs`. Commit `ad2645b6`. Three changes, one rule:
+a container border belongs to the window the container draws. The `Windows` accent implementation
+follows the same rule so a floating window's accent is not overwritten by the container it is in; a
+minimized floating window loses its border rather than keeping one parked where Win32 parks a
+minimized window; and a border is repositioned when the window it tracks changes, which it
+previously did only if its colour changed at the same time. There are no unit tests here - the
+module is entirely Win32 - so this phase's evidence is the live border enumeration below.
+
+24C actual files: `komorebi/src/window_manager.rs`, `komorebi/src/process_event.rs`. Commit
+`1a70728b`. `record_floating_drag` answers `Option<Rect>` now: it finds the workspace which owns
+the window rather than reading the focused one, and a window which is not floating is not a
+floating drag. That is what lets the cross-monitor branch call it unconditionally after the
+transfer, which is where the dropped rectangle has to be recorded because nothing on the receiving
+monitor will give a floating window one. `known_hwnds` could not be used for the lookup: it is
+rebuilt at the end of an event, so during the event it still describes where the window was.
+
+24D actual files: `komorebi/src/window_manager.rs`, `komorebi/src/workspace.rs`. Commit `eaa5d7c4`.
+`cross_boundary_edge_index` is left in `komorebi-layouts` rather than deleted - it is upstream API
+and removing it would only make a merge harder - but nothing in this fork calls it any more.
+
+24E: built at `eaa5d7c4`, deployed through the request-file path in `komorebi-start.ps1` and cold
+started; the installed `komorebi.exe` hashes equal to the built one and `komorebic --version`
+reports `eaa5d7c4`.
+
+Verification: komorebi 588 -> 593 passing on the serial runner, 0 failed; `cargo fmt --check`
+clean; `cargo clippy --workspace --all-targets` clean apart from the pre-existing `items after a
+test module` warning.
+
+Live verification, chosen to return the desktop to the state it started in. Cold start gave one
+container with four windows over one slot covering the work area, and four workspaces.
+
+- 24A: with the focus moved to a stored window by `raise-next-stack-window`,
+  `move-floating-window` correctly answered exit 11; with the floating window then focused by a
+  real `SetForegroundWindow` - which is what a click produces - the model's focused window became
+  the floating one, the workspace's window history recorded it at the head, and
+  `move-floating-window left` answered exit 0 and moved the window 63 physical pixels on this 125%
+  display for a configured delta of 50, changing only its x. That focus is exactly what was
+  missing: before this phase the same sequence answered exit 11.
+- 24B: two border windows for the whole desktop, `komoborder-134378` on the floating window and
+  `komoborder-mGhSX8eU...` on the container's slot at 24,64-3816,2076. Two keyboard moves left the
+  container border exactly where it was while the floating border followed. A synthesized title-bar
+  drag of 300x200 moved the window by that amount, the floating border followed it, the container
+  border did not move, no third border existed, the model recorded the dropped rectangle with its
+  size unchanged, and the slot generation did not change. Floating the only window of a container
+  left that container with no border at all while the active container's border expanded to the
+  whole work area.
+- Two real drags of a floating window during the session produced neither `resizing with mouse` nor
+  `moving with mouse`, which is Phase 23's fix still holding.
+- 24C and 24D are two-monitor paths and this desk has one monitor. They are covered by unit tests
+  (`a_floating_window_dragged_to_another_monitor_travels_without_its_container`,
+  `a_floating_drag_is_recorded_on_the_monitor_the_window_is_on`,
+  `a_crossing_arrives_on_the_container_at_the_edge_it_entered`,
+  `a_crossing_never_arrives_on_a_container_which_owns_no_slot`) and are the two things to exercise
+  first on the two-monitor desk.
+
+One ERROR in the log since the new process started: a socket connect timeout (os error 10060) in
+`process_command`, in the middle of a burst of `State` polls from this session and the helper
+scripts. It is in the accept path and is not related to this phase's changes.
+
+The rest of the two-monitor audit found these already correct and they were not changed:
+`transfer_focused_window` rewrites a floating rectangle into the receiving work area and retiles
+both monitors; `move_workspace_to_monitor`, `move_container_to_monitor` and
+`swap_monitor_workspaces` carry floating rectangles across and discard slots and manual boundaries
+so each monitor tiles for its own area; `record_logical_slots` recalculates whenever the work area
+changes, which is what invalidates exact hidden restores on a DPI or resolution change;
+`scaled_floating_delta` reads the focused monitor's own scale; the ID-addressed commands scan every
+monitor; `default_workspace_count` is applied per monitor as one is loaded or connected; and the
+invariant validator walks every monitor and workspace. One thing outside the repository:
+`display_index_preferences` in `komorebi.json` pins index 0 to this machine's built-in panel by
+device ID, so on a different desk the office monitors fall back to enumeration order - worth
+pinning their device IDs if a stable index matters there.
 
 ## Provisional affected-file inventory
 
@@ -3493,3 +3570,53 @@ This list is updated from actual diffs, not treated as permission to change ever
   part-way by the 1Password SSH agent, whose vault locked - which is itself a symptom of the bug,
   since the 1Password window was one of the two this defect had pushed off the bottom of the
   screen. It was moved back on screen to unblock signing.
+- 2026-09-01: Phase 24 turn. Three reports - the floating keys answering `NotFloating` about a
+  floating window, a frame left on the desktop after a floating window is dragged, and a review
+  before this build goes to a two-monitor desk - and the audit found four causes with one shape
+  between them: upstream code reading a floating window the way upstream stored one, in a fork
+  where a floating window is an ordinary member of a container.
+
+  The first is one arm of one match. `FocusChange` recognises a floating window and records the
+  workspace layer, which is everything there was to record when a floating window lived in a
+  workspace-level list. Here it has a container, and leaving that container unfocused left the
+  model's focused window on whichever tiled window was focused before - which is the window
+  `floating_geometry_subject` then offered the floating commands, correctly reporting that it is
+  not floating. The alt-tab reconciliation had the same hole. Neither is unit-testable, so the
+  model half has a test and the fix was verified by producing a real `SetForegroundWindow` on the
+  live desktop and watching the model follow it.
+
+  The second is two borders on one window. `border_manager` gives a container a border tracking
+  `Container::focused_window`, which here can be the container's floating window, and
+  `handle_floating_borders` then makes a second border for that same window and takes over its
+  entry in `WINDOWS_BORDERS`. Only that entry is sent the window's location changes, so the
+  floating border followed the drag and the container border was stranded on the rectangle the
+  window had been dragged away from - a frame around nothing. The rule the module was missing is
+  that a container's border belongs to the window the container is drawing in its slot, which is
+  also the answer for a hidden container: it draws nothing, owns no slot, and has no border.
+
+  The two-monitor half of the turn found two defects which cannot fire on one monitor.
+  `transfer_window` chose between a container window and a floating one by asking whether the
+  window had a container, and every managed window in this model has one - so the floating branch
+  was dead code and dragging a floating window to the other monitor took its whole container
+  across. And a crossing arrived on a container named by `cross_boundary_edge_index`, an index
+  derived from the layout kind and a container count which included hidden containers, against an
+  arrangement that had been computed for the active subset and may have been split or resized
+  since. The slots are the geometry authority in this fork, so the edge container is read from
+  them, in all four directions rather than the two upstream answered.
+
+  The audit's other half is what it did not change, which is most of it: the cross-monitor
+  transfers, workspace and container moves and monitor swaps all carry floating rectangles into
+  the receiving work area and discard slots and manual boundaries; the arrangement recalculates
+  whenever the work area changes; the floating delta is scaled by the focused monitor's own DPI;
+  the ID-addressed commands scan every monitor; and the workspace count is applied per monitor.
+  The one thing worth doing outside the repository is pinning the office monitors' device IDs in
+  `display_index_preferences`, which currently names only this machine's built-in panel.
+
+  komorebi 588 -> 593 passing on the serial runner, fmt clean, Clippy clean apart from the
+  pre-existing `items after a test module`. Built, deployed and cold started at `eaa5d7c4`, hash
+  matched against the built binary. On the live desktop: the click-then-move sequence which used
+  to answer exit 11 now answers 0 and moves by the DPI-scaled delta; a synthesized title-bar drag
+  moved the window by exactly the drag with the floating border following, the container border
+  unmoved on its slot, no third border anywhere and the slot generation untouched; and floating a
+  container's only window left that container with no border at all. The desktop ends where it
+  began.
