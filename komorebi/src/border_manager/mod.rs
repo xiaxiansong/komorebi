@@ -6,6 +6,7 @@ use crate::WindowsApi;
 use crate::core::BorderImplementation;
 use crate::core::BorderStyle;
 use crate::core::WindowKind;
+use crate::managed_window::Visibility;
 use crate::ring::Ring;
 use crate::windows_api;
 use crate::workspace::Workspace;
@@ -268,6 +269,14 @@ pub fn handle_notifications(wm: Arc<Mutex<WindowManager>>) -> color_eyre::Result
                         }
 
                         for (idx, c) in ws.containers().iter().enumerate() {
+                            // The window the container draws, for the same reason the komorebi
+                            // border implementation below tracks it: a floating window is
+                            // accented as a floating window, by its own pass.
+                            let Some(focused_window) = c.focused_visible_stored_window().copied()
+                            else {
+                                continue;
+                            };
+
                             let window_kind = if idx != ws.focused_container_idx()
                                 || monitor_idx != focused_monitor_idx
                             {
@@ -282,10 +291,7 @@ pub fn handle_notifications(wm: Arc<Mutex<WindowManager>>) -> color_eyre::Result
                                 WindowKind::Single
                             };
 
-                            c.focused_window()
-                                .copied()
-                                .unwrap_or_default()
-                                .set_accent(window_kind_colour(window_kind))?;
+                            focused_window.set_accent(window_kind_colour(window_kind))?;
                         }
 
                         for window in ws.floating_windows() {
@@ -552,9 +558,27 @@ pub fn handle_notifications(wm: Arc<Mutex<WindowManager>>) -> color_eyre::Result
                         )?;
 
                         'containers: for (idx, c) in ws.containers().iter().enumerate() {
-                            let focused_window_hwnd =
-                                c.focused_window().map(|w| w.hwnd).unwrap_or_default();
                             let id = c.id.to_string();
+
+                            // A container's border tracks the window the container draws in its
+                            // slot, which is not always the window its ring focus is on: a
+                            // floating window is owned by a container in this model, and a
+                            // container border tracking one would be a second border on a window
+                            // which already has its own floating border. Only one of the two can
+                            // hold that window's entry in `WINDOWS_BORDERS`, and only that entry
+                            // is sent the window's location changes, so the other stayed behind
+                            // at the rectangle the window was dragged away from - an empty frame
+                            // left on the desktop after every drag of a floating window.
+                            //
+                            // A container with nothing to draw is hidden: it owns no slot, so it
+                            // has no border either, and its windows are bordered as the floating
+                            // windows they are.
+                            let Some(focused_window_hwnd) =
+                                c.focused_visible_stored_window().map(|w| w.hwnd)
+                            else {
+                                remove_border(&id, &mut borders, &mut windows_borders)?;
+                                continue 'containers;
+                            };
 
                             // Get the border entry for this container from the map or create one
                             let mut new_border = false;
@@ -591,6 +615,11 @@ pub fn handle_notifications(wm: Arc<Mutex<WindowManager>>) -> color_eyre::Result
 
                             border.window_kind = new_focus_state;
 
+                            // A container draws a different window when the one it was drawing
+                            // is floated, minimized or closed, and the border has to be moved to
+                            // it rather than left on the rectangle the previous window had.
+                            let tracking_changed = border.tracking_hwnd != focused_window_hwnd;
+
                             // Update the borders `tracking_hwnd` in case it changed and remove the
                             // old `tracking_hwnd` from `WINDOWS_BORDERS` if needed.
                             if border.tracking_hwnd != focused_window_hwnd {
@@ -625,6 +654,7 @@ pub fn handle_notifications(wm: Arc<Mutex<WindowManager>>) -> color_eyre::Result
                             border.window_rect = rect;
 
                             let should_invalidate = new_border
+                                || tracking_changed
                                 || (last_focus_state != new_focus_state)
                                 || layer_changed
                                 || forced_update;
@@ -679,9 +709,18 @@ fn handle_floating_borders(
     layer_changed: bool,
     forced_update: bool,
 ) -> color_eyre::Result<()> {
-    for window in ws.floating_windows() {
+    for managed in ws.floating_managed_windows() {
+        let id = managed.hwnd.to_string();
+
+        // A minimized floating window is not on the screen. Win32 parks it far outside the
+        // desktop, so a border which followed it there is a window kept alive to draw nothing.
+        if managed.visibility != Visibility::Visible {
+            remove_border(&id, borders, windows_borders)?;
+            continue;
+        }
+
+        let window = managed.window;
         let mut new_border = false;
-        let id = window.hwnd.to_string();
         let border = match borders.entry(id.clone()) {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => {
