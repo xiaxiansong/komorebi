@@ -3006,6 +3006,55 @@ invariant validator walks every monitor and workspace. One thing outside the rep
 device ID, so on a different desk the office monitors fall back to enumeration order - worth
 pinning their device IDs if a stable index matters there.
 
+### Phase 25 - Carrying the desk to the other desk
+
+Added on 2026-09-01. The request is not about the model: the user wants this build, this
+configuration and this script layer to exist unchanged on a second machine - the office desktop,
+which has two monitors where this one has a built-in panel. Nothing in the repository moves a
+running environment, so this phase adds the two scripts which do, and fixes the three places where
+the live environment is pinned to this machine.
+
+What is machine-specific in the environment as it stands:
+
+1. `komorebi-hotkeys.ahk` includes the key table by absolute path into this repository checkout.
+   The office machine will not have the checkout, so the shipped copy includes it as
+   `%A_ScriptDir%\komorebi-model.ahk` and the key table travels beside the wrapper in
+   `%USERPROFILE%`.
+2. `komorebi-start.ps1` and `komorebi-watchdog.ps1` looked for AutoHotkey only under
+   `%LOCALAPPDATA%\Programs\AutoHotkey\v2`, which is where a per-user install puts it; the
+   official installer and winget put it under `%ProgramFiles%`. Both scripts now walk a candidate
+   list and fall back to `PATH`, keeping the per-user path as the one named in the failure log.
+3. `display_index_preferences` names only this machine's panel. That part was already designed for
+   the move - the configuration reserves index 0 for this machine and 1 and 2 for the office
+   screens, and `komorebi-pin-displays.ps1` only ever appends the screens it finds - but the bar
+   did not follow: `bar_configurations` is positional, and `komorebi-bar` falls back to physical
+   monitor 0 when its configured user index is not in `monitor_usr_idx_map`. Two office screens
+   registered as 1 and 2 would therefore have drawn the index-0 bar on top of the index-1 one and
+   left the second screen bare. The installer aligns `bar_configurations` to the user indices the
+   screens actually registered on, generating a bar configuration from the first one as a template
+   if a registered index has none.
+
+- [x] 25A: `deployment/New-KomorebiTransferPackage.ps1` collects the installed binaries, the
+  `%USERPROFILE%` configuration and script layer, the repository's key table, and the bar font into
+  a self-contained directory with a SHA256 manifest, and zips it.
+- [x] 25B: `deployment/Install-KomorebiTransferPackage.ps1` restores that package on the other
+  machine: dependency check, self-elevation, manifest verification, backup of every file it
+  replaces, binaries and PATH, configuration and scripts, per-user font install, the elevated logon
+  task, and then the two-monitor step - cold start, display registration, bar alignment, cold start
+  again - followed by an install report.
+- [x] 25C: `deployment/README.md` documents the package, the prerequisites, the dual-monitor
+  behaviour, the hotkeys and the rollback path, and travels inside the package.
+- [x] 25D: the two AutoHotkey lookups in the live start and watchdog scripts become portable.
+- Commit the phase as `docs: add a transfer package for a second machine`.
+
+Verification: both new scripts parse; the packaged hotkey wrapper passes `AutoHotkey64.exe
+/validate` with its relative include; the installer's `-DryRun` was run against the built package
+and reported every step without touching anything; and `Sync-BarConfiguration` was extracted from
+the installer and exercised offline against five monitor scenarios - two office screens on indices
+1 and 2, on 0 and 1, on 1 and 3 where index 3 has no bar configuration, two unregistered screens
+before pinning, and this machine's single panel. The package built is 36 files, 114.3 MB, 46.5 MB
+zipped.
+
 ## Provisional affected-file inventory
 
 This list is updated from actual diffs, not treated as permission to change every file.
@@ -3620,3 +3669,17 @@ This list is updated from actual diffs, not treated as permission to change ever
   unmoved on its slot, no third border anywhere and the slot generation untouched; and floating a
   container's only window left that container with no border at all. The desktop ends where it
   began.
+
+- 2026-09-01: Phase 25 moved the environment rather than the model. The repository gained a
+  `deployment/` directory with a packager, an installer and a Chinese README; the package carries
+  the six installed binaries, `komorebi.json`, `applications.json`, the three bar configurations,
+  the hotkey wrapper, the repository's key table, twenty-one PowerShell scripts and the bar font,
+  with a SHA256 manifest. Three machine-specific things were fixed on the way: the hotkey wrapper's
+  absolute include became `%A_ScriptDir%`, the AutoHotkey lookup in the start and watchdog scripts
+  became a candidate list rather than the per-user path alone, and the bar's positional
+  `bar_configurations` is now aligned by the installer to the user indices the screens register on,
+  which is what keeps two office screens from sharing one bar. The display pinning itself already
+  worked: the configuration reserves index 0 for this machine and 1 and 2 for the office, and
+  `komorebi-pin-displays.ps1` appends without overwriting. Verified by parse checks, an
+  `AutoHotkey64.exe /validate` of the packaged wrapper, a full installer dry run, and five offline
+  bar-alignment scenarios. Nothing on the live desktop was started, stopped or reconfigured.
