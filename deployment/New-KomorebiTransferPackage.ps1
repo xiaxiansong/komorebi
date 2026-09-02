@@ -257,6 +257,8 @@ $manifest = [ordered]@{
     repo_root = $RepoRoot
     repo_branch = $branch
     repo_commit = $commit
+    # 二进制的来源目录：已安装目录还是 target\release，装到公司电脑之后仍然可以追溯。
+    bin_dir = $BinDir
     komorebi_version = (Get-ToolVersion (Join-Path $PackageBin 'komorebi.exe'))
     komorebic_version = (Get-ToolVersion (Join-Path $PackageBin 'komorebic.exe'))
     binaries = $BinaryNames
