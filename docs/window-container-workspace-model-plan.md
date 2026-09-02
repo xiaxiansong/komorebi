@@ -3092,7 +3092,7 @@ Windows does with a minimized window while komorebi is deciding what to show.
   back. Restoring takes the recorded set, or every minimized window of those workspaces when
   there is no recorded set, which is also how a desktop left inconsistent by `Win+D` is repaired.
   The recorded set is runtime state and is not serialized.
-- [ ] 26C: three keys in the AutoHotkey table, the documentation for the new commands, and the
+- [x] 26C: three keys in the AutoHotkey table, the documentation for the new commands, and the
   progress log entry. Commit each part separately.
 
 Verification: unit tests for the show/hide split, the reveal, and the bulk minimize and restore
@@ -3728,3 +3728,39 @@ This list is updated from actual diffs, not treated as permission to change ever
   `komorebi-pin-displays.ps1` appends without overwriting. Verified by parse checks, an
   `AutoHotkey64.exe /validate` of the packaged wrapper, a full installer dry run, and five offline
   bar-alignment scenarios. Nothing on the live desktop was started, stopped or reconfigured.
+- 2026-09-02: Phase 26 turn. Two reports about the taskbar, and one thing behind both: what Windows
+  is doing with a minimized window while komorebi is deciding what to show.
+
+  The restore flicker was not a wrong order. The model already showed the restored window before it
+  hid the one it replaced - Phase 22 put that in - but the two halves are not the same kind of
+  operation. Hiding is a cloak and takes effect on the call; revealing is `SW_RESTORE`, which
+  returns while Windows is still animating the window off the taskbar. The sibling was therefore
+  gone for the length of that animation with nothing drawn in the slot, which is the desktop the
+  user saw, and it is exactly what alt-tab avoids by hiding nothing at all. So
+  `load_focused_window` is split, the reveal path runs the show half, the hide waits until the
+  retile has put the window in the slot and the focus has raised it, and the window's DWM
+  transitions are suppressed across the reveal so there is no animation to be seen behind in the
+  first place. `Window::without_transitions` is a guard which restores the attribute on drop,
+  including on an early return; a window or a system which refuses the attribute simply animates,
+  which is the behaviour this replaces rather than a failure. The peek,
+  `Workspace::last_minimized_window`, is what keeps the sequence atomic: nothing comes off the
+  taskbar for a model change which then cannot be made.
+
+  `Win+D` is a race komorebi cannot win from where it was standing. The shell minimizes windows one
+  at a time and komorebi answers each event on its own: the container which has just lost the window
+  it was showing shows the next window it holds, and showing a window komorebi believes visible
+  takes it off the taskbar. So while the shell works down its list komorebi pulls back what the
+  shell has already put away, and the events for those arrive later and are answered again - which
+  is both halves of the report, the windows which will not minimize and the layout which does not
+  come back. Reacting better to a per-window stream is not the fix; owning the operation is.
+  `minimize-all-windows` is one model pass over the visible windows of every monitor's focused
+  workspace, then the Win32 calls, then one retile per monitor, so every event which comes back is
+  about a window the model already has minimized. `restore-desktop` brings back exactly the recorded
+  set - a window the user had already minimized stays where they put it - and falls back to every
+  minimized window of every visible workspace when there is no recorded set, which is the repair
+  path for a desktop the shell has already scattered. `toggle-show-desktop` is one key for both, and
+  `Alt+D` and an override of `Win+D` are both bound to it in the key table.
+
+  komorebi 593 -> 610 tests passing on the serial runner, fmt clean, Clippy clean apart from the
+  pre-existing `items after a test module`. The container-level tests read the process-wide hidden
+  set, which is the only place the difference between showing and hiding is observable in a test.

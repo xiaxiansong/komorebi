@@ -139,6 +139,9 @@ nav:
       - cli/move-floating-window.md
       - cli/resize-floating-window.md
       - cli/restore-last-minimized-window.md
+      - cli/minimize-all-windows.md
+      - cli/restore-desktop.md
+      - cli/toggle-show-desktop.md
       - cli/create-container.md
       - cli/destroy-container.md
       - cli/destroy-focused-container.md

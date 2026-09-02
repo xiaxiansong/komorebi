@@ -246,6 +246,22 @@ ResizeFloating(Edge, Sizing) {
 !+m::Komorebic("restore-last-minimized-window")   ; 恢复本工作区最后最小化的窗口
 
 ; ============================================================================
+; 显示桌面
+;
+; komorebi 自己的一键最小化：一次模型改动，然后才是 Win32 调用，所以最小化
+; 事件回来时模型里这些窗口已经是最小化的，没有任何窗口会被重新显示出来。
+; 系统的 Win+D 由 shell 一个个最小化窗口，komorebi 只能一条条事件地跟，而跟的
+; 过程本身就会把 shell 刚放下的窗口重新拉起来，所以这里用 komorebi 的实现替换它。
+; ============================================================================
+
+!d::Komorebic("toggle-show-desktop")              ; 显示桌面 / 还原布局
+!+d::Komorebic("minimize-all-windows")            ; 只最小化，不还原
+!^d::Komorebic("restore-desktop")                 ; 只还原；没有记录时把所有最小化窗口收回布局
+
+; 覆盖系统的 Win+D。删掉这一行即可恢复系统行为。
+#d::Komorebic("toggle-show-desktop")
+
+; ============================================================================
 ; 浮动窗口：移动与按边缘缩放
 ;
 ; 只对当前聚焦的浮动窗口生效，不改变任何容器、槽位或相邻窗口。
@@ -393,6 +409,8 @@ global ShortcutTable := [
     ["Alt+F", "Stored / Floating 切换", "toggle-float"],
     ["Alt+Shift+F / Alt+Ctrl+F", "最大化 / 全屏", "toggle-maximize / toggle-fullscreen"],
     ["Alt+W / Alt+M / Alt+Shift+M", "关闭 / 最小化 / 恢复最小化", "close / minimize / restore-last-minimized-window"],
+    ["Alt+D / Win+D", "显示桌面 / 还原布局", "toggle-show-desktop"],
+    ["Alt+Shift+D / Alt+Ctrl+D", "只最小化全部 / 只还原", "minimize-all-windows / restore-desktop"],
     ["Alt+Ctrl+H J K L", "移动浮动窗口", "move-floating-window"],
     ["Alt+Ctrl+Shift+H J K L", "浮动窗口对应边缘外扩", "resize-floating-window ... increase"],
     ["Alt+Ctrl+Shift+Y U I O", "浮动窗口对应边缘内收", "resize-floating-window ... decrease"],

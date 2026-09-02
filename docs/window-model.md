@@ -105,6 +105,45 @@ anything moved - a layout change, a manual resize, a swap, a merge, a monitor or
 the workspace is relaid out instead. Every geometry change advances a generation counter, and
 records which describe an arrangement that no longer exists are dropped.
 
+## The taskbar
+
+Minimizing is a visibility change and nothing else: the window keeps its container, its place in the
+stack, its placement and its presentation, and it goes to the top of the workspace's own minimize
+history. A container which is left with no visible stored window becomes Hidden by the ordinary
+derivation and gives its slot up.
+
+`restore-last-minimized-window` takes the most recent window of that history which the workspace
+still owns and puts it back the way it left, at the top of its container's stack and focused.
+Because a container draws one stored window at a time, restoring into a stack means the window the
+container was showing has to stop being drawn - and the two operations are not the same kind of
+thing. Hiding is a cloak, which is immediate; revealing is `SW_RESTORE`, which returns while Windows
+is still animating the window off the taskbar. So the order is fixed: the window's DWM transitions
+are suppressed for the reveal, the reveal happens before the model changes anything, and the window
+it replaces is hidden last, after the retile has put the revealed window in the slot and the focus
+has raised it. Nothing is ever hidden while the slot has nothing to draw in it.
+
+### Showing the desktop
+
+`toggle-show-desktop` is komorebi's own `Win+D`, and it exists because the shell's cannot be
+followed from outside. `Win+D` minimizes windows one at a time, and komorebi hears each minimize as
+its own event: the container which has just lost the window it was showing shows the next window it
+holds, and showing a window komorebi believes visible takes it off the taskbar. So while the shell
+is still working down its list, komorebi is pulling back windows the shell has already put away, and
+the events for those arrive later and are answered again. The way back has the same shape, and the
+shell restores the stack members komorebi had cloaked and the windows of workspaces which are not on
+screen along with everything else.
+
+The command is one model pass and then the Win32 calls, which is what makes it reliable: by the time
+the minimize events arrive, the model already has every one of those windows minimized and there is
+nothing left for them to change. Only the visible windows of each monitor's focused workspace are
+touched, and each monitor is retiled once.
+
+`restore-desktop` brings back exactly what the command minimized, so a window the user had already
+put on the taskbar stays there, and every container comes back showing the window it was showing.
+With nothing recorded - komorebi was restarted, or the desktop was shown by the shell - it restores
+every minimized window of every visible workspace instead, which is how a desktop left inconsistent
+by `Win+D` is repaired. The recorded set is runtime state and is not serialized.
+
 ## Logical slots and rendered rectangles
 
 Three rectangles, and only the first is geometry:
@@ -302,6 +341,9 @@ randomized sequences.
   which here can be a floating window - and a floating window has a border of its own.
 - Dragging a floating window onto another monitor moves that window. Upstream's cross-monitor drag
   moved the container of any window which had one, which in this model is every managed window.
+- Showing the desktop is a komorebi command - `toggle-show-desktop`, `minimize-all-windows` and
+  `restore-desktop` - rather than something to be inferred from a stream of shell minimizes.
+  Upstream has no equivalent, and `Win+D` races komorebi's per-window reaction to each minimize.
 - Crossing a monitor boundary lands on the container whose logical slot is flush with the edge
   being entered, in all four directions. Upstream derived that container from the layout kind and
   the container count, which describes a freshly calculated arrangement rather than this model's
