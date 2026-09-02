@@ -3085,7 +3085,7 @@ Windows does with a minimized window while komorebi is deciding what to show.
   changes the model, retiles, focuses it, and only then hides the stored window it replaced -
   restoring the transition setting afterwards. Nothing is hidden until the restored window is
   drawn in the slot, and there is no animation to be drawn behind.
-- [ ] 26B: `SocketMessage::ToggleShowDesktop`, `MinimizeAllWindows` and `RestoreAllWindows`, with
+- [x] 26B: `SocketMessage::ToggleShowDesktop`, `MinimizeAllWindows` and `RestoreDesktop`, with
   `komorebic` subcommands. Minimizing is one model pass over every visible window of every
   monitor's focused workspace, followed by the Win32 minimizes and one retile per monitor: the
   events which come back find nothing left to change, so there is no window for komorebi to pull

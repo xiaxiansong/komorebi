@@ -144,6 +144,18 @@ pub enum SocketMessage {
     /// The window returns to the container it was minimized in, with the placement and
     /// presentation it was minimized with.
     RestoreLastMinimizedWindow,
+    /// Minimize every visible window of every monitor's focused workspace to show the desktop.
+    ///
+    /// One model pass and then the Win32 calls, which is what the shell's own `Win+D` cannot do
+    /// from outside komorebi. The windows it minimized are remembered for `RestoreDesktop`.
+    MinimizeAllWindows,
+    /// Bring back the windows `MinimizeAllWindows` minimized, and the arrangement with them.
+    ///
+    /// With nothing recorded - after a restart, or a desktop shown by the shell - every minimized
+    /// window of every visible workspace is restored instead.
+    RestoreDesktop,
+    /// `MinimizeAllWindows` or `RestoreDesktop`, whichever the current state calls for.
+    ToggleShowDesktop,
     Promote,
     PromoteSwap,
     PromoteFocus,
@@ -942,6 +954,18 @@ mod tests {
             (
                 SocketMessage::RestoreLastMinimizedWindow,
                 r#"{"type":"RestoreLastMinimizedWindow"}"#,
+            ),
+            (
+                SocketMessage::MinimizeAllWindows,
+                r#"{"type":"MinimizeAllWindows"}"#,
+            ),
+            (
+                SocketMessage::RestoreDesktop,
+                r#"{"type":"RestoreDesktop"}"#,
+            ),
+            (
+                SocketMessage::ToggleShowDesktop,
+                r#"{"type":"ToggleShowDesktop"}"#,
             ),
             (
                 SocketMessage::CreateContainer(None),

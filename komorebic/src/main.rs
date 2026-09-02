@@ -1550,6 +1550,15 @@ enum SubCommand {
     /// Restore the window most recently minimized on the focused workspace
     #[clap(alias = "restore-minimized")]
     RestoreLastMinimizedWindow,
+    /// Minimize every visible window on every monitor to show the desktop
+    #[clap(alias = "minimize-all")]
+    MinimizeAllWindows,
+    /// Restore the windows minimized to show the desktop, and the arrangement with them
+    #[clap(alias = "restore-all")]
+    RestoreDesktop,
+    /// Show the desktop, or put back what showing it covered
+    #[clap(alias = "show-desktop")]
+    ToggleShowDesktop,
     /// Replace the configuration of a running instance of komorebi from a static configuration file
     #[clap(arg_required_else_help = true)]
     ReplaceConfiguration(ReplaceConfiguration),
@@ -3425,6 +3434,15 @@ if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
         }
         SubCommand::RestoreLastMinimizedWindow => {
             send_command(&SocketMessage::RestoreLastMinimizedWindow)?;
+        }
+        SubCommand::MinimizeAllWindows => {
+            send_command(&SocketMessage::MinimizeAllWindows)?;
+        }
+        SubCommand::RestoreDesktop => {
+            send_command(&SocketMessage::RestoreDesktop)?;
+        }
+        SubCommand::ToggleShowDesktop => {
+            send_command(&SocketMessage::ToggleShowDesktop)?;
         }
         SubCommand::QuickSaveResize => {
             send_message(&SocketMessage::QuickSave)?;

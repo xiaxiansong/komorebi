@@ -252,6 +252,12 @@ impl ManagedWindow {
         self.visibility == Visibility::Visible && self.placement == ManagedPlacement::Stored
     }
 
+    /// Whether Win32 is holding this window on the taskbar, as far as the model knows.
+    #[must_use]
+    pub fn is_minimized(&self) -> bool {
+        self.visibility == Visibility::Minimized
+    }
+
     #[must_use]
     pub fn is_maximized(&self) -> bool {
         self.presentation == Presentation::Maximized

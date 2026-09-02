@@ -136,6 +136,13 @@ pub struct WindowManager {
     /// This is deliberately not part of persisted state. A new window manager process treats any
     /// still-existing, otherwise eligible HWND as a newly opened window.
     pub temporarily_unmanaged_hwnds: SuspensionSet,
+    /// The windows the show-desktop command minimized, in the order it minimized them.
+    ///
+    /// Non-empty is what "the desktop is being shown" means, and the list is what the restore
+    /// half brings back, so a window the user had already minimized before the desktop was shown
+    /// is not resurrected with the rest. Runtime-only, like the suspension set: a restart has no
+    /// desktop to restore, and the windows are on the taskbar where the user can see them.
+    pub desktop_minimized_hwnds: Vec<isize>,
 }
 
 impl AsRef<Self> for WindowManager {
@@ -216,6 +223,7 @@ impl WindowManager {
             uncloack_to_ignore: 0,
             known_hwnds: HashMap::new(),
             temporarily_unmanaged_hwnds: SuspensionSet::default(),
+            desktop_minimized_hwnds: Vec::new(),
         })
     }
 
@@ -1064,6 +1072,233 @@ impl WindowManager {
         }
 
         Ok(Some(hwnd))
+    }
+
+    /// Whether the show-desktop command is currently holding windows on the taskbar.
+    #[must_use]
+    pub fn is_showing_desktop(&self) -> bool {
+        !self.desktop_minimized_hwnds.is_empty()
+    }
+
+    /// Minimize every visible window of every monitor's focused workspace.
+    ///
+    /// komorebi's own answer to `Win+D`, which it cannot answer well from the outside: the shell
+    /// minimizes windows one at a time and komorebi hears each one as a separate event, so while
+    /// the shell is still working down its list komorebi is showing the next window of every
+    /// container the shell has just emptied - and showing a window komorebi believes visible takes
+    /// it off the taskbar. Here it is one model pass and then the Win32 calls, so every event which
+    /// comes back is about a window the model already has minimized and has nothing left to
+    /// change.
+    ///
+    /// Returns the windows it put away, which is also what [`Self::restore_desktop`] will bring
+    /// back. Windows on workspaces which are not on screen are not touched: they are already
+    /// invisible, and minimizing them would put them on the taskbar of a desktop they are not
+    /// part of.
+    pub fn minimize_all_windows(&mut self) -> eyre::Result<Vec<isize>> {
+        let mut minimized = Vec::new();
+        let mut touched = Vec::new();
+
+        for monitor_idx in 0..self.monitors().len() {
+            let Some(workspace) = self
+                .monitors_mut()
+                .get_mut(monitor_idx)
+                .and_then(Monitor::focused_workspace_mut)
+            else {
+                continue;
+            };
+
+            let hwnds = workspace.minimize_all_visible_windows();
+
+            if !hwnds.is_empty() {
+                touched.push(monitor_idx);
+                minimized.extend(hwnds);
+            }
+        }
+
+        // Only now, with the whole model already agreeing that these windows are minimized.
+        for hwnd in &minimized {
+            Window::from(*hwnd).minimize();
+        }
+
+        for monitor_idx in touched {
+            self.update_focused_workspace_by_monitor_idx(monitor_idx)?;
+        }
+
+        if !minimized.is_empty() {
+            self.desktop_minimized_hwnds = minimized.clone();
+        }
+
+        Ok(minimized)
+    }
+
+    /// Bring back the windows the desktop was shown over, and the arrangement with them.
+    ///
+    /// The recorded set is what comes back, so a window the user had already minimized before
+    /// showing the desktop stays where they put it. With no recorded set - komorebi was restarted,
+    /// or the desktop was shown by the shell rather than by this command - every minimized window
+    /// of every visible workspace comes back instead, which is how a desktop left half minimized
+    /// by `Win+D` is repaired.
+    ///
+    /// Win32 first, as in every reveal: the windows come off the taskbar with their transitions
+    /// suppressed so the arrangement snaps back rather than animating window by window, and the
+    /// model pass which follows is what cloaks the stack members which should not be drawn.
+    pub fn restore_desktop(&mut self) -> eyre::Result<Vec<isize>> {
+        let recorded = std::mem::take(&mut self.desktop_minimized_hwnds);
+        let selected = if recorded.is_empty() {
+            None
+        } else {
+            Some(recorded.as_slice())
+        };
+
+        let candidates = self.minimized_windows_on_visible_workspaces(selected);
+
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut restored = Vec::new();
+
+        {
+            let _transitions = candidates
+                .iter()
+                .map(|(_, hwnd)| Window::from(*hwnd).without_transitions())
+                .collect::<Vec<_>>();
+
+            for (_, hwnd) in &candidates {
+                let window = Window::from(*hwnd);
+                window.unminimize();
+                window.restore();
+            }
+
+            for monitor_idx in 0..self.monitors().len() {
+                let wanted = candidates
+                    .iter()
+                    .filter(|(monitor, _)| *monitor == monitor_idx)
+                    .map(|(_, hwnd)| *hwnd)
+                    .collect::<Vec<_>>();
+
+                if wanted.is_empty() {
+                    continue;
+                }
+
+                if let Some(workspace) = self
+                    .monitors_mut()
+                    .get_mut(monitor_idx)
+                    .and_then(Monitor::focused_workspace_mut)
+                {
+                    restored.extend(workspace.restore_minimized_windows(Some(&wanted)));
+                }
+
+                self.update_focused_workspace_by_monitor_idx(monitor_idx)?;
+            }
+        }
+
+        // The foreground goes back to the window which had it before the desktop was shown:
+        // nothing here moved container focus, so the focused container's own most recent focusable
+        // window is that window. Focused explicitly rather than through the workspace focus pass,
+        // which takes the container ring's focused window whether or not it is visible - and
+        // handing the foreground to a minimized window is how Windows un-minimizes it, which would
+        // resurrect a window the user had deliberately left on the taskbar.
+        let refocus = self
+            .focused_workspace()?
+            .focused_container()
+            .and_then(Container::first_focusable_window)
+            .map(|window| window.hwnd);
+
+        if let Some(hwnd) = refocus {
+            Window::from(hwnd).focus(self.mouse_follows_focus)?;
+        }
+
+        Ok(restored)
+    }
+
+    /// Show the desktop, or put back what showing it covered.
+    ///
+    /// One key for both halves, like `Win+D`. A minimize which finds nothing visible to put away
+    /// falls through to the restore: that is the state a desktop shown by the shell leaves behind,
+    /// and answering it with another minimize would leave the user pressing a key that does
+    /// nothing.
+    pub fn toggle_show_desktop(&mut self) -> eyre::Result<CommandResponse> {
+        if self.is_showing_desktop() {
+            let restored = self.restore_desktop()?;
+
+            return Ok(CommandResponse::new(
+                CommandOutcome::Success,
+                format!("restored {} window(s) from the taskbar", restored.len()),
+            ));
+        }
+
+        let minimized = self.minimize_all_windows()?;
+
+        if !minimized.is_empty() {
+            return Ok(CommandResponse::new(
+                CommandOutcome::Success,
+                format!(
+                    "minimized {} window(s) to show the desktop",
+                    minimized.len()
+                ),
+            ));
+        }
+
+        let restored = self.restore_desktop()?;
+
+        if restored.is_empty() {
+            return Ok(CommandResponse::new(
+                CommandOutcome::NoOp,
+                "there is no visible window to minimize and no minimized window to restore",
+            ));
+        }
+
+        Ok(CommandResponse::new(
+            CommandOutcome::Success,
+            format!(
+                "restored {} window(s) which were already minimized",
+                restored.len()
+            ),
+        ))
+    }
+
+    /// The minimized windows of every monitor's focused workspace, with the monitor which owns
+    /// each, filtered to `selected` when a set was recorded.
+    ///
+    /// A recorded handle which no longer resolves to a minimized window of a visible workspace is
+    /// dropped rather than acted on: the window may have been closed, moved to another workspace
+    /// or restored by the user while the desktop was showing.
+    fn minimized_windows_on_visible_workspaces(
+        &self,
+        selected: Option<&[isize]>,
+    ) -> Vec<(usize, isize)> {
+        let mut candidates = Vec::new();
+
+        for (monitor_idx, monitor) in self.monitors().iter().enumerate() {
+            let Some(workspace) = monitor.focused_workspace() else {
+                continue;
+            };
+
+            for window in workspace
+                .containers()
+                .iter()
+                .flat_map(|container| container.windows().iter())
+                .filter(|window| window.is_minimized())
+            {
+                if selected.is_none_or(|selected| selected.contains(&window.hwnd)) {
+                    candidates.push((monitor_idx, window.hwnd));
+                }
+            }
+        }
+
+        // In the order they were recorded, so the window which was focused when the desktop was
+        // shown is the last one restored and the one the focus pass finds in front.
+        if let Some(selected) = selected {
+            candidates.sort_by_key(|(_, hwnd)| {
+                selected
+                    .iter()
+                    .position(|recorded| recorded == hwnd)
+                    .unwrap_or(usize::MAX)
+            });
+        }
+
+        candidates
     }
 
     /// Raise the window under the top of the focused container's stack and focus it.
@@ -6258,6 +6493,87 @@ mod tests {
 
         assert_eq!(response.outcome, CommandOutcome::NoOp);
         assert!(wm.managed_window_location(42).is_some());
+    }
+
+    /// Whether every window of the first container of the focused workspace is minimized.
+    fn all_minimized(wm: &WindowManager) -> bool {
+        wm.focused_workspace().unwrap().containers()[0]
+            .windows()
+            .iter()
+            .all(|window| window.is_minimized())
+    }
+
+    #[test]
+    fn showing_the_desktop_records_what_it_minimized_and_restoring_clears_the_record() {
+        let (mut wm, _test_context) = window_manager_with_container(&[42, 43]);
+
+        let minimized = wm.minimize_all_windows().unwrap();
+
+        assert_eq!(minimized.len(), 2);
+        assert!(wm.is_showing_desktop());
+        assert!(all_minimized(&wm));
+
+        // The focus which ends a restore is a Win32 call no test window can answer; every model
+        // change this asserts on happens before it.
+        wm.restore_desktop().ok();
+
+        assert!(!wm.is_showing_desktop());
+        assert!(
+            !all_minimized(&wm),
+            "the windows the desktop was shown over came back"
+        );
+    }
+
+    #[test]
+    fn restoring_the_desktop_leaves_a_window_the_user_had_already_minimized_alone() {
+        let (mut wm, _test_context) = window_manager_with_container(&[42, 43]);
+        wm.minimize_managed_window(43).ok();
+
+        let minimized = wm.minimize_all_windows().unwrap();
+        assert_eq!(minimized, vec![42]);
+
+        wm.restore_desktop().ok();
+
+        let windows = wm.focused_workspace().unwrap().containers()[0]
+            .windows()
+            .clone();
+        assert!(!windows[0].is_minimized(), "42 was put away by the command");
+        assert!(
+            windows[1].is_minimized(),
+            "43 was put away by the user and stays where they put it"
+        );
+    }
+
+    #[test]
+    fn the_desktop_key_shows_the_desktop_and_then_puts_it_back() {
+        let (mut wm, _test_context) = window_manager_with_container(&[42, 43]);
+
+        let response = wm.toggle_show_desktop().unwrap();
+        assert_eq!(response.outcome, CommandOutcome::Success);
+        assert!(wm.is_showing_desktop());
+        assert!(all_minimized(&wm));
+
+        wm.toggle_show_desktop().ok();
+        assert!(!wm.is_showing_desktop());
+        assert!(!all_minimized(&wm));
+    }
+
+    #[test]
+    fn the_desktop_key_repairs_a_desktop_shown_by_something_else() {
+        let (mut wm, _test_context) = window_manager_with_container(&[42, 43]);
+
+        // What `Win+D` leaves behind: the windows are minimized and komorebi never recorded that
+        // it was the one which minimized them.
+        wm.minimize_managed_window(42).ok();
+        wm.minimize_managed_window(43).ok();
+        assert!(!wm.is_showing_desktop());
+
+        wm.toggle_show_desktop().ok();
+
+        assert!(
+            !all_minimized(&wm),
+            "with nothing visible left to minimize, the key restores instead of doing nothing"
+        );
     }
 
     #[test]

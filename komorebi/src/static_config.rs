@@ -1436,6 +1436,7 @@ impl StaticConfig {
             uncloack_to_ignore: 0,
             known_hwnds: HashMap::new(),
             temporarily_unmanaged_hwnds: SuspensionSet::default(),
+            desktop_minimized_hwnds: Vec::new(),
         };
 
         #[allow(deprecated)]

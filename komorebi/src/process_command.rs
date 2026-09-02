@@ -438,6 +438,45 @@ impl WindowManager {
 
                 Self::respond(&mut reply, &response);
             }
+            SocketMessage::MinimizeAllWindows => {
+                let minimized = self.minimize_all_windows()?;
+                let response = if minimized.is_empty() {
+                    CommandResponse::new(
+                        CommandOutcome::NoOp,
+                        "there is no visible window to minimize",
+                    )
+                } else {
+                    CommandResponse::new(
+                        CommandOutcome::Success,
+                        format!(
+                            "minimized {} window(s) to show the desktop",
+                            minimized.len()
+                        ),
+                    )
+                };
+
+                Self::respond(&mut reply, &response);
+            }
+            SocketMessage::RestoreDesktop => {
+                let restored = self.restore_desktop()?;
+                let response = if restored.is_empty() {
+                    CommandResponse::new(
+                        CommandOutcome::NoOp,
+                        "there is no minimized window to restore",
+                    )
+                } else {
+                    CommandResponse::new(
+                        CommandOutcome::Success,
+                        format!("restored {} window(s) from the taskbar", restored.len()),
+                    )
+                };
+
+                Self::respond(&mut reply, &response);
+            }
+            SocketMessage::ToggleShowDesktop => {
+                let response = self.toggle_show_desktop()?;
+                Self::respond(&mut reply, &response);
+            }
             SocketMessage::LockMonitorWorkspaceContainer(
                 monitor_idx,
                 workspace_idx,

@@ -3056,6 +3056,89 @@ impl Workspace {
         Some(hwnd)
     }
 
+    /// Mark every visible window this workspace owns as minimized, without touching Win32.
+    ///
+    /// This is the model half of showing the desktop, and it is deliberately one pass rather than
+    /// a loop over [`Self::minimize_window`]. Minimizing a window one at a time makes each
+    /// container show the next window it holds, and showing a window komorebi believes visible
+    /// takes it off the taskbar - so a bulk minimize done that way spends its time pulling back
+    /// the windows it has just put away. With the model changed first, the Win32 minimizes which
+    /// follow are events about windows which are already minimized as far as the model is
+    /// concerned, and there is nothing left for them to change.
+    ///
+    /// Returns the handles it changed, oldest first, with the window the workspace was working in
+    /// last so that it is the first candidate a single restore offers. Every window keeps its
+    /// container, its stack position, its placement and its presentation; container focus is left
+    /// where it is, because it is what the workspace comes back to.
+    pub fn minimize_all_visible_windows(&mut self) -> Vec<isize> {
+        let focused = self
+            .focused_container()
+            .and_then(Container::focused_managed_window)
+            .map(|window| window.hwnd);
+
+        let mut minimized = Vec::new();
+
+        for container in self.containers_mut() {
+            for window in container.windows_mut().iter_mut() {
+                if window.set_minimized() {
+                    minimized.push(window.hwnd);
+                }
+            }
+        }
+
+        // The focused window goes to the end so that it is recorded as the most recent minimize,
+        // which is what `restore-last-minimized` will offer first.
+        if let Some(focused) = focused
+            && let Some(idx) = minimized.iter().position(|hwnd| *hwnd == focused)
+        {
+            let hwnd = minimized.remove(idx);
+            minimized.push(hwnd);
+        }
+
+        for hwnd in &minimized {
+            self.record_minimized_window(*hwnd);
+        }
+
+        minimized
+    }
+
+    /// Mark minimized windows of this workspace as visible again, in one pass.
+    ///
+    /// `selected` names the windows to bring back; `None` means every minimized window this
+    /// workspace owns, which is how a desktop left inconsistent by something outside komorebi is
+    /// repaired. Handles this workspace does not own, or does not have minimized, are ignored.
+    ///
+    /// Each container then shows the window it should be showing and cloaks the rest, so a stack
+    /// comes back as a stack rather than with every member of it drawn. The caller is responsible
+    /// for having taken these windows off the taskbar first: this changes the model, and a window
+    /// which Win32 still holds minimized would be cloaked here and left where the user cannot see
+    /// it.
+    pub fn restore_minimized_windows(&mut self, selected: Option<&[isize]>) -> Vec<isize> {
+        let wanted = |hwnd: isize| selected.is_none_or(|selected| selected.contains(&hwnd));
+        let mut restored = Vec::new();
+
+        for container in self.containers_mut() {
+            for window in container.windows_mut().iter_mut() {
+                if window.visibility == Visibility::Minimized
+                    && wanted(window.hwnd)
+                    && window.set_visible()
+                {
+                    restored.push(window.hwnd);
+                }
+            }
+        }
+
+        for hwnd in &restored {
+            self.forget_minimized_window(*hwnd);
+        }
+
+        for container in self.containers_mut() {
+            container.load_focused_window();
+        }
+
+        restored
+    }
+
     /// Whether this workspace owns `hwnd` and it could take focus as it stands.
     ///
     /// A minimized window is owned and remembered, but it cannot be focused without being restored
@@ -5823,6 +5906,117 @@ mod tests {
             revealing.focused_container_idx(),
             restoring.focused_container_idx()
         );
+    }
+
+    #[test]
+    fn showing_the_desktop_minimizes_every_visible_window_in_one_pass() {
+        let mut workspace = workspace_with_containers(&[2, 1]);
+        let area = work_area(1920, 1080);
+        let containers_before = workspace.containers().len();
+
+        let minimized = workspace.minimize_all_visible_windows();
+        workspace.record_logical_slots(area);
+
+        assert_eq!(minimized.len(), 3);
+        assert!(
+            workspace
+                .containers()
+                .iter()
+                .all(|container| container.windows().iter().all(ManagedWindow::is_minimized))
+        );
+        assert!(workspace.containers().iter().all(Container::is_hidden));
+        assert_eq!(
+            workspace.containers().len(),
+            containers_before,
+            "showing the desktop puts windows away, it does not destroy containers"
+        );
+        assert!(
+            workspace.logical_slots.is_empty(),
+            "no container owns an active slot, so the work area is free"
+        );
+        for hwnd in &minimized {
+            assert!(workspace.minimize_history.contains(hwnd));
+        }
+    }
+
+    #[test]
+    fn the_window_the_workspace_was_working_in_is_the_first_one_offered_back() {
+        let mut workspace = workspace_with_containers(&[2, 2]);
+        workspace.focus_container(1);
+        workspace.containers_mut()[1].focus_window(1);
+        let focused = workspace.containers()[1].windows()[1].hwnd;
+
+        workspace.minimize_all_visible_windows();
+
+        assert_eq!(workspace.last_minimized_window(), Some(focused));
+    }
+
+    #[test]
+    fn a_window_the_user_minimized_first_is_not_brought_back_with_the_desktop() {
+        let mut workspace = workspace_with_containers(&[3]);
+        workspace.minimize_window(1).unwrap();
+
+        let shown_desktop = workspace.minimize_all_visible_windows();
+
+        assert_eq!(
+            shown_desktop,
+            vec![0, 2],
+            "the window which was already on the taskbar is not part of what showing the desktop \
+             put there"
+        );
+
+        let restored = workspace.restore_minimized_windows(Some(&shown_desktop));
+
+        assert_eq!(restored.len(), 2);
+        let container = &workspace.containers()[0];
+        assert!(
+            container.windows()[1].is_minimized(),
+            "still where the user put it"
+        );
+        assert!(workspace.minimize_history.contains(&1));
+        assert!(!workspace.minimize_history.contains(&0));
+    }
+
+    #[test]
+    fn restoring_the_desktop_puts_every_stack_back_the_way_it_was() {
+        let mut workspace = workspace_with_containers(&[3, 2]);
+        workspace.focus_container(1);
+        let before = workspace.containers().clone();
+
+        let minimized = workspace.minimize_all_visible_windows();
+        let restored = workspace.restore_minimized_windows(Some(&minimized));
+
+        assert_eq!(restored.len(), minimized.len());
+        assert_eq!(
+            workspace.containers(),
+            &before,
+            "the stack order, the window each container shows and every window state come back \
+             unchanged"
+        );
+        assert!(workspace.minimize_history.is_empty());
+    }
+
+    #[test]
+    fn restoring_the_desktop_without_a_selection_takes_everything_minimized() {
+        let mut workspace = workspace_with_containers(&[2]);
+        workspace.minimize_window(0).unwrap();
+        workspace.minimize_window(1).unwrap();
+
+        // This is the repair path: something outside komorebi minimized the windows, so there is
+        // no recorded set to restore and everything minimized comes back.
+        let restored = workspace.restore_minimized_windows(None);
+
+        assert_eq!(restored.len(), 2);
+        assert!(workspace.containers()[0].is_active());
+        assert!(workspace.minimize_history.is_empty());
+    }
+
+    #[test]
+    fn showing_the_desktop_twice_finds_nothing_left_to_minimize() {
+        let mut workspace = workspace_with_containers(&[2]);
+
+        assert_eq!(workspace.minimize_all_visible_windows().len(), 2);
+        assert!(workspace.minimize_all_visible_windows().is_empty());
     }
 
     #[test]
